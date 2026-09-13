@@ -1,0 +1,156 @@
+import os
+import pandas as pd
+from env_setting import ROOT
+from AshareData.datautils.dataloaders.feature_build.feature_utils import *
+
+KLINE_DIRS = {
+    'daily': f'{ROOT}/AshareData/dataset/kline_data/daily_kline',
+    'm15':   f'{ROOT}/AshareData/dataset/kline_data/m15_kline',
+}
+FeatDIR = f'{ROOT}/AshareData/dataset/built_data/base_feature'
+
+# 固定 parquet schema：所有数值列统一为 float64，避免 NaN 导致 int/float 不一致
+PARQUET_NUM_SCHEMA = {
+    'volume': 'float64', 'tradestatus': 'float64', 'isST': 'float64',
+    'trade_date_idx': 'float64', 'code_idx': 'float64', 'isNew': 'float64',
+}
+
+def read_kline(kline_type='daily', code=None, end_date=None, **kwargs):
+    """读取 kline CSV。指定 code 读单只，否则读全部目录。end_date 截断到该日期。**kwargs 透传给 read_csv。"""
+    d = KLINE_DIRS[kline_type]
+    dedup_cols = ['date', 'code'] if kline_type == 'daily' else ['date', 'code', 'time']
+
+    def _read(fp):
+        df = pd.read_csv(fp, **kwargs)
+        df['date'] = df['date'].str.replace('-', '')
+        if kline_type == 'm15':
+            # 上游脏数据：time 列可能是 YYYYMMDDHHMMSS 格式（如 20260624094500000），修正为 HHMM
+            time_str = df['time'].astype(str)
+            bad = time_str.str.len() > 4
+            if bad.any():
+                df.loc[bad, 'time'] = time_str[bad].str[8:12].astype(int)
+        if end_date:
+            df = df[df.date <= end_date]
+        return df.drop_duplicates(dedup_cols, keep='last')
+
+    if code:
+        return _read(f'{d}/{code}.csv')
+    return pd.concat(_read(f'{d}/{f}') for f in sorted(os.listdir(d)) if f.endswith('.csv'))
+
+def build_daily_kline_feature(code, data, latest_date=None):
+    """计算 daily kline 特征。latest_date 之后的行才算新数据，内部自动留100行lookback给指标热身。"""
+    if latest_date is not None:
+        calc_mask = data['date'].values > latest_date
+        if not calc_mask.any():
+            return data.iloc[0:0]
+        calc_start = int(np.argmax(calc_mask))
+        lookback = 100
+        win_start = max(0, calc_start - lookback)
+    else:
+        calc_start = 0
+        win_start = 0
+
+    window = data.iloc[win_start:].copy()
+    close = window['close'].values.astype(float).reshape(-1, 1)
+
+    # 索引特征
+    window['trade_date_idx'] = get_trade_date_idx(window['date'].tolist())
+    window['code_idx'] = get_code_idx([code])[0]
+    window['isNew'] = isNew(window['trade_date_idx'].values.tolist())
+    window['price_limit'] = get_code_price_limit(
+        [code] * len(window), window['isST'].values.astype(int).tolist(), window['isNew'].tolist()
+    )
+
+    # MA
+    for w in [5, 10, 20, 30, 60]:
+        window[f'ma{w}'] = calculate_moving_average(close, w)[:, 0]
+
+    # MACD
+    macd, signal, hist = calculate_macd(close)
+    window['macd'] = macd[:, 0]
+    window['macd_signal'] = signal[:, 0]
+    window['macd_hist'] = hist[:, 0]
+
+    # RSI
+    window['rsi14'] = calculate_rsi(close, 14)[:, 0]
+
+    # Bollinger
+    upper, mid, lower = calculate_bollinger_bands(close, 20, 2)
+    window['boll_upper'] = upper[:, 0]
+    window['boll_mid'] = mid[:, 0]
+    window['boll_lower'] = lower[:, 0]
+
+    # KDJ
+    high = window['high'].values.astype(float).reshape(-1, 1)
+    low = window['low'].values.astype(float).reshape(-1, 1)
+    k, d, j = calculate_kdj(high, low, close)
+    window['kdj_k'] = k[:, 0]
+    window['kdj_d'] = d[:, 0]
+    window['kdj_j'] = j[:, 0]
+
+    # 只返回 latest_date 之后的行
+    if latest_date is not None:
+        return window.iloc[calc_start - win_start:]
+    return window
+
+
+def build_m15_kline_feature(code, data, latest_date=None):
+    """计算 m15 kline 特征。latest_date 之后的行才算新数据，内部留100行lookback。"""
+    if latest_date is not None:
+        calc_mask = data['date'].values > latest_date
+        if not calc_mask.any():
+            return data.iloc[0:0]
+        calc_start = int(np.argmax(calc_mask))
+        lookback = 100
+        win_start = max(0, calc_start - lookback)
+    else:
+        calc_start = 0
+        win_start = 0
+
+    window = data.iloc[win_start:].copy()
+    close = window['close'].values.astype(float).reshape(-1, 1)
+    window['rsi14'] = calculate_rsi(close, 14)[:, 0]
+    high = window['high'].values.astype(float).reshape(-1, 1)
+    low = window['low'].values.astype(float).reshape(-1, 1)
+    k, d, j = calculate_kdj(high, low, close)
+    window['kdj_k'] = k[:, 0]
+    window['kdj_d'] = d[:, 0]
+    window['kdj_j'] = j[:, 0]
+
+    if latest_date is not None:
+        return window.iloc[calc_start - win_start:]
+    return window
+
+
+def build_merged_feature(code, rebuild=False):
+    """合并 daily + m15 为单个 DataFrame，每天一行，m15 flatten 到列。支持增量更新。"""
+    # 读已有 parquet，取 pq_max_date 作为增量起点
+    pq_path = f'{FeatDIR}/{code}.parquet'
+    old_df = None
+    pq_max_date = None
+    if os.path.exists(pq_path) and not rebuild:
+        old_df = pd.read_parquet(pq_path)
+        pq_max_date = old_df['date'].max()
+
+    # 读取全量 kline，feature 函数根据 pq_max_date 内部算窗口
+    daily = read_kline('daily', code)
+    if daily.empty:
+        return old_df
+    daily = build_daily_kline_feature(code, daily, latest_date=pq_max_date)
+
+    m15 = read_kline('m15', code)
+    if not m15.empty:
+        m15 = build_m15_kline_feature(code, m15, latest_date=pq_max_date)
+        m15_value_cols = [c for c in m15.columns if c not in ('date', 'time', 'code')]
+        pivoted = m15.pivot_table(index='date', columns='time', values=m15_value_cols, aggfunc='last')
+        pivoted.columns = [f'm15_{int(t):04d}_{f}' for f, t in pivoted.columns]
+        daily = daily.merge(pivoted.reset_index(), on='date', how='left')
+
+    # 无新数据直接返回老数据
+    if daily.empty:
+        return old_df
+    # 增量追加：去掉全 NA 列避免 FutureWarning
+    if old_df is not None:
+        return pd.concat([old_df, daily.dropna(axis=1, how='all')], ignore_index=True)
+    return daily
+    
