@@ -16,7 +16,6 @@ AshareData/
     ├── exchanges_utils/           # 交易日历、股票代码 ↔ 名称检索
     ├── exchanges_meta/            # 股票代码表、交易日历（随仓库携带）
     ├── kline_data_utils/          # baostock 行情查询
-    ├── paddle_ocr_utils/          # 表格图片 OCR
     ├── tsh_utils/                 # 同花顺/问财登录（含滑块验证码）
     └── slide_captcha_model/       # 子模块：滑块定位模型
 ```
@@ -53,7 +52,7 @@ from AshareData.dataloader import KlineDataConfig, build_train_and_val_dataloade
 
 ## 依赖与外部文件
 
-- Python 3.10+；主要三方库：`pandas`、`pyarrow`、`polars`、`numpy`、`tqdm`、`selenium`、`baostock`、`openpyxl`、`akshare`（更新日历）、`pypinyin`（可选）、`torch`/`torchvision`（滑块模型与 OCR）。
+- Python 3.10+；主要三方库：`pandas`、`pyarrow`、`polars`、`numpy`、`tqdm`、`selenium`、`baostock`、`openpyxl`、`akshare`（更新日历）、`pypinyin`（可选）、`torch`/`torchvision`（滑块定位模型）。
 - **chromedriver**：爬虫用；按 环境变量 `CHROME_DRIVER_PATH` → 常见安装路径 → `PATH` 依次探测。
 - **子模块**：首次克隆后执行 `git submodule update --init`。
 
