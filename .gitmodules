@@ -1,3 +1,3 @@
 [submodule "utils/slide_captcha_model"]
-	path = utils/slide_captcha_model
+	path = utils/tsh_utils/slide_captcha_model
 	url = git@github.com:leon20th/slide_captcha_model.git

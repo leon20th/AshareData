@@ -11,9 +11,9 @@ from AshareData.paths import CHROME_DRIVER_PATH, TMP_DIR
 
 os.makedirs(TMP_DIR, exist_ok=True)
 
-# 滑块验证码模型：utils/slide_captcha_model 子模块（git@github.com:leon20th/slide_captcha_model.git，MiniYOLO + 线上权重）
+# 滑块验证码模型：tsh_utils/slide_captcha_model 子模块（git@github.com:leon20th/slide_captcha_model.git，MiniYOLO + 线上权重）
 _SLIDE_ROOT = os.path.abspath(os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), '..', 'slide_captcha_model'))
+    os.path.dirname(os.path.abspath(__file__)), 'slide_captcha_model'))
 if os.path.dirname(_SLIDE_ROOT) not in sys.path:
     sys.path.append(os.path.dirname(_SLIDE_ROOT))   # 包式导入 slide_captcha_model.*（append，不抢同名模块）
 _SLIDE_WEIGHTS = os.path.join(_SLIDE_ROOT, 'models', 'mini_yolo_online_best.pth')

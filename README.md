@@ -16,8 +16,8 @@ AshareData/
     ├── exchanges_utils/           # 交易日历、股票代码 ↔ 名称检索
     ├── exchanges_meta/            # 股票代码表、交易日历（随仓库携带）
     ├── kline_data_utils/          # baostock 行情查询
-    ├── tsh_utils/                 # 同花顺/问财登录（含滑块验证码）
-    └── slide_captcha_model/       # 子模块：滑块定位模型
+    └── tsh_utils/                 # 同花顺/问财登录
+        └── slide_captcha_model/   # 子模块：滑块定位模型
 ```
 
 ## 数据目录（`dataset/`，不入库）
