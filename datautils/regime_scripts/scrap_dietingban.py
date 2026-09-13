@@ -17,6 +17,7 @@ from bs4 import BeautifulSoup
 
 setup_logging()
 logger = get_logger('跌停板爬取')
+_BEGIN = '20200101'   # 无历史数据时的默认抓取起始日
 
 class ScrapDietingban(Scrap):
     def __init__(self, date=''):
@@ -195,9 +196,9 @@ if __name__ == '__main__':
     output = sw.result_path
 
     had_scrap_date = [f.split('跌停板')[0] for f in os.listdir(output) if f.endswith('.xlsx')]
-    last_date = max(had_scrap_date) if had_scrap_date else '20200101'
+    last_date = max(had_scrap_date) if had_scrap_date else _BEGIN
     last_date_idx = all_dates.index(last_date) if last_date in all_dates else -1
-    begin_date = all_dates[last_date_idx-5] if last_date_idx >= 0 else '20200101'
+    begin_date = all_dates[last_date_idx-5] if last_date_idx >= 0 else _BEGIN
 
     dates = [d for d in all_dates if d > begin_date and d <= end_date]
     logger.info(f'需要爬取的日期列表: {dates}')
