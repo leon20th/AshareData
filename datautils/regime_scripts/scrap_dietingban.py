@@ -167,6 +167,11 @@ class ScrapDietingban(Scrap):
                         except ValueError:
                             time.sleep(0.5)
                     if tables is None:
+                        body_text = driver.find_element(By.TAG_NAME, 'body').text
+                        m = re.search(r'的跌停\s*\((\d+)\s*个\)', body_text)
+                        total = int(m.group(1)) if m else None
+                        if total:
+                            raise RuntimeError(f'页面数据未渲染完成: 官方共 {total} 行')
                         logger.info(f'当日无数据，写入空文件: query={query}')
                         pd.DataFrame().to_excel(f'{self.result_path}/{query}.xlsx', index=False)
                         if shutdown_driver:

@@ -167,6 +167,11 @@ class ScrapZhangtingban(Scrap):
                         except ValueError:
                             time.sleep(0.5)
                     if tables is None:
+                        body_text = driver.find_element(By.TAG_NAME, 'body').text
+                        m = re.search(r'的涨停\s*\((\d+)\s*个\)', body_text)
+                        total = int(m.group(1)) if m else None
+                        if total:
+                            raise RuntimeError(f'页面数据未渲染完成: 官方共 {total} 行')
                         logger.info(f'当日无数据，写入空文件: query={query}')
                         pd.DataFrame().to_excel(f'{self.result_path}/{query}.xlsx', index=False)
                         if shutdown_driver:
@@ -187,11 +192,23 @@ class ScrapZhangtingban(Scrap):
                     if next_btn is None:
                         break
                     last_text = table_content.find_element(By.CSS_SELECTOR, "table tbody tr:first-child").text
-                    driver.execute_script("arguments[0].click();", next_btn)
-                    wait = WebDriverWait(table_content, 10)
-                    wait.until(
-                        lambda table_content: table_content.find_element(By.CSS_SELECTOR, "table tbody tr:first-child").text != last_text
-                    )
+                    turned = False
+                    for _ in range(2):
+                        try:
+                            next_btn.click()
+                        except Exception:
+                            driver.execute_script("arguments[0].click();", next_btn)
+                        try:
+                            WebDriverWait(table_content, 15).until(
+                                lambda table_content: table_content.find_element(By.CSS_SELECTOR, "table tbody tr:first-child").text != last_text
+                            )
+                            turned = True
+                            break
+                        except Exception:
+                            next_btn = self._find_next_page_button(pager) or next_btn
+                    if not turned:
+                        logger.error(f'翻页重试后仍未生效，停止翻页（已收集 {0 if cc_tables is None else len(cc_tables)} 行）: query={query}')
+                        break
                 cc_tables = cc_tables.drop_duplicates(subset=['股票代码'], keep='first').reset_index(drop=True)
                 cc_tables['股票代码'] = cc_tables['股票代码'].apply(lambda x: '%.6d' % x)
                 m = re.search(r'的涨停\s*\((\d+)\s*个\)', driver.find_element(By.TAG_NAME, 'body').text)
