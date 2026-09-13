@@ -126,7 +126,19 @@ class ScrapDietingban(Scrap):
                     table_content = WebDriverWait(driver, 10).until(
                         EC.presence_of_element_located((By.CSS_SELECTOR, '.iwc-table-scroll'))
                     )
-                    tables = pd.read_html(StringIO(table_content.get_attribute('outerHTML')))[0]
+                    # 空结果日（如当日无跌停股）：容器内没有可解析的 <table>；重试至 8 秒仍无 → 视为当日无数据
+                    tables = None
+                    for _ in range(16):
+                        try:
+                            tables = pd.read_html(StringIO(table_content.get_attribute('outerHTML')))[0]
+                            break
+                        except ValueError:
+                            time.sleep(0.5)
+                    if tables is None:
+                        logger.info(f'当日无数据，跳过: query={query}')
+                        if shutdown_driver:
+                            driver.quit()
+                        return None
                     tables = tables.iloc[:, 2:]
 
                     fix_table = driver.find_element(By.CSS_SELECTOR, '.iwc-table-fixed')
