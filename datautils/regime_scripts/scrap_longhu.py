@@ -61,21 +61,23 @@ class ScrapLonghu(Scrap):
     def get_auto_scrap_dates(self, all_dates, end_date, earliest_date='2020-01-02'):
         earliest_trade_date = self.normalize_trade_date(earliest_date)
         end_trade_date = self.normalize_trade_date(end_date)
-        saved_dates = self.get_saved_dates()
-        last_saved_date = max(saved_dates) if saved_dates else None
+        saved_dates = set(self.get_saved_dates())
 
-        normalized_trade_dates = [self.normalize_trade_date(date) for date in all_dates]
         pending_dates = []
-        for trade_date in normalized_trade_dates:
+        for trade_date in map(self.normalize_trade_date, all_dates):
             if trade_date < earliest_trade_date or trade_date > end_trade_date:
                 continue
-            if last_saved_date and trade_date <= last_saved_date:
+            if trade_date in saved_dates:
                 continue
             pending_dates.append(trade_date)
         return pending_dates
 
     def build_session(self, date=None):
         target_date = self.normalize_date(date) if date else datetime.now().strftime('%Y-%m-%d')
+        anonymous = self.create_session_from_cookies([])
+        if self.is_session_valid(anonymous, target_date):
+            logger.info('匿名会话可直接抓取龙虎榜')
+            return anonymous
         cookie_list = get_tsh_cookies_static()
         if cookie_list:
             session = self.create_session_from_cookies(cookie_list)
@@ -312,9 +314,20 @@ class ScrapLonghu(Scrap):
 
         session = self.build_session(pending_dates[0])
         results = {}
+        failed = 0
         with tqdm.tqdm(total=len(pending_dates), desc='Scraping longhu') as pbar, logging_redirect_tqdm():
             for date in pending_dates:
-                data = self.get_content(date, session=session)
+                try:
+                    data = self.get_content(date, session=session)
+                except ValueError as exc:
+                    # 页面异常（当日无数据或登录态失效）：跳过不落盘，下次运行会重试
+                    failed += 1
+                    logger.error(f'龙虎榜抓取异常跳过: date={date}, error={exc}, 连续失败={failed}')
+                    if failed >= 3:
+                        raise RuntimeError('连续3个交易日抓取异常，疑似登录态失效，终止本次补抓') from exc
+                    pbar.update(1)
+                    continue
+                failed = 0
                 save_path = self.get_save_path(date)
                 with open(save_path, 'w', encoding='utf-8') as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)

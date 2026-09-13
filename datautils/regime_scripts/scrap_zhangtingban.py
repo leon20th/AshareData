@@ -11,7 +11,7 @@ from AshareData.utils.tsh_utils.login_util import login_wencai
 from io import StringIO
 import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
-from AshareData.paths import SCRAP_DATA_DIR
+from AshareData.paths import SCRAP_DATA_DIR, _BEGIN
 import traceback
 from bs4 import BeautifulSoup
 
@@ -157,7 +157,20 @@ class ScrapZhangtingban(Scrap):
                     table_content = WebDriverWait(driver, 10).until(
                         EC.presence_of_element_located((By.CSS_SELECTOR, '.iwc-table-scroll'))
                     )
-                    tables = pd.read_html(StringIO(table_content.get_attribute('outerHTML')))[0]
+                    # 空结果日（如当日无涨停股）：容器内没有可解析的 <table>；重试至 8 秒仍无 → 视为当日无数据
+                    tables = None
+                    for _ in range(16):
+                        try:
+                            tables = pd.read_html(StringIO(table_content.get_attribute('outerHTML')))[0]
+                            break
+                        except ValueError:
+                            time.sleep(0.5)
+                    if tables is None:
+                        logger.info(f'当日无数据，写入空文件: query={query}')
+                        pd.DataFrame().to_excel(f'{self.result_path}/{query}.xlsx', index=False)
+                        if shutdown_driver:
+                            driver.quit()
+                        return f'{self.result_path}/{query}.xlsx'
                     tables = tables.iloc[:, 2:]
 
                     fix_table = driver.find_element(By.CSS_SELECTOR, '.iwc-table-fixed')
@@ -209,14 +222,9 @@ if __name__ == '__main__':
     sw = ScrapZhangtingban(date=end_date)
     output = sw.result_path
 
-    had_scrap_date = [f.split('涨停板')[0] for f in os.listdir(output) if f.endswith('.xlsx')]
-    last_date = max(had_scrap_date) if had_scrap_date else '20250101'
-    last_date_idx = all_dates.index(last_date) if last_date in all_dates else -1
-    begin_date = all_dates[last_date_idx-5] if last_date_idx >= 0 else '20250101'
-
-    dates = [d for d in all_dates if d > begin_date and d <= end_date]
-    logger.info(f'需要爬取的日期列表: {dates}')
-    # 遍历A列
+    had_scrap_date = {f.split('涨停板')[0] for f in os.listdir(output) if f.endswith('.xlsx')}
+    dates = [d for d in all_dates if _BEGIN <= d <= end_date and d not in had_scrap_date]
+    logger.info(f'需要补充的日期({len(dates)}): {dates}')
     with tqdm.tqdm(total=len(dates)) as pbar, logging_redirect_tqdm():
         for date in dates:
             sw.get_content_with_selenium(date=date, shutdown_driver=False)
