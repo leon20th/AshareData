@@ -19,10 +19,8 @@ if [ -n "${TSH_USER:-}" ] && [ -n "${TSH_PASS:-}" ]; then
     echo "==> 使用环境变量 TSH_USER/TSH_PASS 写入账号"
 else
     echo "==> 配置同花顺/问财账号，用于抓取涨停板和龙虎榜等（仅写入本地缓存 ${ACCOUNT_FILE}）"
-    echo "    密码输入时不显示字符（无回显属正常），输完按回车即可"
     read -r -p "账号: " TSH_USER || { echo "读取输入失败：请在交互式终端中运行" >&2; exit 1; }
-    read -r -s -p "密码: " TSH_PASS || { echo "读取密码失败" >&2; exit 1; }
-    echo
+    read -r -p "密码: " TSH_PASS || { echo "读取密码失败" >&2; exit 1; }
 fi
 mkdir -p "$TMP_DIR"
 printf '{"username": "%s", "password": "%s"}\n' "$TSH_USER" "$TSH_PASS" > "$ACCOUNT_FILE"
