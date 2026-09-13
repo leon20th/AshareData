@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # AshareData 环境安装：
-#   1) 交互输入同花顺账号密码 → 写入本地缓存（不进 git）
+#   1) 交互输入同花顺账号密码 → 写入本地缓存
 #   2) 安装 Chrome + chromedriver（macOS / Linux 自动分支）
 set -euo pipefail
 
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
-TMP_DIR="$(dirname "$ROOT")/business_tmp_files/tsh"
+TMP_DIR="$ROOT/.cache"
 ACCOUNT_FILE="$TMP_DIR/tsh_account.json"
 OS="$(uname -s)"
 
 # ---------------- 1. 账号密码 → 本地缓存 ----------------
-echo "==> 配置同花顺/问财账号（仅写入本地缓存 ${ACCOUNT_FILE}，不进 git）"
+echo "==> 配置同花顺/问财账号，用于抓取涨停板和龙虎榜等（仅写入本地缓存 ${ACCOUNT_FILE}）"
 read -r -p "账号: " TSH_USER
 read -r -s -p "密码: " TSH_PASS; echo
 read -r -s -p "确认密码: " TSH_PASS2; echo

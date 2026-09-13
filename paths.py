@@ -22,7 +22,7 @@ BASE_FEATURE_DIR = os.path.join(BUILT_DATA_DIR, 'base_feature')
 
 # ---- 外部文件 ----
 META_DIR = os.path.join(ASHARE_ROOT, 'utils', 'exchanges_meta')   # 股票代码表/交易日历
-TMP_DIR = os.path.join(os.path.dirname(ASHARE_ROOT), 'business_tmp_files', 'tsh')  # 爬虫运行期临时文件
+TMP_DIR = os.path.join(ASHARE_ROOT, '.cache')   # 运行期缓存（账号/cookie/验证码截图，不进 git）
 
 # ---- chromedriver ----
 CHROME_DRIVER_PATH = (
