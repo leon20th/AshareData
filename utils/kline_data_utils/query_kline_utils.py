@@ -1,6 +1,5 @@
 import pandas as pd
 import baostock as bs
-from AshareData.utils.kline_data_utils.baostock_session import fast_login
 
 class QueryKlineUtils:
     def __init__(self):
@@ -8,7 +7,7 @@ class QueryKlineUtils:
 
     def login_bs(self):
         if not self.login:
-            fast_login(force_fast=True, max_force_attempts=20)
+            bs.login()
             self.login = True
 
     def query_history(self, code, start_date='2020-01-01', end_date='2026-01-21', frequency="d", adjustflag="2"):
