@@ -1,7 +1,7 @@
 """AshareData 路径寻址：以本包在系统中的实际位置为基准，不依赖上层工程配置。
 
 - 数据目录全部由 ASHARE_ROOT 派生（dataset/...）；
-- 交易元数据（股票代码表/交易日历）默认取同级工程的 utils/exchanges_meta；
+- 交易元数据（股票代码表/交易日历）随仓库携带在 utils/exchanges_meta；
 - chromedriver 按 环境变量 → 常见路径 → PATH 依次探测。
 """
 import os
@@ -21,7 +21,7 @@ BUILT_DATA_DIR = os.path.join(DATASET_DIR, 'built_data')
 BASE_FEATURE_DIR = os.path.join(BUILT_DATA_DIR, 'base_feature')
 
 # ---- 外部文件 ----
-META_DIR = os.path.join(os.path.dirname(ASHARE_ROOT), 'utils', 'exchanges_meta')   # 股票代码表/交易日历
+META_DIR = os.path.join(ASHARE_ROOT, 'utils', 'exchanges_meta')   # 股票代码表/交易日历
 TMP_DIR = os.path.join(os.path.dirname(ASHARE_ROOT), 'business_tmp_files', 'tsh')  # 爬虫运行期临时文件
 
 # ---- chromedriver ----
