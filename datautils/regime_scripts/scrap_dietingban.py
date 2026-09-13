@@ -3,6 +3,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
 import os
+import re
 import pandas as pd
 from datetime import datetime
 from AshareData.utils.log_util import setup_logging, get_logger
@@ -93,6 +94,37 @@ class ScrapDietingban(Scrap):
         return headers
 
 
+    def _find_next_page_button(self, pager):
+        """兼容不同分页样式，返回可点击的下一页按钮。"""
+        next_xpath = (
+            ".//*[self::a or self::button or self::span]"
+            "[contains(normalize-space(.), '下页') or "
+            "contains(normalize-space(.), '下一页') or "
+            "contains(normalize-space(.), '下 一 页') or "
+            "normalize-space(.)='>']"
+        )
+        candidates = pager.find_elements(By.XPATH, next_xpath)
+        for ele in candidates:
+            cls = (ele.get_attribute('class') or '').lower()
+            parent_cls = (ele.find_element(By.XPATH, 'parent::*').get_attribute('class') or '').lower()
+            if 'disabled' in cls or 'disabled' in parent_cls:
+                continue
+            if ele.is_displayed() and ele.is_enabled():
+                return ele
+
+        css_candidates = [
+            '.pagination-next:not(.disabled)',
+            '.next:not(.disabled)',
+            '.btn-next:not(.disabled)',
+            'li.next:not(.disabled) a',
+        ]
+        for selector in css_candidates:
+            elements = pager.find_elements(By.CSS_SELECTOR, selector)
+            for ele in elements:
+                if ele.is_displayed() and ele.is_enabled():
+                    return ele
+        return None
+
     def get_content_with_selenium(self, query='跌停板', date='', shutdown_driver=True):
         """
         使用Selenium获取动态加载的内容
@@ -151,21 +183,20 @@ class ScrapDietingban(Scrap):
                         cc_tables = tables
                     else:
                         cc_tables = pd.concat([cc_tables, tables], axis=0, ignore_index=True)
-                    has_next_btn = pager.find_elements(By.LINK_TEXT, '下页')
-                    if not has_next_btn:
+                    next_btn = self._find_next_page_button(pager)
+                    if next_btn is None:
                         break
-                    next_btn = pager.find_element(By.LINK_TEXT, '下页')
-                    next_btn_pt = next_btn.find_element(By.XPATH, "parent::*")
-                    if next_btn_pt.get_attribute('class') == 'disabled':
-                        break
-                    else:
-                        last_text = table_content.find_element(By.CSS_SELECTOR, "table tbody tr:first-child").text
-                        next_btn.click()
-                        wait = WebDriverWait(table_content, 10)
-                        wait.until(
-                            lambda table_content: table_content.find_element(By.CSS_SELECTOR, "table tbody tr:first-child").text != last_text
-                        )
+                    last_text = table_content.find_element(By.CSS_SELECTOR, "table tbody tr:first-child").text
+                    next_btn.click()
+                    wait = WebDriverWait(table_content, 15)
+                    wait.until(
+                        lambda table_content: table_content.find_element(By.CSS_SELECTOR, "table tbody tr:first-child").text != last_text
+                    )
                 cc_tables['股票代码'] = cc_tables['股票代码'].apply(lambda x: '%.6d' % x)
+                m = re.search(r'的跌停\s*\((\d+)\s*个\)', driver.find_element(By.TAG_NAME, 'body').text)
+                total = int(m.group(1)) if m else None
+                if total is not None and len(cc_tables) < total:
+                    logger.error(f'分页不完整: 已收集 {len(cc_tables)} 行, 官方共 {total} 行, query={query}')
                 cc_tables.to_excel(f'{self.result_path}/{query}.xlsx', index=False)
 
                 # 直接点击数据导出

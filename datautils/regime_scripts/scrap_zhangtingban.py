@@ -3,6 +3,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
 import os
+import re
 import pandas as pd
 from datetime import datetime
 from AshareData.utils.log_util import setup_logging, get_logger
@@ -193,6 +194,10 @@ class ScrapZhangtingban(Scrap):
                     )
                 cc_tables = cc_tables.drop_duplicates(subset=['股票代码'], keep='first').reset_index(drop=True)
                 cc_tables['股票代码'] = cc_tables['股票代码'].apply(lambda x: '%.6d' % x)
+                m = re.search(r'的涨停\s*\((\d+)\s*个\)', driver.find_element(By.TAG_NAME, 'body').text)
+                total = int(m.group(1)) if m else None
+                if total is not None and len(cc_tables) < total:
+                    logger.error(f'分页不完整: 已收集 {len(cc_tables)} 行, 官方共 {total} 行, query={query}')
                 cc_tables.to_excel(f'{self.result_path}/{query}.xlsx', index=False)
 
                 # 直接点击数据导出
