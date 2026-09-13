@@ -75,12 +75,12 @@ def _read_single_updown_file(filepath: str, is_limit_up: int) -> pd.DataFrame:
     out['is_limit_up'] = int(is_limit_up)
     out['first_limit_min'] = df['first_limit_time'].apply(_t2min) if 'first_limit_time' in df.columns else np.nan
     out['last_limit_min'] = df['last_limit_time'].apply(_t2min) if 'last_limit_time' in df.columns else np.nan
-    out['consecutive_days'] = pd.to_numeric(df.get('consecutive_days'), errors='coerce').fillna(0).astype(int)
+    out['consecutive_days'] = pd.to_numeric(df['consecutive_days'], errors='coerce').fillna(0).astype(int) if 'consecutive_days' in df.columns else 0
     out['seal_volume_wan'] = df['seal_volume'].apply(lambda v: _n(v) / 1e6) if 'seal_volume' in df.columns else np.nan  # 股→万手
     out['seal_value_wan'] = df['seal_value'].apply(lambda v: _n(v) / 1e4) if 'seal_value' in df.columns else np.nan    # 元→万元
     out['seal_pct'] = pd.to_numeric(df.get('seal_pct'), errors='coerce')
     out['seal_flow_pct'] = pd.to_numeric(df.get('seal_flow_pct'), errors='coerce')
-    out['open_count'] = pd.to_numeric(df.get('open_count'), errors='coerce').fillna(0).astype(int)
+    out['open_count'] = pd.to_numeric(df['open_count'], errors='coerce').fillna(0).astype(int) if 'open_count' in df.columns else 0
 
     # 几天几板: '3天3板'→(3,3), '首板涨停'→(1,1), 缺失→(0,0)
     def _db(v):
