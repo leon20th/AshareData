@@ -11,14 +11,14 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 from AshareData.utils.exchanges_utils.a_open import get_target_trade_date
 from AshareData.utils.read_file_utils import get_first_last_line_from_csv
 from AshareData.utils.kline_data_utils.query_kline_utils import QueryKlineUtils
-from RegimeFramework.datautils.kline_scripts.update_notrade import UpdateNotrade
+from AshareData.datautils.kline_scripts.update_notrade import UpdateNotrade
 
 logger = get_logger('更新k线数据')
 
 class UpdateKline:
     def __init__(self):
-        self.daily_database = f'{ROOT}/RegimeFramework/dataset/kline_data/daily_kline'
-        self.m15_database = f'{ROOT}/RegimeFramework/dataset/kline_data/m15_kline'
+        self.daily_database = f'{ROOT}/AshareData/dataset/kline_data/daily_kline'
+        self.m15_database = f'{ROOT}/AshareData/dataset/kline_data/m15_kline'
         self.frequency_map = {
             'd': self.daily_database,
             '15': self.m15_database,
