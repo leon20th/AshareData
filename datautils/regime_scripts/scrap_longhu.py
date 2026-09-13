@@ -12,7 +12,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from tqdm.contrib.logging import logging_redirect_tqdm
 
-from env_setting import ROOT
+from AshareData.paths import SCRAP_DATA_DIR
 from AshareData.datautils.regime_scripts.scrap import Scrap
 from AshareData.utils.log_util import get_logger, setup_logging
 from AshareData.utils.tsh_utils.login_util import login_tsh, get_tsh_cookies_static
@@ -26,7 +26,7 @@ class ScrapLonghu(Scrap):
         self.url = 'https://data.10jqka.com.cn/market/longhu/'
         self.login_url = 'https://t.10jqka.com.cn/circle/211687/'
         self.ajax_url = 'https://data.10jqka.com.cn/ifmarket/lhbggxq/report/{date}/'
-        self.result_path = f'{ROOT}/AshareData/dataset/scrap_data/longhu'
+        self.result_path = f'{SCRAP_DATA_DIR}/longhu'
         os.makedirs(self.result_path, exist_ok=True)
 
     def normalize_date(self, date):

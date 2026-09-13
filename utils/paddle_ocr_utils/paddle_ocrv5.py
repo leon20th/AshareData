@@ -183,7 +183,11 @@ class PaddleOCRV5:
 
 
 if __name__ == "__main__":
-    img_dir = '/home/leon/TradingMan/business/zhangting_analysis_report/scrap_data/zhangtingimgs/2023-02-06/table_img_test/img-2'
+    import sys
+
+    if len(sys.argv) < 2:
+        sys.exit('用法: python paddle_ocrv5.py <图片目录>')
+    img_dir = sys.argv[1]
     ocr = PaddleOCRV5()
     for img_name in sorted(os.listdir(img_dir)):
         if img_name.startswith('_debug'):

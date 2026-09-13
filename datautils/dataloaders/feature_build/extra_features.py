@@ -5,7 +5,7 @@ import os, re, json
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from env_setting import ROOT
+from AshareData.paths import BASE_FEATURE_DIR, BUILT_DATA_DIR, SCRAP_DATA_DIR
 
 from AshareData.datautils.dataloaders.feature_build.feature_utils import get_code_idx, get_trade_date_idx
 
@@ -28,10 +28,10 @@ UPDOWN_COLUMNS = [
     'reason',            # 涨停原因类别 / 跌停原因类型
 ]
 
-UPLIMIT_DIR = f'{ROOT}/AshareData/dataset/scrap_data/zhangtingban'
-DOWNLIMIT_DIR = f'{ROOT}/AshareData/dataset/scrap_data/dietingban'
+UPLIMIT_DIR = f'{SCRAP_DATA_DIR}/zhangtingban'
+DOWNLIMIT_DIR = f'{SCRAP_DATA_DIR}/dietingban'
 
-UPDOWN_PARQUET = f'{ROOT}/AshareData/dataset/built_data/updown_limit.parquet'
+UPDOWN_PARQUET = f'{BUILT_DATA_DIR}/updown_limit.parquet'
 os.makedirs(os.path.dirname(UPDOWN_PARQUET), exist_ok=True)
 
 
@@ -129,7 +129,7 @@ def get_updown_limit_feature(update: bool = False, force_rebuild: bool = False) 
     return combined
 
 
-MARKET_PARQUET = f'{ROOT}/AshareData/dataset/built_data/market_daily_stats.parquet'
+MARKET_PARQUET = f'{BUILT_DATA_DIR}/market_daily_stats.parquet'
 MARKET_COLUMNS = ['date', 'trade_date_idx', 'avg_pctChg', 'amount_sum', 'zhangting_count', 'dieting_count',
                   'up_count', 'down_count', 'flat_count', 'stock_count']
 os.makedirs(os.path.dirname(MARKET_PARQUET), exist_ok=True)
@@ -178,7 +178,7 @@ def build_market_features(update: bool = False, force_rebuild: bool = False) -> 
     return combined
 
 
-PCT_RANK_PARQUET = f'{ROOT}/AshareData/dataset/built_data/pct_cross_rank.parquet'
+PCT_RANK_PARQUET = f'{BUILT_DATA_DIR}/pct_cross_rank.parquet'
 PCT_RANK_COLUMNS = ['trade_date_idx', 'code_idx', 'pct_rank']
 
 
@@ -187,7 +187,7 @@ def build_pct_cross_rank(update: bool = False, force_rebuild: bool = False) -> p
 
     rel = pctChg / price_limit —— 源 base_feature 的 price_limit 在 isST=0 & isNew=0
     行即纯板幅（主板0.1 / 创业·科创0.2 / 北交0.3），故 rel 跨板块可比。当日全体可比
-    股票 rel 升序分位 → [0,1]，天生逐日无基准率漂移（与温度缩放失败结论同构）。
+    股票 rel 升序分位 → [0,1]，天生逐日无基准率漂移。
     剔除 ST/新股后剩余样本再排名；被剔除者不进表（loader lookup 落空 → 0）。
 
     横截面 rank 按天独立，可增量（只算新 trade_date_idx）。
@@ -199,7 +199,7 @@ def build_pct_cross_rank(update: bool = False, force_rebuild: bool = False) -> p
 
     import glob as _g
     import polars as pl
-    files = sorted(_g.glob(f'{ROOT}/AshareData/dataset/built_data/base_feature/*.parquet'))
+    files = sorted(_g.glob(f'{BASE_FEATURE_DIR}/*.parquet'))
     cols = ['trade_date_idx', 'code_idx', 'pctChg', 'price_limit', 'isST', 'isNew']
     lazy = pl.scan_parquet(files).select(cols).filter(
         (pl.col('isST') == 0) & (pl.col('isNew') == 0)
@@ -225,17 +225,15 @@ def build_pct_cross_rank(update: bool = False, force_rebuild: bool = False) -> p
 
 
 # ======================== 龙虎榜特征构建 ========================
-# 独立重实现：直接解析 PPO 本地 scrap_data/longhu/*.json，不依赖 RegimeFramework 老管线。
-# 列 = 探针定案 8 列（tests/probe_longhu_next_ret.py，联合控制 ret/turn/uplimit 后独立存活），
-# 每族 1 根：方向 net_buy_ratio；结构 buy/sell_hhi；席位 buy_lhasa_ratio/famous_net_bias；
+# 解析 scrap_data/longhu/*.json → 8 特征列，每族 1 根：
+# 方向 net_buy_ratio；结构 buy/sell_hhi；席位 buy_lhasa_ratio/famous_net_bias；
 # 原因 reason_turnover/reason_amplitude；存在位 is_longhu。
-# 老 builder 死列不进（change/turnover_percent_norm 解析 bug、top5_ratio≡1、恒等共线族、
-# north/inst 席位 t<3.7 且事件内非零率≤44%）。
-# ⚠️ 同 (code,date) 多条 reason 记录 → 保留文件序最后一条（与老管线 dict 覆盖语义一致，
-#    保证与已探针验证的事件表逐值可比）。
+# 未采用列：change/turnover_percent_norm（解析 bug）、top5_ratio（恒等共线）、
+# north/inst 席位（t<3.7 且事件内非零率≤44%）。
+# 同 (code,date) 多条 reason 记录 → 保留文件序最后一条。
 
-LONGHU_DIR = f'{ROOT}/AshareData/dataset/scrap_data/longhu'
-LONGHU_PARQUET = f'{ROOT}/AshareData/dataset/built_data/longhu_features.parquet'
+LONGHU_DIR = f'{SCRAP_DATA_DIR}/longhu'
+LONGHU_PARQUET = f'{BUILT_DATA_DIR}/longhu_features.parquet'
 os.makedirs(os.path.dirname(LONGHU_PARQUET), exist_ok=True)
 
 LONGHU_COLUMNS = ['date', 'trade_date_idx', 'code', 'code_idx', 'is_longhu',

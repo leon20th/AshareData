@@ -1,6 +1,6 @@
 """极简 dataloader —— parquet → numpy，不做列计算/特征工程。
 
-【全项目数据唯一出口】
+【数据唯一出口】
 - 所有数据必须经 `build_train_and_val_dataloaders` 获取：训练/eval 直接消费返回的
 train/val DataLoader；预测/分析等只需 storage 的场景走 `storage_only=True` 轻量模式
 （返回 (storage, None)，不构建样本池）。
@@ -29,7 +29,7 @@ import tqdm
 from tqdm.contrib import logging as tqdm_logging
 from torch.utils.data import DataLoader, Dataset, default_collate
 
-from env_setting import ROOT
+from AshareData.paths import BASE_FEATURE_DIR
 from AshareData.utils.exchanges_utils.a_open import get_trade_date_list
 from AshareData.utils.log_util import get_logger
 
@@ -99,7 +99,7 @@ class KlineDataConfig:
     special_codes: List[str] = field(default_factory=list)
     begin_date: Optional[str] = None
     end_date: Optional[str] = None
-    data_dir: str = f"{ROOT}/AshareData/dataset/built_data/base_feature"
+    data_dir: str = BASE_FEATURE_DIR
     need_cols: Optional[List[str]] = None
     read_chunk_size: Optional[int] = 256
 
@@ -428,7 +428,7 @@ class _KlineDataset(Dataset):
     每个样本 = arr[end - total_len : end, :] 的连续切片，
     由 collate 后统一 to(device)。
 
-    fake_target_tail（实盘）：为「末行日期 = 数据最新日」的股票追加一条虚拟样本，
+    fake_target_tail：为「末行日期 = 数据最新日」的股票追加一条虚拟样本，
     目标日 = last_tdi+1（尚未有数据）；__getitem__ 以末行副本伪造目标行。
     特征统计与模型输入只见前 feature_len 行（target_horizon 截尾），虚拟行仅暴露
     close_tgt=close_dec（0 收益）与 target_tdi 键 ⇒ eval 循环对最后决策日自然接上。
@@ -522,7 +522,7 @@ class _KlineDataset(Dataset):
                 idx = rng.choice(valid.shape[0], size=keep, replace=False)
                 valid = valid[idx]
 
-            # 实盘 fake 目标日：该票末行 = 最新数据日 ⇒ 虚拟样本（end=n，窗口 =
+            # fake 目标日：该票末行 = 最新数据日 ⇒ 虚拟样本（end=n，窗口 =
             # 最后 total_len-1 行真实 + __getitem__ 伪造目标行；质量口径 = 这 60 行，
             # 与 predict 整窗逐行同集合）。不掺入 sample_ratio：决策日截面须完整。
             # 注册门 = 虚拟目标日 last_tdi+1 落在 target 范围内（target_end=None 时
@@ -807,31 +807,30 @@ def build_train_and_val_dataloaders(
     fake_target_tail: bool = False,
     storage_only: bool = False,
 ) -> Tuple[Any, Optional[DataLoader]]:
-    """构建训练/验证 DataLoader —— 全项目唯一数据出口（监督线 + PPO loader 线共用）。
+    """构建训练/验证 DataLoader —— 数据唯一出口。
 
-    data_transform: 可插拔的 batch 级变换（如 general_datatransform.data_transform
-    的组合）。传入后在 worker 进程内 default_collate 之后执行（CPU 并行、不阻塞主循环）；
+    data_transform: 可插拔的 batch 级变换。传入后在 worker 进程内
+    default_collate 之后执行（CPU 并行、不阻塞主循环）；
     不传则维持默认 default_collate。需 num_workers>0 才有加速效果，且 transform
     必须是可 pickle 的顶层函数（或 functools.partial 包装）。
     val_batch_size / val_num_workers: 验证集独立批次大小与 worker 数（None=沿用
     train 值）。val 是完整遍历、无梯度，瓶颈在 GPU forward，batch 调大只减 kernel
     次数不改任何指标（日期分组采样保证 daily-AUC 分组不受 batch 影响）。
 
-    以下 7 参为 PPO loader 线（train/val 异构）新增，默认值 = 原逐位行为：
-    train_target_horizon: train 侧独立 horizon（None=沿用 target_horizon）。PPO 传
-      H+1（滑窗多步样本），val 仍 1（单步）——两线窗口长度不同。
+    以下 7 参用于 train/val 异构采样，默认值 = 原逐位行为：
+    train_target_horizon: train 侧独立 horizon（None=沿用 target_horizon）。可传
+      H+1（滑窗多步样本）而 val 仍 1（单步）——两侧窗口长度可不同。
     train_data_transform / val_data_transform: 分侧 transform，覆盖 data_transform
-      （None=沿用）。PPO：train=ppo_data_transform(mode=rollout/forward,H)、
-      val=mode=eval,H=0 —— 同一 batch 级插桩点，两侧可异构。
-    train_drop_last: 仅 train 侧 sampler（PPO 每批须满 B 以对齐 rollout 网格）。
+      （None=沿用）——同一 batch 级插桩点，两侧可异构。
+    train_drop_last: 仅 train 侧 sampler（用于要求 train 每批满 B 的场景）。
     val_sort_by_date / val_group_by_date: 仅 val 侧采样模式（None=跟 train 同名参）。
-      PPO：train 可 group_by_date，val 须 sort_by_date 且**不**分组（eval 日门
-      `batch["target_tdi"][0]` 依赖批内目标日唯一）。
-    fake_target_tail: 仅 val 侧透传 _KlineDataset（实盘末决策日虚拟目标日）。
+      val 评估若依赖批内目标日唯一（如取 `batch["target_tdi"][0]`），须
+      sort_by_date 且**不**分组。
+    fake_target_tail: 仅 val 侧透传 _KlineDataset（末决策日虚拟目标日）。
     storage_only: 轻量模式——只构建 storage（范围/列由 config 决定）并返回
       (storage, None)，不构建 train/val 样本池与 DataLoader。预测/分析等只需
-      storage 的调用方一律走这里（本函数 = 全项目数据唯一出口）。
-    注意：storage 范围由 `config` 决定（PPO 必须传日期=None 的全量 config，
+      storage 的调用方一律走这里（数据唯一出口）。
+    注意：storage 范围由 `config` 决定（须传日期=None 的全量 config，
     否则 fake_tail 的 last_tdi 判定与 eval 末日会错）；begin/end/split 三参只进
     两侧 dataset 的 target 窗口。
     """
@@ -877,8 +876,8 @@ def build_train_and_val_dataloaders(
     cf_tr = None if tr_tf is None else _TransformCollate(tr_tf)
     cf_v = None if v_tf is None else _TransformCollate(v_tf)
     # sampler 按侧独立判定：train 仅看 train 的 sort/group，val 仅看 v_sort/v_group。
-    # （两侧共用一个判定会让 PPO 的「train=Order × val=DateGroup」异构组合失效；
-    #  对既有调用方：v_* 默认跟随同名参 ⇒ 判定与旧实现等价。）
+    # （两侧共用一个判定会让「train=Order × val=DateGroup」的异构组合失效；
+    #  v_* 默认跟随同名参 ⇒ 与旧实现等价。）
     if sort_by_date or group_by_date:
         train_sampler = _DateGroupBatchSampler(
             train_ds, batch_size, drop_last=train_drop_last,

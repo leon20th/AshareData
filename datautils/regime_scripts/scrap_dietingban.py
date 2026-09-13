@@ -11,7 +11,7 @@ from AshareData.utils.tsh_utils.login_util import login_wencai
 from io import StringIO
 import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
-from env_setting import ROOT
+from AshareData.paths import SCRAP_DATA_DIR
 import traceback
 from bs4 import BeautifulSoup
 
@@ -24,7 +24,7 @@ class ScrapDietingban(Scrap):
         if not date:
             date = datetime.now().strftime('%Y%m%d')
         self.date = date
-        self.result_path = f'{ROOT}/AshareData/dataset/scrap_data/dietingban'
+        self.result_path = f'{SCRAP_DATA_DIR}/dietingban'
         os.makedirs(self.result_path, exist_ok=True)
         self.driver = None
 

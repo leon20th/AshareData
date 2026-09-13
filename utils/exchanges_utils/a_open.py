@@ -1,8 +1,8 @@
 import json
-from env_setting import ROOT
+from AshareData.paths import META_DIR
 from datetime import datetime, time as dt_time
 
-trade_date_list = json.load(open(f"{ROOT}/utils/exchanges_meta/trade_date_list.json", "r"))
+trade_date_list = json.load(open(f"{META_DIR}/trade_date_list.json", "r"))
 trade_date_dict = {}
 for idx, _t_date in enumerate(trade_date_list):
     trade_date_dict[_t_date] = idx
@@ -14,11 +14,11 @@ def update_a_open():
     trade_date_df = ak.tool_trade_date_hist_sina()
     trade_date_list = trade_date_df["trade_date"].astype(str).tolist()
     trade_date_list = [t.replace("-", "") for t in trade_date_list]
-    json.dump(trade_date_list, open(f"{ROOT}/utils/exchanges_meta/trade_date_list.json", "w"), ensure_ascii=False)
+    json.dump(trade_date_list, open(f"{META_DIR}/trade_date_list.json", "w"), ensure_ascii=False)
 
 
 def is_a_share_open_today(date=None):
-    trade_date_list = json.load(open(f"{ROOT}/utils/exchanges_meta/trade_date_list.json", "r"))
+    trade_date_list = json.load(open(f"{META_DIR}/trade_date_list.json", "r"))
     if date is None:
         date = datetime.now().strftime("%Y%m%d")
     if date in trade_date_list:

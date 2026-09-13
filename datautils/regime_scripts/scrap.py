@@ -1,4 +1,4 @@
-from env_setting import CHROME_DRIVER_PATH
+from AshareData.paths import CHROME_DRIVER_PATH
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service

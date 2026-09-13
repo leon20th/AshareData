@@ -1,4 +1,4 @@
-from env_setting import ROOT
+from AshareData.paths import BASE_FEATURE_DIR
 from AshareData.utils.exchanges_utils.stock_utils import get_code_list
 
 import json
@@ -18,7 +18,7 @@ from AshareData.datautils.dataloaders.feature_build.extra_features import (
     get_longhu_feature
 )
 
-FeatDIR = f'{ROOT}/AshareData/dataset/built_data/base_feature'
+FeatDIR = BASE_FEATURE_DIR
 os.makedirs(FeatDIR, exist_ok=True)
 
 def process_feature(codes, rebuild=False):

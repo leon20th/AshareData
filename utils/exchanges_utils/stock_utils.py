@@ -12,12 +12,12 @@ except ImportError:
     lazy_pinyin = None
     pypinyin_pinyin = None
 
-from env_setting import ROOT
+from AshareData.paths import META_DIR
 
-code_with_exchanges = json.load(open(f"{ROOT}/utils/exchanges_meta/code_with_exchanges.json", "r"))
-stock_code_to_name_map = json.load(open(f"{ROOT}/utils/exchanges_meta/stock_code_to_name.json", "r", encoding="utf-8"))
+code_with_exchanges = json.load(open(f"{META_DIR}/code_with_exchanges.json", "r"))
+stock_code_to_name_map = json.load(open(f"{META_DIR}/stock_code_to_name.json", "r", encoding="utf-8"))
 stock_name_to_code_map = {v: k for k, v in stock_code_to_name_map.items()}
-code_list = json.load(open(f"{ROOT}/utils/exchanges_meta/code_list_append.json", "r"))
+code_list = json.load(open(f"{META_DIR}/code_list_append.json", "r"))
 
 MAIN_BOARD_PREFIXES = ("00", "60")
 CHINEXT_PREFIXES = ("30",)

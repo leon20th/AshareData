@@ -1,13 +1,13 @@
 import os
 import pandas as pd
-from env_setting import ROOT
+from AshareData.paths import BASE_FEATURE_DIR, DAILY_KLINE_DIR, M15_KLINE_DIR
 from AshareData.datautils.dataloaders.feature_build.feature_utils import *
 
 KLINE_DIRS = {
-    'daily': f'{ROOT}/AshareData/dataset/kline_data/daily_kline',
-    'm15':   f'{ROOT}/AshareData/dataset/kline_data/m15_kline',
+    'daily': DAILY_KLINE_DIR,
+    'm15':   M15_KLINE_DIR,
 }
-FeatDIR = f'{ROOT}/AshareData/dataset/built_data/base_feature'
+FeatDIR = BASE_FEATURE_DIR
 
 # 固定 parquet schema：所有数值列统一为 float64，避免 NaN 导致 int/float 不一致
 PARQUET_NUM_SCHEMA = {

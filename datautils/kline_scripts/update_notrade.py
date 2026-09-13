@@ -3,7 +3,7 @@ import os
 import pandas as pd
 import tqdm
 
-from env_setting import ROOT
+from AshareData.paths import DAILY_KLINE_DIR, INFO_DIR
 from AshareData.utils.log_util import get_logger
 from AshareData.utils.read_file_utils import read_csv_by_tail
 
@@ -21,13 +21,13 @@ manual_update = [
 class UpdateNotrade:
     """Tracks stocks that are currently suspended (tradestatus=0 at end of history)."""
 
-    NOTRADE_CSV = f'{ROOT}/AshareData/dataset/kline_data/info/notrade_yet.csv'
+    NOTRADE_CSV = f'{INFO_DIR}/notrade_yet.csv'
     COLUMNS = ['code', 'notrade_date']
     # Number of tail rows to scan per stock CSV when detecting suspension runs.
     TAIL_SCAN_ROWS = 500
 
     def __init__(self, force_init=False):
-        self.daily_database = f'{ROOT}/AshareData/dataset/kline_data/daily_kline'
+        self.daily_database = DAILY_KLINE_DIR
         self.notrade_dir = os.path.dirname(self.NOTRADE_CSV)
         self.df_notrade_yet = self._load_notrade_yet(force_init=force_init)
         self.changed = False

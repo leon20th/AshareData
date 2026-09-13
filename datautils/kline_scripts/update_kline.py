@@ -5,7 +5,7 @@ import json
 import pandas as pd
 import tqdm
 
-from env_setting import ROOT
+from AshareData.paths import DAILY_KLINE_DIR, M15_KLINE_DIR
 from AshareData.utils.log_util import get_logger
 from tqdm.contrib.logging import logging_redirect_tqdm
 from AshareData.utils.exchanges_utils.a_open import get_target_trade_date
@@ -17,8 +17,8 @@ logger = get_logger('更新k线数据')
 
 class UpdateKline:
     def __init__(self):
-        self.daily_database = f'{ROOT}/AshareData/dataset/kline_data/daily_kline'
-        self.m15_database = f'{ROOT}/AshareData/dataset/kline_data/m15_kline'
+        self.daily_database = DAILY_KLINE_DIR
+        self.m15_database = M15_KLINE_DIR
         self.frequency_map = {
             'd': self.daily_database,
             '15': self.m15_database,

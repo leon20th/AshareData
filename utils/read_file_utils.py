@@ -275,9 +275,13 @@ def read_csv_by_tail(file_path, n_lines=5, start_index=None, end_index=None):
 
 
 if __name__ == "__main__":
+    import sys
     import time
-    from env_setting import ROOT
-    file_path = f'{ROOT}/business_models/kline_models/kline_dataset_build/dataset/kline_uniform_samples/sh.603248.csv'
+    from AshareData.paths import DAILY_KLINE_DIR
+
+    file_path = sys.argv[1] if len(sys.argv) > 1 else f'{DAILY_KLINE_DIR}/sh.603248.csv'
+    if not os.path.exists(file_path):
+        sys.exit(f'样例文件不存在：{file_path}（可传入其他 CSV 路径）')
 
     st = time.time()
     last_lines = read_last_lines(file_path, n_lines=60)

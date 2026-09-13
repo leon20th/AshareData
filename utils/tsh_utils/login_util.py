@@ -7,10 +7,11 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
 
-os.makedirs('business_tmp_files/tsh', exist_ok=True)
+from AshareData.paths import CHROME_DRIVER_PATH, TMP_DIR
 
-# 滑块验证码模型：AshareData/utils/slide_captcha_model 子模块
-# （git@github.com:leon20th/slide_captcha_model.git，MiniYOLO + 线上权重）
+os.makedirs(TMP_DIR, exist_ok=True)
+
+# 滑块验证码模型：utils/slide_captcha_model 子模块（git@github.com:leon20th/slide_captcha_model.git，MiniYOLO + 线上权重）
 _SLIDE_ROOT = os.path.abspath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), '..', 'slide_captcha_model'))
 if os.path.dirname(_SLIDE_ROOT) not in sys.path:
@@ -49,7 +50,7 @@ def predict_captcha(model, image_path):
 
 def get_tsh_cookies_static():
     try:
-        with open("business_tmp_files/tsh/tsh_cookies.json", "r") as f:
+        with open(f"{TMP_DIR}/tsh_cookies.json", "r") as f:
             cookie = json.load(f)
             return cookie
     except:
@@ -61,7 +62,7 @@ def login_tsh(driver):
     <div data-statid="sns_fxts_index.agree" class="btn riskhint-D-sure btn-h36 tk-riskhint-D-sure bluebg">我已阅读并同意<span class="timeBox" style="display: none;">（<span class="timeCount">0</span>S）</span></div>
     '''
     try:
-        with open("business_tmp_files/tsh/tsh_cookies.json", "r") as f:
+        with open(f"{TMP_DIR}/tsh_cookies.json", "r") as f:
             cookie = json.load(f)
         driver.delete_all_cookies()
         for cookie_dict in cookie:
@@ -135,10 +136,10 @@ def login_tsh(driver):
                 captcha_img = WebDriverWait(driver, 15).until(
                     EC.visibility_of_element_located((By.ID, 'slicaptcha-img'))
                 )
-                captcha_img.screenshot('business_tmp_files/tsh/captcha_image.png')
+                captcha_img.screenshot(f'{TMP_DIR}/captcha_image.png')
 
                 try:
-                    pred_x = predict_captcha(model, 'business_tmp_files/tsh/captcha_image.png')
+                    pred_x = predict_captcha(model, f'{TMP_DIR}/captcha_image.png')
                     slider = driver.find_element(By.ID, 'slider')
                     from selenium.webdriver import ActionChains
                     action = ActionChains(driver)
@@ -152,7 +153,7 @@ def login_tsh(driver):
                 except:
                     # 保存cookie
                     cookies = driver.get_cookies()
-                    with open("business_tmp_files/tsh/tsh_cookies.json", "w") as f:
+                    with open(f"{TMP_DIR}/tsh_cookies.json", "w") as f:
                         json.dump(cookies, f)
                     return True
             except Exception as cpt_err:
@@ -165,7 +166,7 @@ def login_tsh(driver):
 
 def login_wencai(driver):
     try:
-        with open("business_tmp_files/tsh/wencai_cookies.json", "r") as f:
+        with open(f"{TMP_DIR}/wencai_cookies.json", "r") as f:
             cookie = json.load(f)
         driver.delete_all_cookies()
         for cookie_dict in cookie:
@@ -229,10 +230,10 @@ def login_wencai(driver):
                 captcha_img = WebDriverWait(driver, 15).until(
                     EC.visibility_of_element_located((By.ID, 'slicaptcha-img'))
                 )
-                captcha_img.screenshot('business_tmp_files/tsh/captcha_image.png')
+                captcha_img.screenshot(f'{TMP_DIR}/captcha_image.png')
 
                 try:
-                    pred_x = predict_captcha(model, 'business_tmp_files/tsh/captcha_image.png')
+                    pred_x = predict_captcha(model, f'{TMP_DIR}/captcha_image.png')
                     slider = driver.find_element(By.ID, 'slider')
                     from selenium.webdriver import ActionChains
                     action = ActionChains(driver)
@@ -246,7 +247,7 @@ def login_wencai(driver):
                 except:
                     # 保存cookie
                     cookies = driver.get_cookies()
-                    with open("business_tmp_files/tsh/wencai_cookies.json", "w") as f:
+                    with open(f"{TMP_DIR}/wencai_cookies.json", "w") as f:
                         json.dump(cookies, f)
                     return True
             except Exception as cpt_err:
@@ -259,7 +260,6 @@ def login_wencai(driver):
 
 def manual_login_wencai():
     import time
-    from env_setting import CHROME_DRIVER_PATH
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
@@ -284,7 +284,7 @@ def manual_login_wencai():
         time.sleep(1)
     # 保存cookie
     cookies = driver.get_cookies()
-    with open("business_tmp_files/tsh/wencai_cookies.json", "w") as f:
+    with open(f"{TMP_DIR}/wencai_cookies.json", "w") as f:
         json.dump(cookies, f)
     print("登录信息已保存，下次将自动登录")
     driver.quit()
