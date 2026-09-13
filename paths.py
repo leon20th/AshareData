@@ -29,18 +29,19 @@ TMP_DIR = os.path.join(ASHARE_ROOT, '.cache')   # 运行期缓存（账号/cooki
 # ---- 业务默认值 ----
 _BEGIN = '20200101'   # 历史数据默认起始日（无已有数据时的兜底）
 
-# ---- chromedriver（默认位置与 setup.sh 的安装路径一致；环境变量可覆盖） ----
+# ---- chromedriver（默认位置与 setup.sh 的安装路径一致：~/.asharedata_deps；环境变量可覆盖） ----
 if sys.platform == 'darwin':
     _CHROME_TAG = 'mac-arm64' if platform.machine() == 'arm64' else 'mac-x64'
-    _CHROME_DEPS = os.path.expanduser('~/Documents/workplace/deps')
 else:
     _CHROME_TAG = 'linux64'
-    _CHROME_DEPS = os.path.expanduser('~/deps')
 
 CHROME_DRIVER_PATH = (
     os.environ.get('CHROME_DRIVER_PATH')
     or next((p for p in (
-        os.path.join(_CHROME_DEPS, f'chromedriver-{_CHROME_TAG}', 'chromedriver'),
+        os.path.expanduser(f'~/.asharedata_deps/chromedriver-{_CHROME_TAG}/chromedriver'),
+        os.path.expanduser('~/deps/chromedriver-linux64/chromedriver'),                         # 旧位置（兼容）
+        os.path.expanduser('~/Documents/workplace/deps/chromedriver-mac-arm64/chromedriver'),   # 旧位置（兼容）
+        os.path.expanduser('~/Documents/workplace/deps/chromedriver-mac-x64/chromedriver'),     # 旧位置（兼容）
         '/usr/bin/chromedriver',
         '/usr/local/bin/chromedriver',
     ) if os.path.exists(p)), None)

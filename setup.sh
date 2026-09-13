@@ -8,6 +8,7 @@ cd "$(dirname "$0")"
 ROOT="$(pwd)"
 TMP_DIR="$ROOT/.cache"
 ACCOUNT_FILE="$TMP_DIR/tsh_account.json"
+DEPS_DIR="$HOME/.asharedata_deps"
 OS="$(uname -s)"
 
 # ---------------- 1. 账号密码 → 本地缓存 ----------------
@@ -59,7 +60,7 @@ if [ "$OS" = "Darwin" ]; then
         arm64) PLATFORM="mac-arm64" ;;
         *)     PLATFORM="mac-x64" ;;
     esac
-    install_chromedriver "$HOME/Documents/workplace/deps" "$PLATFORM" "$CHROME_VER"
+    install_chromedriver "$DEPS_DIR" "$PLATFORM" "$CHROME_VER"
 else
     # ================= Linux（Debian/Ubuntu，含 WSL） =================
     echo "==> Linux：安装 Google Chrome"
@@ -73,7 +74,7 @@ else
     fi
     command -v unzip >/dev/null || sudo apt-get install -y unzip
     CHROME_VER="$(google-chrome --version | awk '{print $NF}')"
-    install_chromedriver "$HOME/deps" "linux64" "$CHROME_VER"
+    install_chromedriver "$DEPS_DIR" "linux64" "$CHROME_VER"
 fi
 
 echo
