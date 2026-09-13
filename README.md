@@ -52,8 +52,8 @@ from AshareData.dataloader import KlineDataConfig, build_train_and_val_dataloade
 
 ## 依赖与外部文件
 
-- Python 3.10+；主要三方库：`pandas`、`pyarrow`、`polars`、`numpy`、`tqdm`、`selenium`、`baostock`、`openpyxl`、`akshare`（更新日历）、`pypinyin`（可选）、`torch`/`torchvision`（滑块定位模型）。
-- **chromedriver**：爬虫用；按 环境变量 `CHROME_DRIVER_PATH` → 常见安装路径 → `PATH` 依次探测。
+- Python 3.10+；依赖清单见 `requirements.txt`（`setup.sh` 自动安装）：`pandas`、`pyarrow`、`polars`、`numpy`、`tqdm`、`selenium`、`baostock`、`openpyxl`、`akshare`（更新日历）、`pypinyin`（可选）、`torch`/`torchvision`（滑块定位模型）。
+- **chromedriver**：爬虫用；`setup.sh` 安装到 `~/.asharedata_deps/`，按 环境变量 `CHROME_DRIVER_PATH` → 该目录 → 系统路径 → `PATH` 依次探测。
 - **子模块**：首次克隆后执行 `git submodule update --init`。
 
 ## 说明

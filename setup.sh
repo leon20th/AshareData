@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # AshareData 环境安装：
 #   1) 交互输入同花顺账号密码 → 写入本地缓存
-#   2) 安装 Chrome + chromedriver（macOS / Linux 自动分支）
+#   2) 安装 Python 依赖（requirements.txt）
+#   3) 安装 Chrome + chromedriver（macOS / Linux 自动分支）
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -22,7 +23,13 @@ printf '{"username": "%s", "password": "%s"}\n' "$TSH_USER" "$TSH_PASS" > "$ACCO
 chmod 600 "$ACCOUNT_FILE"
 echo "已写入 $ACCOUNT_FILE"
 
-# ---------------- 2. Chrome + chromedriver ----------------
+# ---------------- 2. Python 依赖 ----------------
+PYTHON="${PYTHON:-$(command -v python || command -v python3 || echo python3)}"
+echo "==> 安装 Python 依赖（$PYTHON）"
+"$PYTHON" -m pip install -r "$ROOT/requirements.txt"
+echo "Python 依赖已安装"
+
+# ---------------- 3. Chrome + chromedriver ----------------
 # chromedriver 从 Chrome for Testing 下载；版本优先对齐已安装 Chrome，无对应包时回退最新稳定版
 install_chromedriver() {
     local deps_dir="$1" platform="$2" chrome_ver="$3"
@@ -78,4 +85,4 @@ else
 fi
 
 echo
-echo "完成。Python 依赖（如未装）: pip install -r $ROOT/requirements.txt"
+echo "完成。"
