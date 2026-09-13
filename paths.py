@@ -24,6 +24,9 @@ BASE_FEATURE_DIR = os.path.join(BUILT_DATA_DIR, 'base_feature')
 META_DIR = os.path.join(ASHARE_ROOT, 'utils', 'exchanges_meta')   # 股票代码表/交易日历
 TMP_DIR = os.path.join(ASHARE_ROOT, '.cache')   # 运行期缓存（账号/cookie/验证码截图，不进 git）
 
+# ---- 业务默认值 ----
+_BEGIN = '20200101'   # 历史数据默认起始日（无已有数据时的兜底）
+
 # ---- chromedriver ----
 CHROME_DRIVER_PATH = (
     os.environ.get('CHROME_DRIVER_PATH')

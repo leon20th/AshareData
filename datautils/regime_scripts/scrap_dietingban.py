@@ -11,13 +11,12 @@ from AshareData.utils.tsh_utils.login_util import login_wencai
 from io import StringIO
 import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
-from AshareData.paths import SCRAP_DATA_DIR
+from AshareData.paths import SCRAP_DATA_DIR, _BEGIN
 import traceback
 from bs4 import BeautifulSoup
 
 setup_logging()
 logger = get_logger('跌停板爬取')
-_BEGIN = '20200101'   # 无历史数据时的默认抓取起始日
 
 class ScrapDietingban(Scrap):
     def __init__(self, date=''):
