@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import tqdm
 import requests
 from selenium import webdriver
@@ -12,28 +13,39 @@ import time
 
 os.makedirs('business_tmp_files/tsh', exist_ok=True)
 
+# 滑块验证码模型：AshareData/utils/slide_captcha_model 子模块
+# （git@github.com:leon20th/slide_captcha_model.git，MiniYOLO + 线上权重）
+_SLIDE_ROOT = os.path.abspath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'slide_captcha_model'))
+if os.path.dirname(_SLIDE_ROOT) not in sys.path:
+    sys.path.append(os.path.dirname(_SLIDE_ROOT))   # 包式导入 slide_captcha_model.*（append，不抢同名模块）
+_SLIDE_WEIGHTS = os.path.join(_SLIDE_ROOT, 'models', 'mini_yolo_online_best.pth')
+
 # 破解验证码
 def get_yolo_model():
+    """加载滑块定位模型：直接用 slide_captcha_model 子模块（MiniYOLO + 线上权重）。"""
     import torch
-    from business_models.tsh_login_models.slide_captcha_model.model import YOLOv1
-    from PIL import Image
+    from slide_captcha_model.model import MiniYOLO
 
-    pth = "business_models/tsh_login_models/slide_captcha_model/models/yolov1_it0_epoch_30.pth"
-    tl = torch.load(pth)
-    model = YOLOv1(S=1, B=0, C=2)
-    model.load_state_dict(tl['model_state_dict'])
+    ckpt = torch.load(_SLIDE_WEIGHTS, map_location='cpu', weights_only=False)
+    model = MiniYOLO()
+    model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
 
     return model
 
 def predict_captcha(model, image_path):
+    """预测滑块 x 位移：预处理与 slide_captcha_model/predict.py 一致
+    （Resize(282,162)+ToTensor，x 归一×282）。"""
     import torch
-    from business_models.tsh_login_models.slide_captcha_model.train import preprocess
+    import torchvision.transforms as transforms
     from PIL import Image
     with torch.no_grad():
         image = Image.open(image_path).convert('RGB')
-        input_tensor = preprocess(image)
-        input_tensor = input_tensor.unsqueeze(0)  # 添加批次维度
+        input_tensor = transforms.Compose([
+            transforms.Resize((282, 162)),
+            transforms.ToTensor(),
+        ])(image).unsqueeze(0)  # 添加批次维度
         outputs = model(input_tensor)
         pred_x = int(outputs[0, 0].item() * 282)
         return pred_x
