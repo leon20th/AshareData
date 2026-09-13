@@ -1,10 +1,6 @@
-import time
 from env_setting import CHROME_DRIVER_PATH
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 
 class Scrap:
@@ -66,52 +62,3 @@ class Scrap:
         
         return driver
 
-    def get_content_with_selenium(self, headless=True):
-        """
-        使用Selenium获取动态加载的内容
-        headless: 是否使用无头模式（默认为True，静默运行）
-        """
-
-        driver = self.get_driver(headless=headless)
-        
-        try:
-            driver.get(self.url)
-            
-            # 等待页面加载
-            wait = WebDriverWait(driver, 30)
-            wait.until(EC.presence_of_element_located((By.CLASS_NAME, "all_list")))
-            
-            # 滚动页面以确保所有内容加载
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
-            
-            # 在headless模式下，可能需要额外的等待和交互
-            if headless:
-                # 等待页面完全加载
-                wait.until(lambda driver: driver.execute_script("return document.readyState") == "complete")
-                # 额外的滚动以触发懒加载
-                for i in range(3):
-                    driver.execute_script(f"window.scrollTo(0, {(i+1) * 1000});")
-                    time.sleep(0.5)
-                # 回到顶部
-                driver.execute_script("window.scrollTo(0, 0);")
-                time.sleep(1)
-
-            # 获取页面源码
-            page_source = driver.page_source
-
-            # 使用BeautifulSoup解析
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(page_source, 'html.parser')
-            
-            # 提取内容（根据实际页面结构调整选择器）
-            content = self.extract_content_from_soup(soup)
-
-            # 可选：截图保存（用于调试）
-            # if headless:
-            #     driver.save_screenshot('headless_page_screenshot.png')
-            
-            return content
-            
-        finally:
-            driver.quit()

@@ -6,7 +6,6 @@ trade_date_list = json.load(open(f"{ROOT}/utils/exchanges_meta/trade_date_list.j
 trade_date_dict = {}
 for idx, _t_date in enumerate(trade_date_list):
     trade_date_dict[_t_date] = idx
-trade_idx_dict = {int(v):k for v, k in trade_date_dict.items()}
 
 def update_a_open():
     # update every year
@@ -37,9 +36,6 @@ def get_trade_date_idx(date):
     if date not in trade_date_dict:
         return -1
     return trade_date_dict[date]
-
-def get_trade_date_from_idx(idx):
-    return trade_idx_dict.get(int(idx))
 
 def get_target_trade_date(end_date=None):
     trade_dates = sorted(get_trade_date_list())

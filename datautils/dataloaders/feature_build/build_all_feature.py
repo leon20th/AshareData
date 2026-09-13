@@ -3,7 +3,6 @@ from AshareData.utils.exchanges_utils.stock_utils import get_code_list
 
 import json
 import os
-import pandas as pd
 import tqdm
 from datetime import datetime
 
@@ -21,15 +20,6 @@ from AshareData.datautils.dataloaders.feature_build.extra_features import (
 
 FeatDIR = f'{ROOT}/AshareData/dataset/built_data/base_feature'
 os.makedirs(FeatDIR, exist_ok=True)
-
-def check_parquet_field(dir=FeatDIR, field='date', opt='max'):
-    """遍历已有 parquet，返回最新的 date。"""
-    result = None
-    for f in os.listdir(dir):
-        if not f.endswith('.parquet'): continue
-        d = pd.read_parquet(f'{FeatDIR}/{f}', columns=[field])[field].max()
-        result = d if result < d else (result or d)
-    return result
 
 def process_feature(codes, rebuild=False):
     """构建特征。codes 可以是单个 code 字符串或列表。"""

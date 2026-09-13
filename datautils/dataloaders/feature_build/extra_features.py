@@ -4,7 +4,7 @@
 import os, re, json
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from env_setting import ROOT
 
 from AshareData.datautils.dataloaders.feature_build.feature_utils import get_code_idx, get_trade_date_idx

@@ -1,26 +1,19 @@
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
-import base64
-import re
 import os
 import pandas as pd
 from datetime import datetime
 from AshareData.utils.log_util import setup_logging, get_logger
 from AshareData.datautils.regime_scripts.scrap import Scrap
 from AshareData.utils.tsh_utils.login_util import login_wencai
-import json
-from openpyxl import Workbook, load_workbook
 from io import StringIO
 import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 from env_setting import ROOT
 import traceback
 from bs4 import BeautifulSoup
-import re
 
 setup_logging()
 logger = get_logger('跌停板爬取')
@@ -182,7 +175,6 @@ class ScrapDietingban(Scrap):
 
 
 if __name__ == '__main__':
-    import pandas as pd
     from AshareData.utils.exchanges_utils.a_open import get_trade_date_list, get_target_trade_date
 
     all_dates = get_trade_date_list()

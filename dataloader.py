@@ -30,7 +30,7 @@ from tqdm.contrib import logging as tqdm_logging
 from torch.utils.data import DataLoader, Dataset, default_collate
 
 from env_setting import ROOT
-from AshareData.utils.exchanges_utils.a_open import get_trade_date_list, get_next_trade_date
+from AshareData.utils.exchanges_utils.a_open import get_trade_date_list
 from AshareData.utils.log_util import get_logger
 
 logger = get_logger("kline_dataset_build.dataloader_np")

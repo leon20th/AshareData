@@ -1,5 +1,4 @@
 import logging
-import os
 
 def setup_logging():
     """配置日志系统，只应调用一次"""

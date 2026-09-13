@@ -2,13 +2,9 @@ import json
 import os
 import sys
 import tqdm
-import requests
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver import ActionChains
 import time
 
 os.makedirs('business_tmp_files/tsh', exist_ok=True)
@@ -85,15 +81,15 @@ def login_tsh(driver):
         )
         risk_btn.click()
         print('点击风险提示同意按钮')
-    except Exception as e:
-        print(f'风险提示按钮未找到，可能已同意，继续登录')
+    except Exception:
+        print('风险提示按钮未找到，可能已同意，继续登录')
 
     try:
         WebDriverWait(driver, 10).until(
             EC.visibility_of_element_located((By.ID, 'J_THS_LoginBox'))
         )
-    except Exception as e:
-        print(f'登录框未找到，可能已登录，返回')
+    except Exception:
+        print('登录框未找到，可能已登录，返回')
         return True
     need_login = driver.find_elements(By.ID, 'J_THS_LoginBox')
     if not need_login:
@@ -121,7 +117,6 @@ def login_tsh(driver):
             EC.visibility_of_element_located((By.ID, 'slicaptcha'))
         )
 
-        cpt_err = None
         for i in range(10):
             try:
                 # 刷新
@@ -129,7 +124,7 @@ def login_tsh(driver):
                 slicaptcha_icon.click()
 
                 try:
-                    captcha_warn_element = WebDriverWait(driver, 1).until(
+                    WebDriverWait(driver, 1).until(
                         EC.visibility_of_element_located((By.ID, 'slicaptcha-warn-btn'))
                     )
                     warn_btn = driver.find_element(By.ID, 'slicaptcha-warn-btn')
@@ -140,7 +135,7 @@ def login_tsh(driver):
                 captcha_img = WebDriverWait(driver, 15).until(
                     EC.visibility_of_element_located((By.ID, 'slicaptcha-img'))
                 )
-                captcha_img.screenshot(f'business_tmp_files/tsh/captcha_image.png')
+                captcha_img.screenshot('business_tmp_files/tsh/captcha_image.png')
 
                 try:
                     pred_x = predict_captcha(model, 'business_tmp_files/tsh/captcha_image.png')
@@ -216,7 +211,6 @@ def login_wencai(driver):
             EC.visibility_of_element_located((By.ID, 'slicaptcha'))
         )
 
-        cpt_err = None
         for i in range(10):
             try:
                 # 刷新
@@ -224,7 +218,7 @@ def login_wencai(driver):
                 slicaptcha_icon.click()
 
                 try:
-                    captcha_warn_element = WebDriverWait(driver, 1).until(
+                    WebDriverWait(driver, 1).until(
                         EC.visibility_of_element_located((By.ID, 'slicaptcha-warn-btn'))
                     )
                     warn_btn = driver.find_element(By.ID, 'slicaptcha-warn-btn')
@@ -235,7 +229,7 @@ def login_wencai(driver):
                 captcha_img = WebDriverWait(driver, 15).until(
                     EC.visibility_of_element_located((By.ID, 'slicaptcha-img'))
                 )
-                captcha_img.screenshot(f'business_tmp_files/tsh/captcha_image.png')
+                captcha_img.screenshot('business_tmp_files/tsh/captcha_image.png')
 
                 try:
                     pred_x = predict_captcha(model, 'business_tmp_files/tsh/captcha_image.png')
@@ -268,9 +262,6 @@ def manual_login_wencai():
     from env_setting import CHROME_DRIVER_PATH
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.chrome.service import Service
 
     chrome_options = Options()

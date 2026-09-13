@@ -1,5 +1,4 @@
 import json
-import os
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -125,15 +124,6 @@ def list_stock_search_records(allowed_codes: Iterable[str] | None = None) -> lis
     return filtered
 
 
-def search_stock_records(
-    query: str,
-    allowed_codes: Iterable[str] | None = None,
-    limit: int = 80,
-) -> list[StockSearchRecord]:
-    records = list_stock_search_records(allowed_codes=allowed_codes)
-    return filter_stock_search_records(query=query, records=records, limit=limit)
-
-
 def filter_stock_search_records(
     query: str,
     records: Iterable[StockSearchRecord],
@@ -156,24 +146,6 @@ def filter_stock_search_records(
 
     ranked.sort(key=lambda item: item[0])
     return [record for _, record in ranked[:limit]]
-
-
-def resolve_stock_query(query: str, allowed_codes: Iterable[str] | None = None) -> StockSearchRecord | None:
-    query_text = str(query or "").strip()
-    if not query_text:
-        return None
-
-    matches = search_stock_records(query_text, allowed_codes=allowed_codes, limit=20)
-    if not matches:
-        return None
-
-    lowered = query_text.lower()
-    for record in matches:
-        if lowered in {record.code, record.bare_code, record.name.lower(), record.initials, record.pinyin}:
-            return record
-    if len(matches) == 1:
-        return matches[0]
-    return None
 
 
 @lru_cache(maxsize=1)
@@ -266,16 +238,6 @@ def _stock_record_match_key(record: StockSearchRecord, query: str) -> tuple[int,
         return (8, name_lower.find(query), record.code)
     return None
 
-
-def price_limit_status(close, preclose, limit=0.1):
-    up_limit = round(preclose * (1 + limit), 2)
-    down_limit = round(preclose * (1 - limit), 2)
-    if close >= up_limit:
-        return "UP_LIMIT"
-    elif close <= down_limit:
-        return "DOWN_LIMIT"
-    else:
-        return "NORMAL"
 
 def get_price_limit(code, isST, isNew):
     """
