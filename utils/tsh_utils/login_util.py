@@ -103,13 +103,16 @@ def login_tsh(driver):
 
         model = get_yolo_model()
 
+        with open(f"{TMP_DIR}/tsh_account.json", "r", encoding="utf-8") as f:
+            account = json.load(f)
+
         username_input = driver.find_element(By.ID, 'uname')
         password_input = driver.find_element(By.ID, 'passwd')
 
         username_input.clear()
         password_input.clear()
-        username_input.send_keys("mx_lxy72vqqf")
-        password_input.send_keys("liang26535724")
+        username_input.send_keys(account["username"])
+        password_input.send_keys(account["password"])
 
         login_button = driver.find_element(By.CSS_SELECTOR, ".n_f.pointer.tc.submit_btn.enable_submit_btn")
         login_button.click()
@@ -197,13 +200,16 @@ def login_wencai(driver):
 
         driver.find_element(By.ID, 'to_account_login').click()
 
+        with open(f"{TMP_DIR}/tsh_account.json", "r", encoding="utf-8") as f:
+            account = json.load(f)
+
         username_input = driver.find_element(By.ID, 'uname')
         password_input = driver.find_element(By.ID, 'passwd')
 
         username_input.clear()
         password_input.clear()
-        username_input.send_keys("mx_lxy72vqqf")
-        password_input.send_keys("liang26535724")
+        username_input.send_keys(account["username"])
+        password_input.send_keys(account["password"])
 
         login_button = driver.find_element(By.CSS_SELECTOR, ".n_f.pointer.tc.submit_btn.enable_submit_btn")
         login_button.click()
