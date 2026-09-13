@@ -2,10 +2,12 @@
 
 - 数据目录全部由 ASHARE_ROOT 派生（dataset/...）；
 - 交易元数据（股票代码表/交易日历）随仓库携带在 utils/exchanges_meta；
-- chromedriver 按 环境变量 → 常见路径 → PATH 依次探测。
+- chromedriver 按 环境变量 → setup.sh 默认安装路径（随系统/架构） → PATH 依次探测。
 """
 import os
+import platform
 import shutil
+import sys
 
 # ---- 本包位置（自动寻址起点）----
 ASHARE_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -27,12 +29,18 @@ TMP_DIR = os.path.join(ASHARE_ROOT, '.cache')   # 运行期缓存（账号/cooki
 # ---- 业务默认值 ----
 _BEGIN = '20200101'   # 历史数据默认起始日（无已有数据时的兜底）
 
-# ---- chromedriver ----
+# ---- chromedriver（默认位置与 setup.sh 的安装路径一致；环境变量可覆盖） ----
+if sys.platform == 'darwin':
+    _CHROME_TAG = 'mac-arm64' if platform.machine() == 'arm64' else 'mac-x64'
+    _CHROME_DEPS = os.path.expanduser('~/Documents/workplace/deps')
+else:
+    _CHROME_TAG = 'linux64'
+    _CHROME_DEPS = os.path.expanduser('~/deps')
+
 CHROME_DRIVER_PATH = (
     os.environ.get('CHROME_DRIVER_PATH')
     or next((p for p in (
-        os.path.expanduser('~/deps/chromedriver-linux64/chromedriver'),
-        os.path.expanduser('~/Documents/workplace/deps/chromedriver-mac-arm64/chromedriver'),
+        os.path.join(_CHROME_DEPS, f'chromedriver-{_CHROME_TAG}', 'chromedriver'),
         '/usr/bin/chromedriver',
         '/usr/local/bin/chromedriver',
     ) if os.path.exists(p)), None)

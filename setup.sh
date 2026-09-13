@@ -60,9 +60,6 @@ if [ "$OS" = "Darwin" ]; then
         *)     PLATFORM="mac-x64" ;;
     esac
     install_chromedriver "$HOME/Documents/workplace/deps" "$PLATFORM" "$CHROME_VER"
-    if [ "$PLATFORM" != "mac-arm64" ]; then
-        echo "Intel mac：请导出 CHROME_DRIVER_PATH=$HOME/Documents/workplace/deps/chromedriver-mac-x64/chromedriver"
-    fi
 else
     # ================= Linux（Debian/Ubuntu，含 WSL） =================
     echo "==> Linux：安装 Google Chrome"
