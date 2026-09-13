@@ -39,9 +39,6 @@ CHROME_DRIVER_PATH = (
     os.environ.get('CHROME_DRIVER_PATH')
     or next((p for p in (
         os.path.expanduser(f'~/.asharedata_deps/chromedriver-{_CHROME_TAG}/chromedriver'),
-        os.path.expanduser('~/deps/chromedriver-linux64/chromedriver'),                         # 旧位置（兼容）
-        os.path.expanduser('~/Documents/workplace/deps/chromedriver-mac-arm64/chromedriver'),   # 旧位置（兼容）
-        os.path.expanduser('~/Documents/workplace/deps/chromedriver-mac-x64/chromedriver'),     # 旧位置（兼容）
         '/usr/bin/chromedriver',
         '/usr/local/bin/chromedriver',
     ) if os.path.exists(p)), None)
