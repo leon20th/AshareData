@@ -115,30 +115,3 @@ class Scrap:
             
         finally:
             driver.quit()
-
-
-    def reopen_current_page(self, driver):
-        url = driver.current_url
-        old_handle = driver.current_window_handle
-
-        # 先开一个新 tab（也可以改成 'window'）
-        driver.switch_to.new_window('tab')
-        new_handle = driver.current_window_handle
-
-        # 关闭旧 tab
-        driver.switch_to.window(old_handle)
-        driver.close()
-
-        # 切回新 tab，重新打开原页面
-        driver.switch_to.window(new_handle)
-        driver.get(url)
-
-        # 等待页面加载
-        wait = WebDriverWait(driver, 10)
-        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-
-    def block_network_imgs(self, driver):
-        driver.execute_cdp_cmd("Network.enable", {})
-        driver.execute_cdp_cmd("Network.setBlockedURLs", {
-            "urls": ["*.png", "*.jpg", "*.jpeg", "*.gif"]
-        })
