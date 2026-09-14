@@ -1,5 +1,28 @@
+import queue
+import threading
+
 import pandas as pd
 import baostock as bs
+
+QUERY_TIMEOUT = 120  # baostock 偶发卡死(连接半开), 超时后重登录并跳过该票
+
+
+def _call_with_timeout(fn, timeout=QUERY_TIMEOUT):
+    """在守护线程中执行 fn, 卡死不阻塞主流程; 返回 (ok, result_or_None)。"""
+    q = queue.Queue(maxsize=1)
+
+    def runner():
+        try:
+            q.put((True, fn()))
+        except Exception as e:
+            q.put((False, e))
+
+    threading.Thread(target=runner, daemon=True).start()
+    try:
+        return q.get(timeout=timeout)
+    except queue.Empty:
+        return False, None
+
 
 class QueryKlineUtils:
     def __init__(self):
@@ -10,6 +33,9 @@ class QueryKlineUtils:
             bs.login()
             self.login = True
 
+    def _reset_login(self):
+        self.login = False
+
     def query_history(self, code, start_date='2020-01-01', end_date='2026-01-21', frequency="d", adjustflag="2"):
         self.login_bs()
         fields = ['date', 'code', 'open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'tradestatus', 'pctChg', 'isST']
@@ -19,16 +45,30 @@ class QueryKlineUtils:
             fields = [f for f in fields if f not in unsupported_fields]
             fields.insert(1, 'time')
         try:
-            rs = bs.query_history_k_data_plus(code,
+            ok, rs = _call_with_timeout(lambda: bs.query_history_k_data_plus(
+                code,
                 ",".join(fields),
                 start_date=start_date, end_date=end_date,
-                frequency=frequency, adjustflag=adjustflag)
-            data_list = []
+                frequency=frequency, adjustflag=adjustflag))
+            if not ok or rs is None:
+                self._reset_login()
+                msg = f"code={code}, 获取失败: 查询超时>{QUERY_TIMEOUT}s, 结束日期={end_date}"
+                return None, msg
             if rs.error_code != '0':
                 msg = f"code={code}, 获取失败: {rs.error_msg}, 结束日期={end_date}"
                 return None, msg
-            while (rs.error_code == '0') & rs.next():
-                data_list.append(rs.get_row_data())
+
+            def _fetch_rows():
+                rows = []
+                while (rs.error_code == '0') & rs.next():
+                    rows.append(rs.get_row_data())
+                return rows
+
+            ok, data_list = _call_with_timeout(_fetch_rows)
+            if not ok:
+                self._reset_login()
+                msg = f"code={code}, 获取失败: 行读取超时>{QUERY_TIMEOUT}s, 结束日期={end_date}"
+                return None, msg
             result = pd.DataFrame(data_list, columns=rs.fields)
             # 日期区间
             date_range = f"{result['date'].min()} to {result['date'].max()}" if not result.empty else "no data"
