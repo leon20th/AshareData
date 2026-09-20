@@ -98,7 +98,7 @@ def _read_single_updown_file(filepath: str, is_limit_up: int) -> pd.DataFrame:
     return out
 
 
-def get_updown_limit_feature(update: bool = False, force_rebuild: bool = False) -> pd.DataFrame:
+def build_updown_limit_feature(update: bool = False, force_rebuild: bool = False) -> pd.DataFrame:
     """构建涨跌停历史特征(增量)。已有 parquet 只处理新文件，force_rebuild 全量重建。"""
     existing = pd.read_parquet(UPDOWN_PARQUET) if not force_rebuild and os.path.exists(UPDOWN_PARQUET) else None
     if not update:
@@ -160,7 +160,7 @@ def build_market_features(update: bool = False, force_rebuild: bool = False) -> 
         stock_count=('pctChg', 'count'),
     ).reset_index()
 
-    updown = get_updown_limit_feature(update=(update or force_rebuild))
+    updown = build_updown_limit_feature(update=(update or force_rebuild))
     if updown is not None:
         zt = updown[updown.is_limit_up == 1].groupby('date').size().rename('zhangting_count')
         dt = updown[updown.is_limit_up == -1].groupby('date').size().rename('dieting_count')
@@ -307,7 +307,7 @@ def _read_longhu_file(filepath: str) -> pd.DataFrame:
     return out.drop_duplicates(['date', 'code'], keep='last')
 
 
-def get_longhu_feature(update: bool = False, force_rebuild: bool = False) -> pd.DataFrame:
+def build_longhu_feature(update: bool = False, force_rebuild: bool = False) -> pd.DataFrame:
     """构建龙虎榜历史特征(增量)。已有 parquet 只处理新文件，force_rebuild 全量重建。"""
     existing = pd.read_parquet(LONGHU_PARQUET) if not force_rebuild and os.path.exists(LONGHU_PARQUET) else None
     if not update:
@@ -336,10 +336,10 @@ def get_longhu_feature(update: bool = False, force_rebuild: bool = False) -> pd.
 
 
 if __name__ == '__main__':
-    _ = get_updown_limit_feature(update=True, force_rebuild=True)
+    _ = build_updown_limit_feature(update=True, force_rebuild=True)
     data = build_market_features(force_rebuild=True)
     print(data)
     rank = build_pct_cross_rank(force_rebuild=True)
     print(rank)
-    lh = get_longhu_feature(update=True, force_rebuild=True)
+    lh = build_longhu_feature(update=True, force_rebuild=True)
     print(lh)

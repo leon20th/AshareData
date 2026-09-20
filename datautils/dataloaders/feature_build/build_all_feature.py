@@ -12,10 +12,16 @@ from AshareData.datautils.dataloaders.feature_build.feature_calc import (
     PARQUET_NUM_SCHEMA,
 )
 from AshareData.datautils.dataloaders.feature_build.extra_features import (
-    get_updown_limit_feature,
+    build_updown_limit_feature,
     build_market_features,
     build_pct_cross_rank,
-    get_longhu_feature
+    build_longhu_feature
+)
+from AshareData.datautils.dataloaders.feature_build.kpl_features import (
+    build_kpl_features
+)
+from AshareData.datautils.dataloaders.feature_build.stock_traits import (
+    build as build_stock_traits
 )
 
 FeatDIR = BASE_FEATURE_DIR
@@ -81,7 +87,9 @@ def build_base_feature(codes=None, workers=16, rebuild=False):
 
 if __name__ == '__main__':
     build_base_feature(rebuild=False)
-    get_updown_limit_feature(update=True)
+    build_updown_limit_feature(update=True)
     build_market_features(update=True)
     build_pct_cross_rank(update=True)  # 依赖 base_feature，须在其后
-    get_longhu_feature(update=True)
+    build_longhu_feature(update=True)
+    build_stock_traits()                # 股性 traits 14 列（全量重建 ~10s；依赖 base_feature/updown/market）
+    build_kpl_features(update=True)     # 开盘啦事件结构（依赖 scrap_kaipanla 产物）

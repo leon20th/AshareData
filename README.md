@@ -9,9 +9,9 @@ AshareData/
 ├── dataloader.py                  # 训练/推理数据出口（parquet → numpy 样本）
 ├── paths.py                       # 路径寻址（以本包位置为基准自动定位）
 ├── datautils/
-│   ├── dataloaders/feature_build/ # 特征构建（base_feature / 涨跌停 / 市场统计 / 龙虎榜 / 横截面排名）
+│   ├── dataloaders/feature_build/ # 特征构建（base_feature / 涨跌停 / 市场统计 / 龙虎榜 / 横截面排名 / 股性 traits / 开盘啦事件结构）
 │   ├── kline_scripts/             # 行情更新（日线 / 15分钟线、停牌检测）
-│   └── regime_scripts/            # 爬虫（涨停板 / 跌停板 / 龙虎榜）
+│   └── regime_scripts/            # 爬虫（涨停板 / 跌停板 / 龙虎榜 / 开盘啦题材榜）
 └── utils/
     ├── exchanges_utils/           # 交易日历、股票代码 ↔ 名称检索
     ├── exchanges_meta/            # 股票代码表、交易日历（随仓库携带）
@@ -29,8 +29,9 @@ AshareData/
 | `kline_data/info/` | 交易信息（如 `notrade_yet.csv` 停牌记录） |
 | `scrap_data/zhangtingban/`、`scrap_data/dietingban/` | 涨停板 / 跌停板抓取产物（xlsx） |
 | `scrap_data/longhu/` | 龙虎榜抓取产物（json） |
+| `scrap_data/kaipanla/` | 开盘啦题材榜抓取产物（json） |
 | `built_data/base_feature/` | 特征产物 `<code>.parquet` + `meta.json` |
-| `built_data/*.parquet` | 涨跌停 / 市场统计 / 龙虎榜 / 横截面排名特征 |
+| `built_data/*.parquet` | 涨跌停 / 市场统计 / 龙虎榜 / 横截面排名 / 股性 traits（t_*）/ 事件结构（ev_*、kp_*）特征 |
 
 ## 快速使用
 
@@ -38,7 +39,10 @@ AshareData/
 # 更新行情（baostock）
 python AshareData/datautils/kline_scripts/update_kline.py
 
-# 增量重建特征（base_feature 及派生 parquet）
+# 抓取开盘啦题材榜（增量补齐）
+python AshareData/datautils/regime_scripts/scrap_kaipanla.py --update
+
+# 增量重建特征（base_feature 及派生 parquet，含股性 traits 与开盘啦结构特征）
 python AshareData/datautils/dataloaders/feature_build/build_all_feature.py
 
 # 更新交易日历（写入 utils/exchanges_meta/trade_date_list.json）
