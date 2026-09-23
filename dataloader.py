@@ -301,7 +301,10 @@ class _KlineDataStorage:
         # 事件结构特征（reason 词表 base/driver/词龄；文件缺失则全 0）
         _ev_cols = [c for c in EVENT_SUB_COLUMNS if c not in ('trade_date_idx', 'code_idx')]
         try:
-            event_df = pd.read_parquet(f'{BUILT_DATA_DIR}/event_feat.parquet')
+            # EVENT_PARQUET_OVERRIDE：实验替代表（如 placebo 对照）；未设置时行为不变
+            _ev_path = os.environ.get("EVENT_PARQUET_OVERRIDE") or f'{BUILT_DATA_DIR}/event_feat.parquet'
+            event_df = pd.read_parquet(_ev_path)
+            logger.info("event source: %s", _ev_path)
             for c in _ev_cols:  # 向前兼容：老表缺列视为全 0
                 if c not in event_df.columns:
                     event_df[c] = np.float32(0.0)
