@@ -1,13 +1,16 @@
 import os
 import pandas as pd
-from AshareData.paths import BASE_FEATURE_DIR, DAILY_KLINE_DIR, M15_KLINE_DIR
+from AshareData.paths import BASE_FEATURE_DIR, DAILY_KLINE_V2_DIR, M15_KLINE_DIR
 from AshareData.datautils.dataloaders.feature_build.feature_utils import *
+from AshareData.utils.kline_data_utils.kline_v2_reader import read_daily
 
+# daily 已切 v2（读时复权 adapter）；KLINE_DIRS['daily'] 仅用于存在性检查/目录遍历
 KLINE_DIRS = {
-    'daily': DAILY_KLINE_DIR,
+    'daily': DAILY_KLINE_V2_DIR,
     'm15':   M15_KLINE_DIR,
 }
 FeatDIR = BASE_FEATURE_DIR
+_PRICE_COLS = ('open', 'high', 'low', 'close', 'preclose')
 
 # 固定 parquet schema：所有数值列统一为 float64，避免 NaN 导致 int/float 不一致
 PARQUET_NUM_SCHEMA = {
@@ -16,26 +19,35 @@ PARQUET_NUM_SCHEMA = {
 }
 
 def read_kline(kline_type='daily', code=None, end_date=None, **kwargs):
-    """读取 kline CSV。指定 code 读单只，否则读全部目录。end_date 截断到该日期。**kwargs 透传给 read_csv。"""
-    d = KLINE_DIRS[kline_type]
-    dedup_cols = ['date', 'code'] if kline_type == 'daily' else ['date', 'code', 'time']
+    """读取 kline。daily=v2 读时复权（默认 qfq，价格列随除权连续；usecols 不含价格列时直读原值加速）；
+    m15=直读目录 CSV（kwargs 透传给 read_csv）。指定 code 读单只，否则读全目录。end_date 截断到该日期。"""
+    usecols = kwargs.get('usecols')
+    need_price = not usecols or any(c in usecols for c in _PRICE_COLS)
 
-    def _read(fp):
-        df = pd.read_csv(fp, **kwargs)
+    def _read(code_):
+        if kline_type == 'daily':
+            df = read_daily(code_, 'qfq' if need_price else 'raw')
+            return df[[c for c in usecols if c in df.columns]] if usecols else df
+        df = pd.read_csv(f'{KLINE_DIRS[kline_type]}/{code_}.csv', **kwargs)
+        # 上游脏数据：time 列可能是 YYYYMMDDHHMMSS 格式（如 20260624094500000），修正为 HHMM
+        time_str = df['time'].astype(str)
+        bad = time_str.str.len() > 4
+        if bad.any():
+            df.loc[bad, 'time'] = time_str[bad].str[8:12].astype(int)
+        return df
+
+    def _prep(df):
         df['date'] = df['date'].str.replace('-', '')
-        if kline_type == 'm15':
-            # 上游脏数据：time 列可能是 YYYYMMDDHHMMSS 格式（如 20260624094500000），修正为 HHMM
-            time_str = df['time'].astype(str)
-            bad = time_str.str.len() > 4
-            if bad.any():
-                df.loc[bad, 'time'] = time_str[bad].str[8:12].astype(int)
         if end_date:
             df = df[df.date <= end_date]
+        dedup_cols = ['date', 'code'] if kline_type == 'daily' else ['date', 'code', 'time']
         return df.drop_duplicates(dedup_cols, keep='last')
 
     if code:
-        return _read(f'{d}/{code}.csv')
-    return pd.concat(_read(f'{d}/{f}') for f in sorted(os.listdir(d)) if f.endswith('.csv'))
+        return _prep(_read(code))
+    d = KLINE_DIRS[kline_type]
+    files = [f for f in sorted(os.listdir(d)) if f.endswith('.csv') and not f.startswith('_')]
+    return pd.concat(_prep(_read(f[:-4])) for f in files)
 
 def build_daily_kline_feature(code, data, latest_date=None):
     """计算 daily kline 特征。latest_date 之后的行才算新数据，内部自动留100行lookback给指标热身。"""

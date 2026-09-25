@@ -121,5 +121,13 @@ def main():
         sys.exit(1)
 
 
+def is_latest():
+    """本地数据是否已覆盖到最近交易日（get_target_trade_date）。无参。"""
+    target = a_open.get_target_trade_date()
+    if not target:
+        return False
+    return f'{target[:4]}-{target[4:6]}-{target[6:8]}' in saved_dates()
+
+
 if __name__ == '__main__':
     main()

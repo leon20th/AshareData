@@ -20,6 +20,9 @@ from AshareData.datautils.dataloaders.feature_build.extra_features import (
 from AshareData.datautils.dataloaders.feature_build.kpl_features import (
     build_kpl_features
 )
+from AshareData.datautils.dataloaders.feature_build.kpl_entities import (
+    build as build_kpl_entities
+)
 from AshareData.datautils.dataloaders.feature_build.stock_traits import (
     build as build_stock_traits
 )
@@ -93,3 +96,21 @@ if __name__ == '__main__':
     build_longhu_feature(update=True)
     build_stock_traits()                # 股性 traits 14 列（全量重建 ~10s；依赖 base_feature/updown/market）
     build_kpl_features(update=True)     # 开盘啦事件结构（依赖 scrap_kaipanla 产物）
+    build_kpl_entities()                # KPL 题材实体化（实体/别名/成员/复核 四件套，秒级）
+    # KPL 细分/行级两阶段 AI 映射增量（无新数据秒退；API 不可用自动跳过不阻断；
+    # 有新映射才重建实体）
+    try:
+        from AshareData.datautils.dataloaders.feature_build.kpl_segment_map_ai import (
+            update as kpl_segmap_update)
+        if kpl_segmap_update():
+            build_kpl_entities()
+    except Exception as exc:
+        print(f'[kpl] 细分/行级映射更新跳过: {exc}')
+    # KPL 涨停原因嵌入 + 冻结 PCA16 → event_feat 列 kpe_*（增量；无新事件秒退；
+    # GPU 忙自动退 CPU；失败不阻断）
+    try:
+        from AshareData.datautils.dataloaders.feature_build.kpl_reason_emb import (
+            update as kpl_reason_emb_update)
+        kpl_reason_emb_update()
+    except Exception as exc:
+        print(f'[kpl] 原因嵌入更新跳过: {exc}')

@@ -16,6 +16,7 @@ ASHARE_ROOT = os.path.dirname(os.path.abspath(__file__))
 DATASET_DIR = os.path.join(ASHARE_ROOT, 'dataset')
 KLINE_DATA_DIR = os.path.join(DATASET_DIR, 'kline_data')
 DAILY_KLINE_DIR = os.path.join(KLINE_DATA_DIR, 'daily_kline')
+DAILY_KLINE_V2_DIR = os.path.join(KLINE_DATA_DIR, 'daily_kline_v2')   # 扶摇 v2: raw 主表+事件因子+读时复权
 M15_KLINE_DIR = os.path.join(KLINE_DATA_DIR, 'm15_kline')
 INFO_DIR = os.path.join(KLINE_DATA_DIR, 'info')
 SCRAP_DATA_DIR = os.path.join(DATASET_DIR, 'scrap_data')

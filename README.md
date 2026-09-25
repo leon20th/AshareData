@@ -10,7 +10,7 @@ AshareData/
 ├── paths.py                       # 路径寻址（以本包位置为基准自动定位）
 ├── datautils/
 │   ├── dataloaders/feature_build/ # 特征构建（base_feature / 涨跌停 / 市场统计 / 龙虎榜 / 横截面排名 / 股性 traits / 开盘啦事件结构）
-│   ├── kline_scripts/             # 行情更新（日线 / 15分钟线、停牌检测）
+│   ├── kline_scripts/             # 行情 v2 构建（quick_kline）/ 15分钟线 / 停牌名单 / update_all 统一入口
 │   └── regime_scripts/            # 爬虫（涨停板 / 跌停板 / 龙虎榜 / 开盘啦题材榜）
 └── utils/
     ├── exchanges_utils/           # 交易日历、股票代码 ↔ 名称检索
@@ -24,7 +24,7 @@ AshareData/
 
 | 目录 | 内容 |
 | --- | --- |
-| `kline_data/daily_kline/` | 日线 CSV（如 `sh.600000.csv`） |
+| `kline_data/daily_kline_v2/` | 日线 v2 CSV（未复权原值 + 事件因子，**读时复权**；旧库 `daily_kline/` 已于 2026-09-26 撤除） |
 | `kline_data/m15_kline/` | 15 分钟线 CSV |
 | `kline_data/info/` | 交易信息（如 `notrade_yet.csv` 停牌记录） |
 | `scrap_data/zhangtingban/`、`scrap_data/dietingban/` | 涨停板 / 跌停板抓取产物（xlsx） |
@@ -36,8 +36,8 @@ AshareData/
 ## 快速使用
 
 ```bash
-# 更新行情（baostock）
-python AshareData/datautils/kline_scripts/update_kline.py
+# 全量更新（v2 日线 / m15 / 停牌名单 / 新闻 / 榜单 / 特征，含重试与告警）
+python AshareData/datautils/update_all.py
 
 # 抓取开盘啦题材榜（增量补齐）
 python AshareData/datautils/regime_scripts/scrap_kaipanla.py --update

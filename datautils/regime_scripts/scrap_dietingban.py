@@ -13,6 +13,7 @@ from io import StringIO
 import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 from AshareData.paths import SCRAP_DATA_DIR, _BEGIN
+from AshareData.utils.exchanges_utils.a_open import get_target_trade_date
 import traceback
 from bs4 import BeautifulSoup
 
@@ -221,6 +222,16 @@ class ScrapDietingban(Scrap):
                 continue
         if shutdown_driver:
             driver.quit()
+
+
+def is_latest():
+    """本地数据是否已覆盖到最近交易日（get_target_trade_date）。无参。"""
+    target = get_target_trade_date()
+    if not target:
+        return False
+    output = f'{SCRAP_DATA_DIR}/dietingban'
+    files = os.listdir(output) if os.path.isdir(output) else []
+    return target in {f.split('跌停板')[0] for f in files if f.endswith('.xlsx')}
 
 
 if __name__ == '__main__':

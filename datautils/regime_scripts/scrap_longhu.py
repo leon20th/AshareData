@@ -13,6 +13,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from AshareData.paths import SCRAP_DATA_DIR
+from AshareData.utils.exchanges_utils.a_open import get_target_trade_date
 from AshareData.datautils.regime_scripts.scrap import Scrap
 from AshareData.utils.log_util import get_logger, setup_logging
 from AshareData.utils.tsh_utils.login_util import login_tsh, get_tsh_cookies_static
@@ -338,6 +339,14 @@ class ScrapLonghu(Scrap):
                 }
                 pbar.update(1)
         return results
+
+
+def is_latest():
+    """本地数据是否已覆盖到最近交易日（get_target_trade_date）。无参。"""
+    target = get_target_trade_date()
+    if not target:
+        return False
+    return os.path.isfile(f'{SCRAP_DATA_DIR}/longhu/{target[:4]}-{target[4:6]}-{target[6:8]}.json')
 
 
 if __name__ == '__main__':

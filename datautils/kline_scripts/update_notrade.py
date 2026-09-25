@@ -3,7 +3,7 @@ import os
 import pandas as pd
 import tqdm
 
-from AshareData.paths import DAILY_KLINE_DIR, INFO_DIR
+from AshareData.paths import DAILY_KLINE_V2_DIR, INFO_DIR
 from AshareData.utils.log_util import get_logger
 from AshareData.utils.read_file_utils import read_csv_by_tail
 
@@ -27,7 +27,7 @@ class UpdateNotrade:
     TAIL_SCAN_ROWS = 500
 
     def __init__(self, force_init=False):
-        self.daily_database = DAILY_KLINE_DIR
+        self.daily_database = DAILY_KLINE_V2_DIR   # 2026-09-26 起扫 v2 日线（旧库已删）
         self.notrade_dir = os.path.dirname(self.NOTRADE_CSV)
         self.df_notrade_yet = self._load_notrade_yet(force_init=force_init)
         self.changed = False
@@ -296,6 +296,4 @@ class UpdateNotrade:
             return str(notrade_date)
 
 if __name__ == '__main__':
-    updater = UpdateNotrade()
-    ret = updater.set_notrade_yet(code='sz.300029', notrade_date='2026-07-11')
-    print(ret)
+    UpdateNotrade(force_init=True)   # 无参入口：全量扫描 v2 日线重建 notrade_yet.csv（含 manual_update 补充）
