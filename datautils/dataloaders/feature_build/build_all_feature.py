@@ -89,7 +89,11 @@ def build_base_feature(codes=None, workers=16, rebuild=False):
 
 
 if __name__ == '__main__':
-    build_base_feature(rebuild=False)
+    import argparse
+    ap = argparse.ArgumentParser(description='特征构建（base_feature 增量；--rebuild 全史重建）')
+    ap.add_argument('--rebuild', action='store_true', help='base_feature 全量重建（读 v2 读时复权源，已存在 parquet 一并重算）')
+    a = ap.parse_args()
+    build_base_feature(rebuild=a.rebuild)
     build_updown_limit_feature(update=True)
     build_market_features(update=True)
     build_pct_cross_rank(update=True)  # 依赖 base_feature，须在其后
