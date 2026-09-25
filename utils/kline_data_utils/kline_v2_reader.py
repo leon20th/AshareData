@@ -32,7 +32,10 @@ def _suffix_factors(dates, closes, precloses, trade):
     closes = np.asarray(closes, dtype=float)
     precloses = np.asarray(precloses, dtype=float)
     real = np.asarray(trade, dtype=float) == 1
-    prev_real = pd.Series(closes).where(real).ffill().shift(1).to_numpy()   # 前一真实行收盘
+    prev_real = np.full(len(dates), np.nan)          # 每个真实行取前一真实行收盘
+    idx = np.flatnonzero(real)
+    if len(idx) > 1:
+        prev_real[idx[1:]] = closes[idx[:-1]]
     with np.errstate(invalid='ignore', divide='ignore'):
         ratio = precloses / prev_real
     bd = real & np.isfinite(ratio) & (precloses > 0) & (prev_real > 0) & (np.abs(ratio - 1.0) > 1e-10)
@@ -61,26 +64,32 @@ def read_daily(code, adjust='qfq'):
     return df
 
 
-def close_rows(code):
-    """[(date, qfq_close), ...]（轻量解析：只取 date/close/preclose/tradestatus；供 Lushan 表格逐行消费）。"""
+def close_rows(code, tail_bytes=16384):
+    """[(date, qfq_close), ...]（轻量尾窗读：只取 date/close/preclose/tradestatus，窗口内重建因子）。
+
+    正确性：因子只影响“更早”的行（边界只作用于日期早于它的行），窗口内任意行所需的
+    边界部在窗口内；仅当窗口首行恰为新边界（其基被截断）时跳过该边界——它不影响窗口内任何行。
+    默认窗口 16KB（≈260 行 ≈ 1 年），供 Lushan 表格逐行消费（全市场 ~5000 只 / ~0.5s）。
+    """
     p = os.path.join(V2_DIR, f'{code}.csv')
+    with open(p, 'rb') as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - tail_bytes))
+        text = f.read().decode('utf-8', errors='ignore')
+    lines = text.splitlines()[1:]        # 首行 = 表头（全读）或被截断行（尾读）
     dates, closes, precloses, trade = [], [], [], []
-    with open(p, encoding='utf-8') as f:
-        next(f, None)
-        for line in f:
-            parts = line.split(',')
-            if len(parts) < 11:
-                continue
-            try:
-                c = float(parts[5])
-                pc = float(parts[6]) if parts[6].strip() else float('nan')
-                tr = float(parts[10]) if parts[10].strip() else float('nan')
-            except ValueError:
-                continue
-            dates.append(parts[0])
-            closes.append(c)
-            precloses.append(pc)
-            trade.append(tr)
+    for line in lines:
+        parts = line.split(',')
+        if len(parts) < 11:
+            continue
+        try:
+            closes.append(float(parts[5]))
+            precloses.append(float(parts[6]) if parts[6].strip() else float('nan'))
+            trade.append(float(parts[10]) if parts[10].strip() else float('nan'))
+        except ValueError:
+            continue
+        dates.append(parts[0])
     if not dates:
         return []
     closes = np.asarray(closes)
