@@ -30,7 +30,7 @@ echo "已写入 $ACCOUNT_FILE"
 # ---------------- 2. Python 依赖 ----------------
 PYTHON="${PYTHON:-$(command -v python || command -v python3 || echo python3)}"
 echo "==> Python 依赖（$PYTHON）"
-if "$PYTHON" -c "import pandas, numpy, polars, pyarrow, openpyxl, requests, tqdm, bs4, lxml, selenium, baostock, akshare, pypinyin, torch, torchvision, PIL" 2>/dev/null; then
+if "$PYTHON" -c "import pandas, numpy, polars, pyarrow, openpyxl, requests, tqdm, bs4, lxml, selenium, baostock, pypinyin, torch, torchvision, PIL" 2>/dev/null; then
     echo "依赖已满足，跳过安装"
 elif ! "$PYTHON" -m pip install -r "$ROOT/requirements.txt"; then
     echo "pip 安装失败。若报 externally-managed-environment（系统 Python 限制），请指定虚拟环境的解释器重跑：" >&2
