@@ -64,12 +64,13 @@ def read_daily(code, adjust='qfq'):
     return df
 
 
-def close_rows(code, tail_bytes=16384):
-    """[(date, qfq_close), ...]（轻量尾窗读：只取 date/close/preclose/tradestatus，窗口内重建因子）。
+def close_rows(code, tail_bytes=8192):
+    """[(date, qfq_close), ...]（轻量尾窗读；候选边界法定因子，绝大多数窗口零因子开销）。
 
-    正确性：因子只影响“更早”的行（边界只作用于日期早于它的行），窗口内任意行所需的
-    边界部在窗口内；仅当窗口首行恰为新边界（其基被截断）时跳过该边界——它不影响窗口内任何行。
-    默认窗口 16KB（≈260 行 ≈ 1 年），供 Lushan 表格逐行消费（全市场 ~5000 只 / ~0.5s）。
+    快路径：preclose 原文 == 上一行 close 原文 ⇒ 两浮点严格相等 ⇒ ratio==1 ⇒ 必非边界
+    （不同浮点的 repr 必不同，不会漏检）。仅出现候选（字面不等）时才精查 tradestatus/前真实行，
+    与 _suffix_factors 的判定完全一致。因子只作用于更早的行：窗口首边界被截断时跳过，不影响窗口内任何行。
+    默认窗口 8KB（≈130 行 ≈ 半年），供 Lushan 表格逐行消费（全市场 ~5000 只 / ~0.5s）。
     """
     p = os.path.join(V2_DIR, f'{code}.csv')
     with open(p, 'rb') as f:
@@ -77,21 +78,53 @@ def close_rows(code, tail_bytes=16384):
         size = f.tell()
         f.seek(max(0, size - tail_bytes))
         text = f.read().decode('utf-8', errors='ignore')
-    lines = text.splitlines()[1:]        # 首行 = 表头（全读）或被截断行（尾读）
-    dates, closes, precloses, trade = [], [], [], []
-    for line in lines:
+    dates, closes, keep, cand = [], [], [], []
+    prev_cstr = ''
+    for line in text.splitlines()[1:]:        # 首行 = 表头（全读）或被截断行（尾读）
         parts = line.split(',')
         if len(parts) < 11:
             continue
+        cs = parts[5].strip()
         try:
-            closes.append(float(parts[5]))
-            precloses.append(float(parts[6]) if parts[6].strip() else float('nan'))
-            trade.append(float(parts[10]) if parts[10].strip() else float('nan'))
+            c = float(cs)
         except ValueError:
             continue
         dates.append(parts[0])
+        closes.append(c)
+        keep.append(parts)
+        pc = parts[6].strip()
+        if pc and prev_cstr and pc != prev_cstr:
+            cand.append(len(dates) - 1)       # 候选边界行 → 精查
+        prev_cstr = cs
     if not dates:
         return []
-    closes = np.asarray(closes)
-    F = _suffix_factors(dates, closes, precloses, trade)
-    return list(zip(dates, (closes * F).tolist()))
+    closes_a = np.asarray(closes)
+    if not cand:
+        return list(zip(dates, closes_a.tolist()))
+    bd_dates, bd_f = [], []
+    for i in cand:
+        try:
+            if float(keep[i][10]) != 1:
+                continue                      # 非真实行（占位/缺状态）不构成边界
+        except ValueError:
+            continue
+        j = i - 1
+        while j >= 0:                         # 最近的前一真实行
+            try:
+                if float(keep[j][10]) == 1:
+                    break
+            except ValueError:
+                pass
+            j -= 1
+        if j < 0:
+            continue                          # 基被窗口截断 → 跳过（不影响窗口内任何行）
+        pc_f, base = float(keep[i][6]), closes[j]
+        if pc_f > 0 and base > 0 and pc_f != base:
+            bd_dates.append(dates[i])
+            bd_f.append(pc_f / base)
+    if not bd_f:
+        return list(zip(dates, closes_a.tolist()))
+    f = np.asarray(bd_f)
+    suffix = np.concatenate([np.cumprod(f[::-1])[::-1], [1.0]])
+    k = np.searchsorted(np.asarray(bd_dates), np.asarray(dates), side='right')
+    return list(zip(dates, (closes_a * suffix[k]).tolist()))
