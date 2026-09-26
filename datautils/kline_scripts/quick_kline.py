@@ -37,7 +37,7 @@ import requests
 from AshareData.paths import ASHARE_ROOT, DAILY_KLINE_DIR, DAILY_KLINE_V2_DIR, M15_KLINE_DIR
 from AshareData.utils.exchanges_utils.a_open import get_target_trade_date, get_trade_date_list
 from AshareData.utils.log_util import get_logger
-from AshareData.utils.read_file_utils import get_first_last_line_from_csv, read_last_lines
+from AshareData.utils.read_file_utils import read_last_lines
 
 logger = get_logger('日Kv2')
 
@@ -167,6 +167,37 @@ def _is_st_name(name):
     return bool(re.match(r'^\*?ST', str(name or '').strip().upper()))
 
 
+def _dur(sec):
+    """秒 → 45s / 3m20s / 1h05m。"""
+    sec = int(sec)
+    if sec < 60:
+        return f'{sec}s'
+    if sec < 3600:
+        return f'{sec // 60}m{sec % 60:02d}s'
+    return f'{sec // 3600}h{sec % 3600 // 60:02d}m'
+
+
+def _progress(i, n, t0, tag, extra='', every=500):
+    """粗粒度进度：每轮迭代开头调用（i 从 1 起），首尾必打、每 every 只打一行。
+
+    只为消除长时间静默：带已用与 ETA，不做花哨刷新，被管道捕获后同样可读。
+    """
+    if i != 1 and i != n and i % every:
+        return
+    el = time.time() - t0
+    tail = f' ETA {_dur(el / (i - 1) * (n - i + 1))}' if 1 < i < n else ''
+    logger.info(f'{tag} {i}/{n}' + (f' {extra}' if extra else '') + f' 已用 {_dur(el)}{tail}')
+
+
+def _fail(tag, code, err, failed, cap=3):
+    """逐票失败：前 cap 条详列，之后只计数（末尾汇总），避免整屏都是失败行。"""
+    failed.append(code)
+    if len(failed) <= cap:
+        logger.info(f'{tag} {code} 失败: {err}')
+    elif len(failed) == cap + 1:
+        logger.info(f'{tag} 失败已超 {cap} 条，后续只计数')
+
+
 class KlineV2Builder:
     def __init__(self, isst_from='baostock', force=False):
         self.isst_from = isst_from
@@ -261,8 +292,9 @@ class KlineV2Builder:
             src, market_last = self._source_backfill(codes, norm_date(start, DEFAULT_START), norm_date(end))
         else:
             src, market_last = self._source_rebuild(codes, norm_date(start, DEFAULT_START), norm_date(end))
-        n = 0
-        for code in codes:
+        n, t0 = 0, time.time()
+        for i, code in enumerate(codes, 1):
+            _progress(i, len(codes), t0, '[ohlcvt]', f'已写 {n}')
             df = pd.DataFrame(columns=COLS) if mode == 'rebuild' else read_v2(code)
             rows = src.get(code)
             if rows is not None and len(rows):
@@ -286,8 +318,9 @@ class KlineV2Builder:
         adj = pd.read_parquet(ADJ_F) if os.path.exists(ADJ_F) else pd.DataFrame(
             columns=['code', 'ex_date', 'dividend_per_share', 'per_share_bonus', 'allotment_ratio', 'allotment_price'])
         prev_map = self._load_prev_close()
-        n = 0
-        for code in codes:
+        n, t0 = 0, time.time()
+        for i, code in enumerate(codes, 1):
+            _progress(i, len(codes), t0, '[preclose]', f'已写 {n}')
             df = read_v2(code)
             if df.empty:
                 continue
@@ -357,7 +390,9 @@ class KlineV2Builder:
             snap = self._auction_snapshot(codes)
             events = self._load_share_events()
             refetch = []
-            for code in codes:
+            t0 = time.time()
+            for i, code in enumerate(codes, 1):
+                _progress(i, len(codes), t0, '[turn]')
                 df = read_v2(code)
                 if df.empty or target not in set(df['date']):
                     continue
@@ -383,8 +418,9 @@ class KlineV2Builder:
         # rebuild / backfill：历史段=旧库 turn 移植（替换连续性），缺口/新增票=新浪事件 as-of
         self._fetch_share_events(codes)
         events = self._load_share_events()
-        n = 0
-        for code in codes:
+        n, t0 = 0, time.time()
+        for i, code in enumerate(codes, 1):
+            _progress(i, len(codes), t0, '[turn]', f'已写 {n}')
             df = read_v2(code)
             if df.empty:
                 continue
@@ -407,12 +443,13 @@ class KlineV2Builder:
         if mode == 'update':
             self._isst_by_name(codes)
             return
-        n = 0
-        for code in codes:
+        n, t0, failed = 0, time.time(), []
+        for i, code in enumerate(codes, 1):
+            _progress(i, len(codes), t0, '[isst]', f'已写 {n} 失败 {len(failed)}', every=50)
             try:
                 scan = self._scan_isst(code, norm_date(start, DEFAULT_START), norm_date(end))
             except Exception as e:
-                logger.info(f'[isst] {code} 扫描失败（可重跑续传）: {e}')
+                _fail('[isst]', code, e, failed)
                 continue
             df = read_v2(code)
             if df.empty:
@@ -422,7 +459,8 @@ class KlineV2Builder:
             df['isST'] = pd.to_numeric(df['isST'], errors='coerce').ffill().fillna(0).astype(int)
             write_v2(code, df)
             n += 1
-        logger.info(f'[isst] {mode}: 写 {n} 只（来源={self.isst_from}）')
+        logger.info(f'[isst] {mode}: 写 {n} 只，失败 {len(failed)} 只'
+                    f'（来源={self.isst_from}，失败可重跑续传）')
 
     def update_m15(self, mode, codes, start, end):
         if mode == 'rebuild':
@@ -430,104 +468,47 @@ class KlineV2Builder:
             return
         cal = _cal()
         last_td = self._target_date()   # 统一到 get_target_trade_date（交易日 15:00 后含当天）
-        plan = {}
+        plan, bad = {}, []
         for code in codes:
             try:
                 r = self._m15_plan(mode, code, cal, last_td)
             except Exception as e:
-                logger.info(f'[m15] {code} 计划失败: {e}')
+                _fail('[m15]', code, e, bad)
                 continue
             if r is not None:
                 plan[code] = r
-        logger.info(f'[m15] {mode}: 需抓 {len(plan)}/{len(codes)} 只（last_td={last_td}）')
-        rows_by_code = {}
-        done = 0
+        logger.info(f'[m15] {mode}: 需抓 {len(plan)}/{len(codes)} 只，计划失败 {len(bad)} 只（last_td={last_td}）')
+        rows_by_code, failed = {}, []
+        done, t0 = 0, time.time()
         with ThreadPoolExecutor(max_workers=6) as ex:
             futs = {ex.submit(self._fetch_m15, c, dl): (c, fm) for c, (dl, fm) in plan.items()}
             for f in as_completed(futs):
                 done += 1
                 c, fm = futs[f]
+                _progress(done, len(futs), t0, '[m15] 抓取', f'已得 {len(rows_by_code)} 失败 {len(failed)}')
                 try:
                     rows_by_code[c] = (f.result(), fm)
                 except Exception as e:
-                    logger.info(f'[m15] {c} 抓取失败: {e}')
-                if done % 500 == 0:
-                    logger.info(f'[m15] 抓取进度 {done}/{len(plan)}')
+                    _fail('[m15]', c, e, failed)
         nw = 0
         for code, (rows, fm) in rows_by_code.items():
             if rows is None or rows.empty:
                 continue
             if self._m15_upsert(code, rows, force_merge=fm):
                 nw += 1
-        logger.info(f'[m15] {mode}: 更新 {nw}/{len(codes)} 只')
+        logger.info(f'[m15] {mode}: 更新 {nw}/{len(codes)} 只，抓取失败 {len(failed)} 只')
 
     def _m15_rebuild_baostock(self, codes, start, end):
-        """m15 全史重建：baostock 单线程慢扫（全史唯一免费源，~55s/只）+ 逐票按本地覆盖续传。
+        """m15 全史重建：委托旧器 update_kline.py（baostock 15 分钟全史 + 逐票断点续传）。
 
-        断点续传=以本地文件首/末 bar 判定缺口（上市日前不算缺口），只补缺段；--force 全区间重扫。
-        注：停牌与数据缺失无法按日期区分，中段空洞不在此路径检测（需要时用 --force 重扫）。
+        旧器内部票池与列格式与 v2 完全同构（date,time,code,open,high,low,close,volume,amount），
+        重建区间由它自己决定（文件缺失时从 2020-01-01 起到目标交易日），故本类不再自带全史扫描。
         """
-        from AshareData.utils.kline_data_utils.query_kline_utils import QueryKlineUtils
-        qu = QueryKlineUtils()
-        tgt_end = end or self._target_date()
-        meta = pd.read_parquet(META_F) if os.path.exists(META_F) else None
-        ld = {}
-        if meta is not None:
-            sub = meta[meta['thscode'].str.endswith(('.SH', '.SZ'))]
-            for x, v in zip(sub['thscode'], sub['list_date']):
-                d = pd.to_datetime(v, errors='coerce') if v else None
-                if d is not None and pd.notna(d):
-                    ld[f"{x.split('.')[1].lower()}.{x.split('.')[0]}"] = d.strftime('%Y-%m-%d')
-        todo = []
-        delisted = set(pd.read_parquet(DELISTED_F)['code']) if os.path.exists(DELISTED_F) else set()
-        for code in codes:
-            if code in delisted:
-                continue   # 退市票不再产生新 bar
-            p = os.path.join(M15_KLINE_DIR, f'{code}.csv')
-            if self.force or not os.path.exists(p):
-                todo.append((code, start, tgt_end))
-                continue
-            fl, msg = get_first_last_line_from_csv(p)
-            if msg or fl is None or fl.empty:
-                todo.append((code, start, tgt_end))
-                continue
-            first_d, last_d = str(fl['date'].iloc[0]), str(fl['date'].iloc[-1])
-            exp_first = max(start, ld.get(code, start))
-            if first_d > exp_first and last_d < tgt_end:
-                todo.append((code, exp_first, tgt_end))
-            elif first_d > exp_first:
-                todo.append((code, exp_first, (pd.to_datetime(first_d) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
-            elif last_d < tgt_end:
-                todo.append((code, (pd.to_datetime(last_d) + pd.Timedelta(days=1)).strftime('%Y-%m-%d'), tgt_end))
-        if not todo:
-            logger.info('[m15] rebuild: 全部已覆盖，无需扫描')
-            return
-        logger.info(f'[m15] rebuild: baostock 单线程需扫 {len(todo)}/{len(codes)} 只（~55s/只，预计 {len(todo) * 55 / 3600:.1f}h）')
-        ok = fail = empty = 0
-        t0 = time.time()
-        for i, (code, qs, qe) in enumerate(todo):
-            df = msg = None
-            for attempt in range(3):
-                df, msg = qu.query_history(code, start_date=qs, end_date=qe, frequency='15', adjustflag='2')
-                if df is not None:
-                    break
-                time.sleep(5 * (attempt + 1))
-            if df is None:
-                fail += 1
-                logger.info(f'[m15] {code} 扫描失败（重跑续传）: {msg}')
-            elif df.empty:
-                empty += 1
-            else:
-                df = df[['date', 'time', 'open', 'high', 'low', 'close', 'volume', 'amount']]
-                df['time'] = pd.to_numeric(df['time'], errors='coerce').astype(int)
-                self._m15_upsert(code, df, force_merge=True)
-                ok += 1
-            if (i + 1) % 20 == 0 or i == len(todo) - 1:
-                el = time.time() - t0
-                eta = el / (i + 1) * (len(todo) - i - 1)
-                logger.info(f'[m15] rebuild 进度 {i + 1}/{len(todo)} ok={ok} empty={empty} fail={fail} '
-                            f'已用 {el / 3600:.1f}h ETA {eta / 3600:.1f}h')
-        logger.info(f'[m15] rebuild 完成: ok={ok} empty={empty} fail={fail}，共 {(time.time() - t0) / 3600:.1f}h')
+        from AshareData.datautils.kline_scripts.update_kline import UpdateKline
+        if end or norm_date(start, DEFAULT_START) != DEFAULT_START:
+            logger.warning(f'[m15] 历史重建区间由旧器决定（2020-01-01 → 目标日），'
+                           f'忽略 start={start} end={end}')
+        UpdateKline().update_kline_daily(codes=codes, frequencies=['15'])
 
     def _m15_plan(self, mode, code, cal, last_td):
         """按本地缺口计算抓取计划 → (datalen, force_merge)；None=无需抓取。
@@ -565,18 +546,23 @@ class KlineV2Builder:
 
     # ==================== 调度 ====================
 
+    STEPS = (('adjust', '复权事件'), ('ohlcvt', 'OHLCV+停牌占位'), ('preclose', '前收/涨跌幅'),
+             ('turn', '换手率'), ('isst', 'isST'), ('m15', 'm15 分钟线'))
+
     def run(self, mode, codes=None, start=None, end=None, skip=()):
         t0 = time.time()
         self.update_meta(mode, codes, start, end)
         if codes is None:
             codes = self._default_codes()
         logger.info(f'== {mode} | {len(codes)} 只 | start={start} end={end} ==')
-        for name in ['adjust', 'ohlcvt', 'preclose', 'turn', 'isst', 'm15']:
+        for i, (name, desc) in enumerate(self.STEPS, 1):
             if name in skip:
-                logger.info(f'== skip {name} ==')
+                logger.info(f'== [{i}/{len(self.STEPS)}] 跳过 {name} ==')
                 continue
+            t = time.time()
             getattr(self, f'update_{name}')(mode, codes, start, end)
-        logger.info(f'== {mode} 完成，共 {time.time() - t0:.0f}s ==')
+            logger.info(f'== [{i}/{len(self.STEPS)}] {name}（{desc}）完成，用时 {_dur(time.time() - t)} ==')
+        logger.info(f'== {mode} 完成，共 {_dur(time.time() - t0)} ==')
 
     def _default_codes(self):
         meta = pd.read_parquet(META_F)
@@ -756,17 +742,16 @@ class KlineV2Builder:
             return code, None, err
 
         new, done, failed = [], 0, []
+        t0 = time.time()
         with ThreadPoolExecutor(max_workers=6) as ex:
             for code, rows, err in ex.map(fetch, todo):
                 done += 1
+                _progress(done, len(todo), t0, '[share]', f'新增 {len(new)} 条 失败 {len(failed)} 只')
                 if err is not None:
-                    failed.append(code)
-                    logger.info(f'[share] {code} 失败: {err}')
+                    _fail('[share]', code, err, failed)
                 else:
                     log[code] = today
                     new += rows
-                if done % 500 == 0:
-                    logger.info(f'[share] {done}/{len(todo)}')
         if new:
             new = pd.DataFrame(new)
             # 空累加帧不进 concat（同 update_ohlcvt：pandas 官方做法，避免空/全 NA 帧参与 dtype 推断）

@@ -70,8 +70,11 @@ class UpdateKline:
         query_end_date = self._format_trade_date(target_trade_date) or end_date
         validate_target_date = self._format_trade_date(query_end_date)
         validate_target_date_str = pd.to_datetime(validate_target_date).strftime('%Y%m%d') if validate_target_date else None
-        # 获取复权行情数据：adjustflag为3表示后复权, 2表示前复权
-        all_files = [f for f in os.listdir(self.daily_database) if f.endswith('.csv') and (not codes or f.rsplit(".", 1)[0] in codes)]
+        # 显式给票池时直接以票池为范围，不依赖旧日线目录（本机可能没建旧库）
+        if codes:
+            all_files = [f'{c}.csv' for c in sorted(codes)]
+        else:
+            all_files = [f for f in os.listdir(self.daily_database) if f.endswith('.csv')]
         results = {
             'target_trade_date': target_trade_date,
             'validate_target_date': validate_target_date_str,
@@ -92,12 +95,12 @@ class UpdateKline:
                         'is_latest': True,
                         'last_date': None,
                     }
-                    logger.info(f'开始更新 code={code} frequency={frequency} 的数据')
+                    logger.debug(f'开始更新 code={code} frequency={frequency} 的数据')
                     file_path = f'{self.frequency_map[frequency]}/{f}'
                     default_last_date = pd.to_datetime('2019-12-31')
                     last_df, last_msg = get_first_last_line_from_csv(file_path)
                     if last_msg:
-                        logger.info(f'code={code}, 读取本地文件失败: {last_msg}, 结束日期={end_date}')
+                        logger.debug(f'code={code}, 读取本地文件失败: {last_msg}, 结束日期={end_date}')
                         last_date = default_last_date
                     elif last_df is None or last_df.empty or 'date' not in last_df.columns:
                         last_date = default_last_date
@@ -109,11 +112,11 @@ class UpdateKline:
                     
                     start_date = (last_date + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
                     if pd.to_datetime(start_date) > pd.to_datetime(query_end_date):
-                        logger.info(f'code={code}, 无需更新, 数据最新日期={last_date}, 查询截止={query_end_date}')
+                        logger.debug(f'code={code}, 无需更新, 数据最新日期={last_date}, 查询截止={query_end_date}')
                         df_new = None
                     else:
                         df_new, msg = self.query_utils.query_history(code, start_date=start_date, end_date=query_end_date, frequency=frequency)
-                        logger.info(msg)
+                        logger.debug(msg)
                         code_result['query_ok'] = df_new is not None
                         if df_new is not None and not df_new.empty:
                             if 'date' in df_new.columns and 'time' in df_new.columns:
@@ -124,12 +127,12 @@ class UpdateKline:
                             try:
                                 df_new.to_csv(file_path, mode='a', index=False, header=not file_exists)
                                 code_result['write_ok'] = True
-                                logger.info(f'code={code}, 更新成功, 新增记录数={len(df_new)}, 结束日期={end_date}')
+                                logger.debug(f'code={code}, 更新成功, 新增记录数={len(df_new)}, 结束日期={end_date}')
                             except Exception as e:
                                 code_result['write_ok'] = False
                                 logger.info(f'code={code}, 写入失败: {e}, 结束日期={end_date}')
                         else:
-                            logger.info(f'code={code}, 无新增数据, 结束日期={end_date}')
+                            logger.debug(f'code={code}, 无新增数据, 结束日期={end_date}')
 
                         # Daily bars include tradestatus; update suspension state in memory.
                         if frequency == 'd' and df_new is not None:
