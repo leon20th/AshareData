@@ -48,17 +48,10 @@ def _count(d):
 
 def plan_steps():
     v2_n, m15_n, old_n = _count(DAILY_KLINE_V2_DIR), _count(M15_KLINE_DIR), _count(DAILY_KLINE_DIR)
-    v2_empty, m15_empty = v2_n == 0, m15_n == 0
-    v2_args = [PY, '-u', KK, '--mode', 'rebuild' if v2_empty else 'update', '--skip', 'm15']
-    if v2_empty:
-        v2_args += ['--start', FLOOR, '--isst-from', 'old' if old_n else 'baostock']
-    m15_args = [PY, '-u', KK, '--mode', 'rebuild' if m15_empty else 'update',
-                '--skip', 'adjust,ohlcvt,preclose,turn,isst']
-    if m15_empty:
-        m15_args += ['--start', FLOOR]
     steps = [
-        ('v2', 'v2 日线（%s）' % ('空库全史重建' if v2_empty else '当日更新'), v2_args),
-        ('m15', 'v2 m15（%s）' % ('空库 baostock 全史慢扫，可中断续跑' if m15_empty else '缺口增量'), m15_args),
+        # quick_kline 自己判断每票每字段的缺口与手段，这里不再传模式/区间
+        ('v2', 'v2 日线', [PY, '-u', KK, '--skip', 'm15']),
+        ('m15', 'v2 m15', [PY, '-u', KK, '--skip', 'adjust,ohlcvt,preclose,turn,isst']),
         ('notrade', '停牌名单（v2 重建）', [PY, '-u', f'{D}/kline_scripts/update_notrade.py']),
         ('cls', '新闻·财联社', [PY, '-u', f'{D}/regime_scripts/scrap_news_cls.py']),
         ('em724', '新闻·东财7x24', [PY, '-u', f'{D}/regime_scripts/scrap_news_em724.py']),

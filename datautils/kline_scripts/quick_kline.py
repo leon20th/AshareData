@@ -1,23 +1,33 @@
 # -*- coding: utf-8 -*-
-"""quick_kline —— 日K v2 构建器（扶摇 OHLCV / 新浪股本·m15 / baostock isST 回扫）
+"""quick_kline —— 日K v2 构建器（字段自维护：缺口自动判定、手段自动选择）
 
-设计（2026-09-25 定稿）：3 种处理模式 × 按列方法，统一签名 (mode, codes, start, end)
-  - 模式: rebuild(空历史重建) / backfill(缺口日期补充) / update(当天更新)
-  - 列方法（各自实现三种模式的处理方式）:
-      update_meta      代码表/名称/上市日      (扶摇 meta，1 请求)
-      update_adjust    复权事件表(aux)         (扶摇 adjustment-factors dump)
-      update_ohlcvt    OHLCV+额 + 停牌占位行 + tradestatus 推导   (扶摇 dump/快照)
-      update_preclose  preclose/pctChg 后处理  (依赖 adjust + ohlcvt)
-      update_turn      换手率                  (历史/缺口=旧库移植→新浪事件兜底; 当天=扶摇竞价快照)
-      update_isst      isST                    (重建=baostock 单线程回扫 或 旧库移植; 更新=扶摇名字对比)
-      update_m15       15分钟线                (rebuild=baostock 单线程全史慢扫+续传；增量/缺口=新浪 getKLineData)
-  - 产物: daily_kline_v2/{sh.600000.csv} 13 列，与旧库同 schema（OHLCV 为**未复权原值**）
-    辅助: daily_kline_v2/_aux/、_dumps/
-  - v2 起点: 2020-01-02（与旧库/消费链对齐；扶摇 dump 的 2016+ 仅用于边界前收盘）
+设计原则（2026-09-26 定稿）
+  1. 每个字段只对外暴露一个 `update_<字段>` 接口：该补哪一段、用哪种手段，全在接口内部判断。
+     调用方不需要、也不应该知道 rebuild / backfill / update 的区别——模式概念已从接口移除。
+  2. 接口内按「每只票 × 每个字段」的缺口选手段：
+
+     情形                     手段
+     ---------------------   ---------------------------------------------------------------
+     无本地数据（整段历史）    OHLCV: 扶摇 daily-k 全量 dump
+                             m15:   旧器 update_kline.py（baostock 15 分钟全史）
+                             isST:  baostock 回扫（有旧库则优先旧库移植）
+     缺历史中间段              OHLCV: 扶摇 daily-k-10d（更早的缺口回落全量 dump）
+                             m15:   新浪 getKLineData（≤1023 根 ≈ 64 交易日窗，超窗报不可回补）
+                             isST:  baostock 只补缺段（逐票 checkpoint，可续跑）
+                             turn:  新浪股本事件 as-of 回填
+     只缺当天                  OHLCV: 扶摇 prices/snapshot（批量 100）
+                             turn:  扶摇 auction/snapshot（竞价快照）
+                             isST:  扶摇名单比对（ST 前缀变化）
+     都不缺                    直接跳过（幂等：重复跑不重复抓）
+
+     缺口起点由「上市日」决定：新股从上市日起算，上市前的空档不算缺口。
+  3. 旧库（daily_kline）存在时，其 turn / pctChg / isST 作为历史权威值覆盖（移植）；
+     没有旧库则自动回落 baostock / 新浪，无需任何参数。
+
+产物: daily_kline_v2/{sh.600000.csv} 13 列（与旧库同 schema，OHLCV 为未复权原值）
+辅助: daily_kline_v2/_aux/、_dumps/，以及 m15_kline/
 用法:
-  python AshareData/datautils/kline_scripts/quick_kline.py --mode rebuild  [--codes 600519,sz.000001] [--isst-from baostock|old]
-  python AshareData/datautils/kline_scripts/quick_kline.py --mode backfill [--codes ...] [--start ...] [--end ...]
-  python AshareData/datautils/kline_scripts/quick_kline.py --mode update   [--codes ...]
+  python AshareData/datautils/kline_scripts/quick_kline.py [--codes 600519,sz.000001] [--skip m15,isst]
 """
 import argparse
 import io
@@ -25,6 +35,7 @@ import json
 import os
 import random
 import re
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -57,16 +68,22 @@ DELISTED_F = os.path.join(AUX_DIR, 'delisted.parquet')
 
 COLS = ['date', 'code', 'open', 'high', 'low', 'close', 'preclose',
         'volume', 'amount', 'turn', 'tradestatus', 'pctChg', 'isST']
-DEFAULT_START = '2020-01-02'
+M15_COLS = ['date', 'time', 'code', 'open', 'high', 'low', 'close', 'volume', 'amount']
+FLOOR = '2020-01-02'                     # 库起点（与旧库/消费链对齐）
 SINA_KLINE = 'https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData'
 SINA_SHARE = ('https://stock.finance.sina.com.cn/stock/api/jsonp.php/'
               'var%20KKE_ShareAmount_{sym}=/StockService.getAmountBySymbol?_=20&symbol={sym}')
+SINA_MAX_BARS = 1023                     # 新浪单次请求上限（≈64 个交易日的 15 分钟 bar）
+BARS_PER_DAY = 16
 
 _CAL = None
 _TLS = threading.local()
 
 
+# ==================== 通用工具（与字段无关） ====================
+
 def _cal():
+    """全部交易日（'YYYY-MM-DD'，含已发布的前瞻日期）。"""
     global _CAL
     if _CAL is None:
         _CAL = [f'{d[:4]}-{d[4:6]}-{d[6:8]}' for d in get_trade_date_list()]
@@ -95,7 +112,7 @@ def ensure_dump(name, max_age_h=6, force=False):
         return pd.read_parquet(path)
     os.makedirs(DUMPS_DIR, exist_ok=True)
     last = None
-    for i in range(4):
+    for _ in range(4):
         try:
             url = api_json(f'/api/dump/market-dumps/{name}/download-url')['presigned_url']
             with requests.get(url, stream=True, timeout=300) as r:
@@ -103,7 +120,7 @@ def ensure_dump(name, max_age_h=6, force=False):
                 buf = io.BytesIO(b''.join(r.iter_content(1 << 20)))
             df = pd.read_parquet(buf)
             df.to_parquet(path)
-            logger.info(f'下载 {name}: {len(df)} 行 → _dumps/{name}.parquet')
+            logger.info(f'[dump] 下载 {name}: {len(df)} 行')
             return df
         except Exception as e:
             last = e
@@ -121,16 +138,19 @@ def _to_local(d):
 
 
 def norm_codes(text):
+    """'600519,sz.000001' → ['sh.600519', 'sz.000001']。"""
     out = []
     for tok in re.split(r'[,\s]+', text or ''):
         tok = tok.strip()
         if not tok:
             continue
         if '.' in tok:
-            a, b = tok.split('.')
-            if a.isdigit():
+            a, b = tok.lower().split('.')
+            if a.isdigit():          # '600000.sh' / '600000.SH'
                 a, b = b, a
-            code = f'{b.lower()}.{a}'
+            if a not in ('sh', 'sz', 'bj') or not b.isdigit():
+                raise ValueError(f'无法识别代码: {tok}')
+            code = f'{a}.{b}'
         elif tok.startswith('6'):
             code = f'sh.{tok}'
         elif tok.startswith(('0', '2', '3')):
@@ -139,15 +159,6 @@ def norm_codes(text):
             raise ValueError(f'无法识别代码: {tok}')
         out.append(code)
     return sorted(set(out))
-
-
-def norm_date(s, default=None):
-    if not s:
-        return default
-    s = str(s).strip()
-    if len(s) == 8 and s.isdigit():
-        return f'{s[:4]}-{s[4:6]}-{s[6:8]}'
-    return s
 
 
 def read_v2(code):
@@ -165,6 +176,15 @@ def write_v2(code, df):
 
 def _is_st_name(name):
     return bool(re.match(r'^\*?ST', str(name or '').strip().upper()))
+
+
+def _num(v):
+    """CSV 字段 → float；空/nan/非数字 → None（'1' 与 '1.0' 都算 1）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None
 
 
 def _dur(sec):
@@ -199,15 +219,25 @@ def _fail(tag, code, err, failed, cap=3):
 
 
 class KlineV2Builder:
-    def __init__(self, isst_from='baostock', force=False):
-        self.isst_from = isst_from
-        self.force = force
+    """字段自维护构建器：对外只有 update_* 接口，缺口判定与手段选择全在内部。
+
+    统一签名 update_<字段>(codes=None)：codes 为 None 时取 meta 全市场沪深。
+    """
+
+    def __init__(self, force=False):
+        self.force = force                 # 强制重取（忽略"已齐/已抓过"的跳过判断）
         self._bs_logged = False
-        self._prev_close_mem = None
+        self._prev_close_mem = {}
+        self._list_dates = None
 
-    # ==================== 列方法（统一签名） ====================
+    # 字段执行顺序（--skip 的取值也来自这里）
+    FIELDS = (('adjust', '复权事件'), ('ohlcvt', 'OHLCV+停牌占位'), ('preclose', '前收/涨跌幅'),
+              ('turn', '换手率'), ('isst', 'isST'), ('m15', 'm15 分钟线'))
 
-    def update_meta(self, mode, codes, start, end):
+    # ==================== 对外：字段接口 ====================
+
+    def update_meta(self, codes=None):
+        """代码表 / 名称 / 上市日（扶摇 meta，1 组请求）+ 退市表维护。其余字段的"新股判定"依赖它。"""
         prev = pd.read_parquet(META_F) if os.path.exists(META_F) else None
         items, off = [], 0
         while True:
@@ -224,51 +254,8 @@ class KlineV2Builder:
         self._sync_delisted(prev, df)
         logger.info(f'[meta] {len(df)} 只')
 
-    def _sync_delisted(self, prev, meta):
-        """退市表维护：meta 名单消失→记入（last_date=库内最后日期）；重新出现→移出；首建时用旧库独有票播种。"""
-        def codes_of(frame):
-            if frame is None:
-                return set(), {}
-            sub = frame[frame['thscode'].str.endswith(('.SH', '.SZ'))]
-            cs = {f"{x.split('.')[1].lower()}.{x.split('.')[0]}" for x in sub['thscode']}
-            nm = {f"{x.split('.')[1].lower()}.{x.split('.')[0]}": n for x, n in zip(sub['thscode'], sub['name'])}
-            return cs, nm
-        cur, _ = codes_of(meta)
-        hist = (pd.read_parquet(DELISTED_F) if os.path.exists(DELISTED_F)
-                else pd.DataFrame(columns=['code', 'name', 'last_date', 'detect_date']))
-        today = pd.Timestamp.now().strftime('%Y-%m-%d')
-        gone = {}
-        if prev is None:
-            if os.path.isdir(DAILY_KLINE_DIR):
-                for f in sorted(os.listdir(DAILY_KLINE_DIR)):
-                    c = f[:-4]
-                    if f.endswith('.csv') and c not in cur:
-                        tail = read_last_lines(os.path.join(DAILY_KLINE_DIR, f), n_lines=1)
-                        last = tail[-1].split(',')[0] if tail else ''
-                        gone[c] = {'code': c, 'name': '', 'last_date': last, 'detect_date': last}
-        else:
-            pc, pn = codes_of(prev)
-            for c in sorted(pc - cur):
-                p = os.path.join(V2_DIR, f'{c}.csv')
-                tail = read_last_lines(p, n_lines=1) if os.path.exists(p) else []
-                last = tail[-1].split(',')[0] if tail else ''
-                gone[c] = {'code': c, 'name': pn.get(c) or '', 'last_date': last, 'detect_date': today}
-        known = set(hist['code'])
-        add = [v for k, v in gone.items() if k not in known]
-        back = sorted(known & cur)
-        if back:
-            hist = hist[~hist['code'].isin(back)]
-        if add:
-            hist = pd.concat([hist, pd.DataFrame(add)], ignore_index=True)
-        if add or back:
-            os.makedirs(AUX_DIR, exist_ok=True)
-            hist.sort_values('code').to_parquet(DELISTED_F)
-        if add:
-            logger.info(f'[meta] 新增退市 {len(add)} 只: {[r["code"] for r in add[:10]]}')
-        if back:
-            logger.info(f'[meta] 名单回归（移出退市表）: {back}')
-
-    def update_adjust(self, mode, codes, start, end):
+    def update_adjust(self, codes=None):
+        """复权事件表（扶摇 adjustment-factors dump）：preclose 的除权参考价依赖它。"""
         d = _to_local(ensure_dump('adjustment-factors'))
         d = d[['code', 'date', 'dividend_per_share', 'per_share_bonus', 'allotment_ratio', 'allotment_price']]
         d = d.rename(columns={'date': 'ex_date'}).sort_values(['code', 'ex_date'])
@@ -276,48 +263,64 @@ class KlineV2Builder:
         d.to_parquet(ADJ_F)
         logger.info(f'[adjust] {len(d)} 事件 / {d["code"].nunique()} 只')
 
-    def update_ohlcvt(self, mode, codes, start, end):
-        if mode == 'update':
-            # 是否需要更新交给 is_latest 统一判定（其基准 get_target_trade_date 已含收盘时点：
-            # 交易日 15:00 前取上一交易日）；不再自算 15:30，否则两套时点不一致时，15:00~15:30
-            # 会出现「目标日已滚动到当天、却仍被判为未收盘」的空窗。
-            # quiet=True：它是全库判据（m15/turn/isST 都在内），那些列各有自己的步骤负责，
-            # 不能在本步的日志里替它们报账
-            if not self.force and is_latest(quiet=True):
-                logger.info('[ohlcvt] 已是最新，跳过（--force 可强跑）')
-                return
-            src = self._source_update(codes)
-            market_last = norm_date(end) or self._target_date()
-        elif mode == 'backfill':
-            src, market_last = self._source_backfill(codes, norm_date(start, DEFAULT_START), norm_date(end))
-        else:
-            src, market_last = self._source_rebuild(codes, norm_date(start, DEFAULT_START), norm_date(end))
+    def update_ohlcvt(self, codes=None):
+        """OHLCV+额（含停牌占位行与 tradestatus）：按缺口自动选 全量 dump / 增量 dump / 当天快照。"""
+        codes = self._codes(codes)
+        target = self._target_date()
+        full, recent, today = [], [], []
+        for code in codes:
+            df = read_v2(code)
+            if df.empty:
+                full.append(code)                     # 无本地数据 → 整段历史
+                continue
+            miss = self._missing(code, df)
+            if [d for d in miss if d < target]:
+                recent.append(code)                   # 缺历史中间段
+            if target in miss or self._stale_today(code):
+                today.append(code)                    # 缺当天（或当天行是收盘前写的）
+        if not (full or recent or today):
+            logger.info('[ohlcvt] 各票均已齐 → 跳过')
+            return
+        logger.info(f'[ohlcvt] 全史 {len(full)} 只 / 历史缺口 {len(recent)} 只 / 当天 {len(today)} 只')
+        src = {}
+        if full:
+            src.update(self._fetch_history(full))
+        if recent:
+            gaps = {c: [d for d in self._missing(c, read_v2(c)) if d < target] for c in recent}
+            src.update(self._fetch_recent(gaps))
+        if today:
+            src.update(self._fetch_today(today))
         n, t0 = 0, time.time()
-        for i, code in enumerate(codes, 1):
-            _progress(i, len(codes), t0, '[ohlcvt]', f'已写 {n}')
-            df = pd.DataFrame(columns=COLS) if mode == 'rebuild' else read_v2(code)
-            rows = src.get(code)
+        # 源里没有这些天行情（长期停牌、库起点前）时仍需落行：按“每交易日一行”补占位行
+        todo = [c for c in codes if c in src] + [c for c in recent if c not in src]
+        for i, code in enumerate(todo, 1):
+            _progress(i, len(todo), t0, '[ohlcvt]', f'已写 {n}')
+            rows, market_last = src.get(code, (None, None))
+            df = read_v2(code)
             if rows is not None and len(rows):
                 rows = rows.copy()
                 rows['code'] = code
-                rows['preclose'] = np.nan
-                rows['turn'] = np.nan
-                rows['pctChg'] = np.nan
-                rows['isST'] = np.nan
-                # 空骨架帧不进 concat（pandas 官方给的做法：concat 前排除空/全 NA 帧）——否则空帧
-                # 参与 dtype 推断，既触发 FutureWarning，又让结果 dtype 随 pandas 版本浮动
+                for col in ('preclose', 'turn', 'pctChg', 'isST'):
+                    rows[col] = np.nan
+                # 空骨架帧不进 concat（pandas 官方做法：concat 前排除空/全 NA 帧）
                 df = rows if df.empty else pd.concat([df, rows], ignore_index=True)
             if df.empty:
                 continue
-            df = self._materialize(df, market_last)
-            write_v2(code, df)
+            write_v2(code, self._materialize(df, market_last, code))
             n += 1
-        logger.info(f'[ohlcvt] {mode}: 写 {n} 只，market_last={market_last}')
+        logger.info(f'[ohlcvt] 写 {n} 只')
 
-    def update_preclose(self, mode, codes, start, end):
+    def update_preclose(self, codes=None):
+        """preclose/pctChg：纯本地派生（依赖 adjust 事件表），旧库有值的历史行以旧库为准。"""
+        codes = self._codes(codes)
+        prev_map = self._load_prev_close()
+        need_pre = [c for c in codes if c not in prev_map and self._first_traded_blank(c, 'preclose')]
+        if need_pre:
+            logger.info(f'[preclose] {len(need_pre)} 只缺首行前收 → 取全量 dump 库起点前收盘')
+            self._remember_prev_close(self._dump_daily('daily-k'), need_pre)
+            prev_map = self._load_prev_close()
         adj = pd.read_parquet(ADJ_F) if os.path.exists(ADJ_F) else pd.DataFrame(
             columns=['code', 'ex_date', 'dividend_per_share', 'per_share_bonus', 'allotment_ratio', 'allotment_price'])
-        prev_map = self._load_prev_close()
         n, t0 = 0, time.time()
         for i, code in enumerate(codes, 1):
             _progress(i, len(codes), t0, '[preclose]', f'已写 {n}')
@@ -330,10 +333,8 @@ class KlineV2Builder:
             ev2 = ev.copy()
             ev2['Rp'] = ev2['allotment_ratio'].fillna(0) * ev2['allotment_price'].fillna(0)
             g = g.merge(ev2.groupby('ex_date')['Rp'].sum().reset_index(), on='ex_date', how='left')
-            ev_dates = g['ex_date'].tolist()
-            f_of = {}
-            for _, e in g.iterrows():
-                f_of[e['ex_date']] = (e['D'], e['B'], e['R'], e['Rp'])
+            f_of = {e['ex_date']: (e['D'], e['B'], e['R'], e['Rp']) for _, e in g.iterrows()}
+            ev_dates = list(f_of)
             cal = _cal()
             last_close, last_mark = None, None
             pre = np.full(len(df), np.nan)
@@ -341,18 +342,17 @@ class KlineV2Builder:
             dates = df['date'].tolist()
             closes = pd.to_numeric(df['close'], errors='coerce').to_numpy()
             vols = pd.to_numeric(df['volume'], errors='coerce').to_numpy()
-            for i in range(len(df)):
-                if not np.isfinite(vols[i]):  # 占位行：preclose 保持 carry
-                    pre[i] = closes[i]
+            for j in range(len(df)):
+                if not np.isfinite(vols[j]):        # 停牌占位行：preclose 保持 carry
+                    pre[j] = closes[j]
                     continue
-                d = dates[i]
+                d = dates[j]
                 if last_close is None:
                     base = prev_map.get(code, np.nan)
-                    j = cal.index(d) if d in cal else 0
-                    lo = cal[max(0, j - 1)] if cal else ''
+                    k = cal.index(d) if d in cal else 0
+                    lo = cal[max(0, k - 1)] if cal else ''
                 else:
-                    base = last_close
-                    lo = last_mark
+                    base, lo = last_close, last_mark
                 f, applied, seg = 1.0, False, []
                 for ed in ev_dates:
                     if ed > lo and ed <= d:
@@ -363,62 +363,42 @@ class KlineV2Builder:
                             applied = True
                 pc = base * f if (base is not None and np.isfinite(base)) else np.nan
                 if applied and np.isfinite(pc):
-                    # 交易所惯例：除权参考价四舍五入到 0.01（半格边界须用十进制 half-up，float 银行家舍入会错）
+                    # 交易所惯例：除权参考价四舍五入到 0.01（半格边界须十进制 half-up，float 银行家舍入会错）
                     if len(seg) == 1:
                         D, B, R, Rp = seg[0]
                         pc = float((Decimal(str(base)) - Decimal(str(D)) + Decimal(str(Rp)))
                                    / (Decimal(1) + Decimal(str(B)) + Decimal(str(R))))
                     pc = float(Decimal(str(pc)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
-                pre[i] = pc
-                if np.isfinite(pc) and pc > 0 and np.isfinite(closes[i]):
-                    pch[i] = (closes[i] / pc - 1.0) * 100.0
-                last_close, last_mark = closes[i], d
+                pre[j] = pc
+                if np.isfinite(pc) and pc > 0 and np.isfinite(closes[j]):
+                    pch[j] = (closes[j] / pc - 1.0) * 100.0
+                last_close, last_mark = closes[j], d
             df['preclose'] = pre
             df['pctChg'] = pch
-            if mode != 'update':
-                overlay = self._old_col(code, 'pctChg', df['date'])
-                if overlay is not None:
-                    df['pctChg'] = np.where(overlay.notna(), overlay, df['pctChg'])
+            overlay = self._old_col(code, 'pctChg', df['date'])   # 旧库历史值权威
+            if overlay is not None:
+                df['pctChg'] = np.where(overlay.notna(), overlay, df['pctChg'])
             write_v2(code, df)
             n += 1
-        logger.info(f'[preclose] {mode}: 写 {n} 只')
+        logger.info(f'[preclose] 写 {n} 只')
 
-    def update_turn(self, mode, codes, start, end):
-        target = None
-        if mode == 'update':
-            target = norm_date(end) or self._target_date()
-            snap = self._auction_snapshot(codes)
-            events = self._load_share_events()
-            refetch = []
-            t0 = time.time()
-            for i, code in enumerate(codes, 1):
-                _progress(i, len(codes), t0, '[turn]')
-                df = read_v2(code)
-                if df.empty or target not in set(df['date']):
-                    continue
-                it = snap.get(code)
-                idx = df.index[df['date'] == target]
-                if it and it.get('last_price') and it.get('float_market_cap'):
-                    shares = it['float_market_cap'] / it['last_price']  # 股
-                    if shares > 0:
-                        vol = pd.to_numeric(df.loc[idx, 'volume'], errors='coerce').iloc[0]
-                        df.loc[idx, 'turn'] = vol / shares * 100 if np.isfinite(vol) else np.nan
-                        ev = events[events['code'] == code]
-                        ev = ev[ev['date'] <= target]
-                        if len(ev):
-                            last_wan = float(ev.sort_values('date')['shares_wan'].iloc[-1])
-                            if last_wan > 0 and abs(shares / 1e4 - last_wan) / last_wan > 0.005:
-                                refetch.append(code)
-                write_v2(code, df)
-            if refetch:
-                logger.info(f'[turn] 快照股本与事件表有差异 → 刷新 {len(refetch)} 只: {refetch[:8]}')
-                self._fetch_share_events(refetch)
-            logger.info(f'[turn] update: {len(codes)} 只（target={target}）')
-            return
-        # rebuild / backfill：历史段=旧库 turn 移植（替换连续性），缺口/新增票=新浪事件 as-of
-        self._fetch_share_events(codes)
+    def update_turn(self, codes=None):
+        """换手率：历史段=新浪股本事件 as-of；当天=扶摇竞价快照优先；旧库有值则覆盖。"""
+        codes = self._codes(codes)
+        target = self._target_date()
+        self._fetch_share_events(codes)                    # 每天只抓一次（share_fetch_log）
         events = self._load_share_events()
-        n, t0 = 0, time.time()
+        need_snap = []
+        for code in codes:
+            df = read_v2(code)
+            if df.empty or target not in set(df['date']):
+                continue
+            row = df.loc[df['date'] == target, 'turn']
+            if len(row) and (_num(row.iloc[0]) is None or self._stale_today(code)):
+                need_snap.append(code)
+        snap = self._auction_snapshot(need_snap) if need_snap else {}
+        logger.info(f'[turn] 股本事件 {len(events)} 条；需当天快照 {len(need_snap)} 只')
+        refetch, n, t0 = [], 0, time.time()
         for i, code in enumerate(codes, 1):
             _progress(i, len(codes), t0, '[turn]', f'已写 {n}')
             df = read_v2(code)
@@ -426,62 +406,110 @@ class KlineV2Builder:
                 continue
             ev = events[events['code'] == code].sort_values('date')
             if not ev.empty:
-                edates = ev['date'].to_numpy()
-                eshares = ev['shares_wan'].to_numpy()
-                idx = np.searchsorted(edates, df['date'].to_numpy(), side='right') - 1
-                shares = np.where(idx >= 0, eshares[np.clip(idx, 0, None)], np.nan)
+                idx = np.searchsorted(ev['date'].to_numpy(), df['date'].to_numpy(), side='right') - 1
+                shares = np.where(idx >= 0, ev['shares_wan'].to_numpy()[np.clip(idx, 0, None)], np.nan)
                 vols = pd.to_numeric(df['volume'], errors='coerce').to_numpy()
                 df['turn'] = vols / (shares * 1e4) * 100
+            it = snap.get(code)
+            if it and it.get('last_price') and it.get('float_market_cap'):
+                shares = it['float_market_cap'] / it['last_price']     # 股
+                if shares > 0:
+                    idx = df.index[df['date'] == target]
+                    vol = pd.to_numeric(df.loc[idx, 'volume'], errors='coerce').iloc[0]
+                    df.loc[idx, 'turn'] = vol / shares * 100 if np.isfinite(vol) else np.nan
+                    if len(ev):                                        # 快照股本与事件表偏差过大 → 下轮重抓
+                        last_wan = float(ev['shares_wan'].iloc[-1])
+                        if last_wan > 0 and abs(shares / 1e4 - last_wan) / last_wan > 0.005:
+                            refetch.append(code)
             overlay = self._old_col(code, 'turn', df['date'])
             if overlay is not None:
                 df['turn'] = np.where(overlay.notna(), overlay, df['turn'])
             write_v2(code, df)
             n += 1
-        logger.info(f'[turn] {mode}: 写 {n} 只')
+        if refetch:
+            logger.info(f'[turn] 快照股本与事件表偏差 → 下轮重抓 {len(refetch)} 只: {refetch[:8]}')
+        logger.info(f'[turn] 写 {n} 只')
 
-    def update_isst(self, mode, codes, start, end):
-        if mode == 'update':
-            self._isst_by_name(codes)
-            return
+    def update_isst(self, codes=None):
+        """isST：历史段=旧库移植（无则 baostock 只补缺段）；当天行=扶摇名单比对。按票缺口分档。"""
+        codes = self._codes(codes)
+        target = self._target_date()
+        m = self._meta()
+        m = m[m['thscode'].str.endswith(('.SH', '.SZ'))]
+        code2name = {f"{x.split('.')[1].lower()}.{x.split('.')[0]}": n for x, n in zip(m['thscode'], m['name'])}
+        self._snap_names(code2name)                        # 每次运行落一条名单快照，供改名判定
+        scan, fix_local = [], []
+        for code in codes:
+            df = read_v2(code)
+            if df.empty:
+                continue
+            vals = pd.to_numeric(df['isST'], errors='coerce')
+            if not vals.isna().any():
+                continue                                   # 整列已完整 → 不碰
+            (fix_local if vals.notna().any() else scan).append(code)
+        if scan:
+            logger.info(f'[isst] 整列缺 → 回扫 {len(scan)} 只（逐票 checkpoint，可续跑）')
         n, t0, failed = 0, time.time(), []
-        for i, code in enumerate(codes, 1):
-            _progress(i, len(codes), t0, '[isst]', f'已写 {n} 失败 {len(failed)}', every=50)
+        for i, code in enumerate(scan, 1):
+            _progress(i, len(scan), t0, '[isst] 回扫', f'已写 {n} 失败 {len(failed)}', every=50)
             try:
-                scan = self._scan_isst(code, norm_date(start, DEFAULT_START), norm_date(end))
+                s = self._scan_isst(code)
             except Exception as e:
                 _fail('[isst]', code, e, failed)
                 continue
             df = read_v2(code)
             if df.empty:
                 continue
-            m = dict(zip(scan['date'], scan['isST']))
-            df['isST'] = [m.get(x, np.nan) for x in df['date']]
-            df['isST'] = pd.to_numeric(df['isST'], errors='coerce').ffill().fillna(0).astype(int)
+            full = s.set_index('date')['isST']
+            df['isST'] = pd.to_numeric(df['date'].map(full), errors='coerce').ffill().fillna(0).astype(int)
             write_v2(code, df)
             n += 1
-        logger.info(f'[isst] {mode}: 写 {n} 只，失败 {len(failed)} 只'
-                    f'（来源={self.isst_from}，失败可重跑续传）')
-
-    def update_m15(self, mode, codes, start, end):
-        if mode == 'rebuild':
-            self._m15_rebuild_baostock(codes, norm_date(start, DEFAULT_START), norm_date(end))
-            return
-        cal = _cal()
-        last_td = self._target_date()   # 统一到 get_target_trade_date（交易日 15:00 后含当天）
-        plan, bad = {}, []
-        for code in codes:
-            try:
-                r = self._m15_plan(mode, code, cal, last_td)
-            except Exception as e:
-                _fail('[m15]', code, e, bad)
+        # 停牌/首行空缺：本地 ffill 补齐即可（无网络）；与 rebuild 路径同规矩，整列归一化为 0/1
+        touched = fix_local + [c for c in scan if c not in failed]
+        filled = 0
+        for code in touched:
+            df = read_v2(code)
+            if df.empty:
                 continue
-            if r is not None:
-                plan[code] = r
-        logger.info(f'[m15] {mode}: 需抓 {len(plan)}/{len(codes)} 只，计划失败 {len(bad)} 只（last_td={last_td}）')
+            col = pd.to_numeric(df['isST'], errors='coerce')
+            if not col.isna().any():
+                continue
+            df['isST'] = col.ffill().fillna(0).astype(int)
+            write_v2(code, df)
+            filled += 1
+        filled += self._isst_by_name(touched, code2name, target)
+        logger.info(f'[isst] 回扫 {n} 只，本地补齐 {filled} 只，失败 {len(failed)} 只（失败可重跑续传）')
+
+    def update_m15(self, codes=None):
+        """15 分钟线：无本地文件 → 旧器 update_kline.py（baostock 全史）；有文件缺段 → 新浪（≤64 交易日窗）。"""
+        codes = self._codes(codes)
+        cal, last_td = _cal(), self._target_date()
+        history, sina, unhealed = [], {}, []
+        for code in codes:
+            p = os.path.join(M15_KLINE_DIR, f'{code}.csv')
+            if self.force or not os.path.exists(p):
+                history.append(code)
+                continue
+            try:
+                plan = self._plan_m15(code, cal, last_td)
+            except Exception as e:
+                unhealed.append(code)
+                _fail('[m15]', code, e, unhealed)
+                continue
+            if isinstance(plan, tuple):
+                sina[code] = plan
+            elif plan == 'old':
+                unhealed.append(code)
+        if history:
+            logger.info(f'[m15] 无本地文件 {len(history)} 只 → 旧器 update_kline.py 全史')
+            self._delegate_history(history)
+        if unhealed:
+            logger.info(f'[m15] {len(unhealed)} 只老缺口早于新浪窗，需 --force 重建（本机用旧器）')
+        logger.info(f'[m15] 需抓 {len(sina)}/{len(codes)} 只（last_td={last_td}）')
         rows_by_code, failed = {}, []
         done, t0 = 0, time.time()
         with ThreadPoolExecutor(max_workers=6) as ex:
-            futs = {ex.submit(self._fetch_m15, c, dl): (c, fm) for c, (dl, fm) in plan.items()}
+            futs = {ex.submit(self._fetch_m15, c, dl): (c, fm) for c, (dl, fm) in sina.items()}
             for f in as_completed(futs):
                 done += 1
                 c, fm = futs[f]
@@ -496,188 +524,162 @@ class KlineV2Builder:
                 continue
             if self._m15_upsert(code, rows, force_merge=fm):
                 nw += 1
-        logger.info(f'[m15] {mode}: 更新 {nw}/{len(codes)} 只，抓取失败 {len(failed)} 只')
+        logger.info(f'[m15] 新浪更新 {nw}/{len(codes)} 只，抓取失败 {len(failed)} 只')
 
-    def _m15_rebuild_baostock(self, codes, start, end):
-        """m15 全史重建：委托旧器 update_kline.py（baostock 15 分钟全史 + 逐票断点续传）。
-
-        旧器内部票池与列格式与 v2 完全同构（date,time,code,open,high,low,close,volume,amount），
-        重建区间由它自己决定（文件缺失时从 2020-01-01 起到目标交易日），故本类不再自带全史扫描。
-        """
-        from AshareData.datautils.kline_scripts.update_kline import UpdateKline
-        if end or norm_date(start, DEFAULT_START) != DEFAULT_START:
-            logger.warning(f'[m15] 历史重建区间由旧器决定（2020-01-01 → 目标日），'
-                           f'忽略 start={start} end={end}')
-        UpdateKline().update_kline_daily(codes=codes, frequencies=['15'])
-
-    def _m15_plan(self, mode, code, cal, last_td):
-        """按本地缺口计算抓取计划 → (datalen, force_merge)；None=无需抓取。
-
-        新浪只能取"最近 N 根"，不支持按日期区间查；N 按本地实际缺口长度换算（16 根/日），
-        只对真有缺口的票发起请求；超出新浪 64 交易日窗的缺口记录为不可回补。
-        """
-        path = os.path.join(M15_KLINE_DIR, f'{code}.csv')
-        i_last = cal.index(last_td)
-        win_start = cal[max(0, i_last - 62)]
-        if not os.path.exists(path):
-            return 1023, True   # 无文件 → 尽量拉满窗
-        if mode == 'update':
-            tail = read_last_lines(path, n_lines=1)
-            parts = tail[-1].split(',') if tail else []
-            if len(parts) < 2:
-                return 1023, True
-            if parts[0] > last_td or (parts[0] == last_td and int(parts[1]) >= 1500):
-                return None   # 本地已含最新交易日尾 bar，无需抓
-            i0 = cal.index(parts[0]) if parts[0] in cal else max(0, i_last - 2)
-            return min(1023, max(32, (i_last - i0 + 1) * 16)), False
-        # backfill：扫描本地日期找缺口
-        dates = set(pd.read_csv(path, usecols=['date'], dtype={'date': str})['date'])
-        i0 = cal.index(min(dates))
-        miss = [d for d in cal[i0:i_last + 1] if d not in dates]
-        if not miss:
-            return None
-        win_miss = [d for d in miss if d >= win_start]
-        if len(win_miss) < len(miss):
-            logger.info(f'[m15] {code}: {len(miss) - len(win_miss)} 天缺口早于新浪窗（{miss[0]} 起），不可回补')
-        if not win_miss:
-            return None
-        datalen = min(1023, (i_last - cal.index(win_miss[0]) + 1) * 16 + 16)
-        return datalen, min(win_miss) <= max(dates)   # 缺口中段→合并；仅尾部→追加
-
-    # ==================== 调度 ====================
-
-    STEPS = (('adjust', '复权事件'), ('ohlcvt', 'OHLCV+停牌占位'), ('preclose', '前收/涨跌幅'),
-             ('turn', '换手率'), ('isst', 'isST'), ('m15', 'm15 分钟线'))
-
-    def run(self, mode, codes=None, start=None, end=None, skip=()):
+    def run(self, codes=None, skip=()):
+        """按固定顺序跑各字段接口（每个接口自己判断缺口与手段）。"""
         t0 = time.time()
-        self.update_meta(mode, codes, start, end)
-        if codes is None:
-            codes = self._default_codes()
-        logger.info(f'== {mode} | {len(codes)} 只 | start={start} end={end} ==')
-        for i, (name, desc) in enumerate(self.STEPS, 1):
+        self.update_meta()                                  # 上市日/退市表：缺口判定依赖它
+        codes = self._codes(codes)
+        logger.info(f'== {len(codes)} 只 | 目标日 {self._target_date()} ==')
+        for i, (name, desc) in enumerate(self.FIELDS, 1):
             if name in skip:
-                logger.info(f'== [{i}/{len(self.STEPS)}] 跳过 {name} ==')
+                logger.info(f'== [{i}/{len(self.FIELDS)}] 跳过 {name} ==')
                 continue
             t = time.time()
-            getattr(self, f'update_{name}')(mode, codes, start, end)
-            logger.info(f'== [{i}/{len(self.STEPS)}] {name}（{desc}）完成，用时 {_dur(time.time() - t)} ==')
-        logger.info(f'== {mode} 完成，共 {_dur(time.time() - t0)} ==')
+            getattr(self, f'update_{name}')(codes)
+            logger.info(f'== [{i}/{len(self.FIELDS)}] {name}（{desc}）完成，用时 {_dur(time.time() - t)} ==')
+        logger.info(f'== 完成，共 {_dur(time.time() - t0)} ==')
 
-    def _default_codes(self):
-        meta = pd.read_parquet(META_F)
+    # ==================== 内部：缺口判定（全部"该补什么"的判断收敛在此） ====================
+
+    def _codes(self, codes=None):
+        if codes:
+            return sorted(codes)
         return sorted(f"{x.split('.')[1].lower()}.{x.split('.')[0]}"
-                      for x in meta['thscode'] if x.endswith(('.SH', '.SZ')))
+                      for x in self._meta()['thscode'] if x.endswith(('.SH', '.SZ')))
 
-    # ==================== 内部：数据源 ====================
+    def _meta(self):
+        return pd.read_parquet(META_F)
+
+    def _list_dates_map(self):
+        if self._list_dates is None:
+            m = self._meta()
+            m = m[m['thscode'].str.endswith(('.SH', '.SZ'))]
+            self._list_dates = {}
+            for x, v in zip(m['thscode'], m['list_date']):
+                d = str(v)[:10] if v and str(v) != 'nan' else None
+                self._list_dates[f"{x.split('.')[1].lower()}.{x.split('.')[0]}"] = d
+        return self._list_dates
+
+    def _start_of(self, code):
+        """该票应覆盖的首个交易日 = max(库起点, 上市日)：新股从上市日算，上市前不算缺口。"""
+        ld = self._list_dates_map().get(code)
+        return max(FLOOR, ld) if ld else FLOOR
+
+    def _missing(self, code, df):
+        """[上市日或库起点, 目标日] 内本地缺失的交易日。"""
+        have = set(df['date'])
+        lo = self._start_of(code)
+        tgt = self._target_date()
+        return [d for d in _cal() if lo <= d <= tgt and d not in have]
+
+    def _first_traded_blank(self, code, col):
+        """首个真成交行的某字段是否为空（字段级缺口：如缺起始基准、缺原始数据）。"""
+        df = read_v2(code)
+        if df.empty:
+            return False
+        t = df[df['volume'].notna()]
+        return bool(len(t)) and bool(pd.to_numeric(t[col], errors='coerce').isna().iloc[0])
+
+    def _stale_today(self, code):
+        """当天行是否是收盘前写的（收盘后需要重新覆盖）。"""
+        now = pd.Timestamp.now()
+        today = now.strftime('%Y-%m-%d')
+        if self._target_date() != today or now.strftime('%H:%M') < '15:00':
+            return False
+        p = os.path.join(V2_DIR, f'{code}.csv')
+        if not os.path.exists(p):
+            return False
+        return os.path.getmtime(p) < pd.Timestamp(f'{today} 15:00').timestamp()
 
     def _target_date(self):
+        """目标交易日：get_target_trade_date（交易日 15:00 前取上一交易日）。"""
         t = get_target_trade_date()
         return pd.to_datetime(t).strftime('%Y-%m-%d') if t else pd.Timestamp.now().strftime('%Y-%m-%d')
 
-    def _source_rebuild(self, codes, start, end):
-        d = _to_local(ensure_dump('daily-k'))
-        d = d[d['adjusted'] == 'none']
+    # ==================== 内部：手段（各数据源） ====================
+
+    def _fetch_history(self, codes):
+        """整段历史：扶摇 daily-k 全量 dump（一次下载，按票切片）→ {code: (rows, market_last)}。"""
+        d = self._dump_daily('daily-k')
+        market_last = d['date'].max()
+        sub = d[d['code'].isin(codes)]
+        self._remember_prev_close(d, codes)            # 首行前收：preclose 的起始基准
+        sub = sub[sub['date'] >= FLOOR]
+        return {c: (g.drop(columns='code'), market_last) for c, g in sub.groupby('code')}
+
+    def _remember_prev_close(self, dump, codes):
+        """记录这些票在库起点前的最后一个收盘（preclose 起始基准），合并写入 aux（不覆盖别的票）。"""
+        sub = dump[(dump['code'].isin(codes)) & (dump['date'] < FLOOR)]
+        if not len(sub):
+            return
+        prev = sub.sort_values('date').groupby('code')['close'].last()
+        self._prev_close_mem.update(prev.to_dict())
+        old = (pd.read_parquet(PREVCLOSE_F) if os.path.exists(PREVCLOSE_F)
+               else pd.DataFrame(columns=['code', 'prev_close']))
+        both = pd.concat([old, pd.DataFrame({'code': list(prev.index), 'prev_close': prev.values})],
+                         ignore_index=True).drop_duplicates('code', keep='last')
+        os.makedirs(AUX_DIR, exist_ok=True)
+        both.to_parquet(PREVCLOSE_F)
+
+    def _fetch_recent(self, gaps):
+        """历史缺口：10d dump 覆盖窗口内直接补；更早的缺口回落到全量 dump。"""
+        d10 = self._dump_daily('daily-k-10d')
+        win_min = d10['date'].min() if len(d10) else '9999'
+        out, older = {}, {c: [x for x in dates if x < win_min] for c, dates in gaps.items()}
+        for code, dates in gaps.items():
+            d = d10[(d10['code'] == code) & (d10['date'].isin(dates))]
+            if len(d):
+                out[code] = d
+        older = {c: v for c, v in older.items() if v}
+        if older:
+            logger.info(f'[ohlcvt] {len(older)} 只缺口早于 10 日窗口 → 回落全量 dump')
+            full = self._dump_daily('daily-k')
+            self._remember_prev_close(full, list(older))      # 补早段历史 → 首行前收也要补上
+            for code, dates in older.items():
+                d = full[(full['code'] == code) & (full['date'].isin(dates))]
+                out[code] = d if code not in out else pd.concat([out[code], d], ignore_index=True)
+        miss = sum(len(v) for v in gaps.values())
+        got = sum(len(v) for v in out.values())
+        if miss > got:
+            logger.info(f'[ohlcvt] 缺口 {miss} 个票日，源只覆盖 {got} 个（其余下轮再试）')
+        tgt = self._target_date()
+        return {c: (d.drop(columns='code'), tgt) for c, d in out.items() if len(d)}
+
+    def _dump_daily(self, name):
+        d = _to_local(ensure_dump(name))
         d = d.rename(columns={'open_price': 'open', 'high_price': 'high', 'low_price': 'low',
                               'close_price': 'close', 'turnover': 'amount'})
-        market_last = d['date'].max()
-        if end:
-            market_last = min(market_last, end)
-        sub = d[d['code'].isin(codes)]
-        # 边界前收：每只票 start 前最后一个收盘（含 2016+ 段）
-        prev = (sub[sub['date'] < start].sort_values('date').groupby('code')['close'].last()
-                if len(sub) else pd.Series(dtype=float))
-        self._prev_close_mem = prev.to_dict()
-        prev_df = pd.DataFrame({'code': list(self._prev_close_mem), 'prev_close': list(self._prev_close_mem.values())})
-        os.makedirs(AUX_DIR, exist_ok=True)
-        prev_df.to_parquet(PREVCLOSE_F)
-        sub = sub[sub['date'] >= start]
-        if end:
-            sub = sub[sub['date'] <= end]
-        sub = sub[['code', 'date', 'open', 'high', 'low', 'close', 'volume', 'amount']]
-        return {c: g.drop(columns='code') for c, g in sub.groupby('code')}, market_last
+        if name == 'daily-k':
+            d = d[d['adjusted'] == 'none']
+        return d[['code', 'date', 'open', 'high', 'low', 'close', 'volume', 'amount']]
 
-    def _source_backfill(self, codes, start, end):
-        """缺口补充：10d dump 覆盖窗口内直接补；更早的缺口回落到全量 dump。"""
-        d10 = _to_local(ensure_dump('daily-k-10d'))
-        d10 = d10.rename(columns={'open_price': 'open', 'high_price': 'high', 'low_price': 'low',
-                                  'close_price': 'close', 'turnover': 'amount'})
-        d10 = d10[['code', 'date', 'open', 'high', 'low', 'close', 'volume', 'amount']]
-        d10 = d10[d10['code'].isin(codes)]
-        win_min = d10['date'].min() if len(d10) else '9999'
-        out, older = {}, []
-        for code in codes:
-            df = read_v2(code)
-            if df.empty:
-                continue
-            miss = self._missing_dates(df, start, end)
-            if not miss:
-                continue
-            win = [x for x in miss if x >= win_min]
-            old = [x for x in miss if x < win_min]
-            if win:
-                out.setdefault(code, []).append(d10[(d10['code'] == code) & (d10['date'].isin(win))])
-            if old:
-                older.append((code, old))
-        if older:
-            full = _to_local(ensure_dump('daily-k'))
-            full = full.rename(columns={'open_price': 'open', 'high_price': 'high', 'low_price': 'low',
-                                        'close_price': 'close', 'turnover': 'amount'})
-            full = full[['code', 'date', 'open', 'high', 'low', 'close', 'volume', 'amount']]
-            for code, old in older:
-                out.setdefault(code, []).append(full[(full['code'] == code) & (full['date'].isin(old))])
-        src = {c: pd.concat(v, ignore_index=True) for c, v in out.items()}
-        market_last = self._target_date()
-        return src, market_last
-
-    def _source_update(self, codes):
-        """当天更新：扶摇 prices/snapshot（批量 100）。"""
+    def _fetch_today(self, codes):
+        """只缺当天：扶摇 prices/snapshot（批量 100）。"""
         target = self._target_date()
-        items = self._batch_snapshot('/api/a-share/prices/snapshot', codes)
         out = {}
-        for it in items:
+        for it in self._batch_snapshot('/api/a-share/prices/snapshot', codes):
             code = f"{it['thscode'].split('.')[1].lower()}.{it['thscode'].split('.')[0]}"
-            if code not in codes:
-                continue
-            out[code] = pd.DataFrame([{
-                'date': target, 'open': it.get('open_price'), 'high': it.get('high_price'),
-                'low': it.get('low_price'), 'close': it.get('last_price'),
-                'volume': it.get('volume'), 'amount': it.get('turnover')}])
-        return out
-
-    def _batch_snapshot(self, path, codes):
-        items = []
-        for i in range(0, len(codes), 100):
-            chunk = codes[i:i + 100]
-            ts = ','.join(f"{c.split('.')[1]}.{c.split('.')[0].upper()}" for c in chunk)
-            d = api_json(path, {'thscodes': ts})
-            items += d.get('item') or []
-        return items
-
-    def _auction_snapshot(self, codes):
-        items = self._batch_snapshot('/api/a-share/auction/snapshot', codes)
-        out = {}
-        for it in items:
-            code = f"{it['thscode'].split('.')[1].lower()}.{it['thscode'].split('.')[0]}"
-            out[code] = it
+            if code in codes:
+                out[code] = (pd.DataFrame([{'date': target, 'open': it.get('open_price'),
+                                            'high': it.get('high_price'), 'low': it.get('low_price'),
+                                            'close': it.get('last_price'), 'volume': it.get('volume'),
+                                            'amount': it.get('turnover')}]), target)
         return out
 
     # ==================== 内部：行网格 / 停牌占位 ====================
 
-    def _missing_dates(self, df, start, end):
-        have = set(df['date'])
-        cal = _cal()
-        lo = start or df['date'].iloc[0]
-        hi = end or self._target_date()
-        return [d for d in cal if lo <= d <= hi and d not in have]
+    def _materialize(self, df, market_last, code=None):
+        """补齐 [max(库起点, 上市日), market_last] 的交易日网格：缺日 → 停牌占位行（OHLC=前收，量额空，tradestatus=0）。
 
-    def _materialize(self, df, market_last):
-        """补齐 [首行, market_last] 的交易日网格：缺日 → 停牌占位行（OHLC=前收，量额空，tradestatus=0）。"""
+        传 code 时左边界取 _start_of(code)（库起点/上市日），这样库起点附近缺行也能补成占位行。
+        """
         df = df.sort_values('date').drop_duplicates('date', keep='last').reset_index(drop=True)
         if df.empty:
             return df
         cal = _cal()
-        d0 = df['date'].iloc[0]
+        d0 = min(df['date'].iloc[0], self._start_of(code)) if code else df['date'].iloc[0]
         d1 = min(market_last, cal[-1]) if market_last else df['date'].iloc[-1]
         if d1 < d0:
             d1 = df['date'].iloc[-1]
@@ -686,9 +688,8 @@ class KlineV2Builder:
         if missing:
             real = df[df['volume'].notna()].sort_values('date')
             if len(real):
-                rds = real['date'].to_numpy()
+                pos = np.searchsorted(real['date'].to_numpy(), np.array(missing), side='left') - 1
                 rcs = pd.to_numeric(real['close'], errors='coerce').to_numpy()
-                pos = np.searchsorted(rds, np.array(missing), side='left') - 1
                 carry = np.where(pos >= 0, rcs[np.clip(pos, 0, None)], np.nan)  # 逐缺口前收（多段停牌各自 carry）
             else:
                 carry = np.full(len(missing), np.nan)
@@ -703,7 +704,21 @@ class KlineV2Builder:
         df['tradestatus'] = df['tradestatus'].astype(int)   # 0/1 标志列显式定型，不随 concat 推断变 float
         return df
 
-    # ==================== 内部：股本 ====================
+    def _batch_snapshot(self, path, codes):
+        items = []
+        for i in range(0, len(codes), 100):
+            ts = ','.join(f"{c.split('.')[1]}.{c.split('.')[0].upper()}" for c in codes[i:i + 100])
+            items += api_json(path, {'thscodes': ts}).get('item') or []
+        return items
+
+    def _auction_snapshot(self, codes):
+        out = {}
+        for it in self._batch_snapshot('/api/a-share/auction/snapshot', codes):
+            code = f"{it['thscode'].split('.')[1].lower()}.{it['thscode'].split('.')[0]}"
+            out[code] = it
+        return out
+
+    # ==================== 内部：股本事件 ====================
 
     def _load_share_events(self):
         if os.path.exists(SHARE_F):
@@ -711,7 +726,7 @@ class KlineV2Builder:
         return pd.DataFrame(columns=['code', 'date', 'shares_wan'])
 
     def _fetch_share_events(self, codes):
-        """新浪流通股本事件（每只一个 jsonp 全量事件表；6 线程 + 线程内 session 复用 + 抖动）。"""
+        """新浪流通股本事件：每票一个 jsonp 全量事件表；每天只抓一次（share_fetch_log）。"""
         os.makedirs(AUX_DIR, exist_ok=True)
         log = json.load(open(SHARE_LOG_F)) if os.path.exists(SHARE_LOG_F) else {}
         today = pd.Timestamp.now().strftime('%Y-%m-%d')
@@ -754,7 +769,7 @@ class KlineV2Builder:
                     new += rows
         if new:
             new = pd.DataFrame(new)
-            # 空累加帧不进 concat（同 update_ohlcvt：pandas 官方做法，避免空/全 NA 帧参与 dtype 推断）
+            # 空累加帧不进 concat（pandas 官方做法：concat 前排除空/全 NA 帧）
             ev_all = new if ev_all.empty else pd.concat([ev_all, new], ignore_index=True)
             ev_all = ev_all.drop_duplicates(['code', 'date'], keep='last').sort_values(['code', 'date'])
             ev_all.to_parquet(SHARE_F)
@@ -763,33 +778,29 @@ class KlineV2Builder:
 
     # ==================== 内部：isST ====================
 
-    def _scan_isst(self, code, start, end):
-        if self.isst_from == 'old':
-            p = os.path.join(DAILY_KLINE_DIR, f'{code}.csv')
-            if os.path.exists(p):
-                df = pd.read_csv(p, dtype={'date': str})
-                df = df[['date', 'isST']]
-                return df[(df['date'] >= start) & (df['date'] <= (end or '9999'))]
-            # 旧库无此票（如新上市）→ 回落 baostock 扫描
-        # baostock 单线程回扫（逐只 checkpoint，可断点续跑）
+    def _scan_isst(self, code):
+        """该票 isST 全史（旧库优先，无则 baostock 回扫；逐票 checkpoint 可续跑）。"""
+        p = os.path.join(DAILY_KLINE_DIR, f'{code}.csv')
+        if os.path.exists(p):
+            df = pd.read_csv(p, dtype={'date': str})
+            return df[['date', 'isST']]
         import baostock as bs
         os.makedirs(ISST_DIR, exist_ok=True)
         path = os.path.join(ISST_DIR, f'{code}.parquet')
         have = pd.read_parquet(path) if os.path.exists(path) else pd.DataFrame(columns=['date', 'isST'])
         have = have.astype({'date': str})
-        tgt_end = end or pd.Timestamp.now().strftime('%Y-%m-%d')
-        # 只补缺口段：isST 对非 ST 明确返回 0（数据可信），续传=从本地边界接着请求
+        tgt_end = self._target_date()
         segs = []
         if len(have):
             lo, hi = str(have['date'].min()), str(have['date'].max())
             if hi < tgt_end:
                 segs.append(((pd.to_datetime(hi) + pd.Timedelta(days=1)).strftime('%Y-%m-%d'), tgt_end))
-            if lo > start:
-                segs.append((start, (pd.to_datetime(lo) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+            if lo > FLOOR:
+                segs.append((FLOOR, (pd.to_datetime(lo) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
         else:
-            segs.append((start, tgt_end))
+            segs.append((FLOOR, tgt_end))
         if not segs:
-            return have[(have['date'] >= start) & (have['date'] <= tgt_end)]
+            return have
         if not self._bs_logged:
             bs.login()
             self._bs_logged = True
@@ -813,25 +824,26 @@ class KlineV2Builder:
                     bs.login()
             df = pd.DataFrame(rows, columns=['date', 'isST'])
             df['isST'] = pd.to_numeric(df['isST'], errors='coerce')
-            new = pd.concat([new, df], ignore_index=True)
-        full = pd.concat([have, new], ignore_index=True).drop_duplicates('date', keep='last').sort_values('date')
+            new = df if new.empty else pd.concat([new, df], ignore_index=True)
+        full = pd.concat([have, new], ignore_index=True) if len(have) else new
+        full = full.drop_duplicates('date', keep='last').sort_values('date')
         full.to_parquet(path)
-        return full[(full['date'] >= start) & (full['date'] <= tgt_end)]
+        return full
 
-    def _isst_by_name(self, codes):
-        """日常更新：扶摇名字对比（快照落 aux，ST 前缀变化的票改当天 isST）。"""
-        meta = pd.read_parquet(META_F)
-        meta = meta[meta['thscode'].str.endswith(('.SH', '.SZ'))]
-        code2name = {f"{x.split('.')[1].lower()}.{x.split('.')[0]}": n for x, n in zip(meta['thscode'], meta['name'])}
+    def _snap_names(self, code2name):
+        """落一条今天的名字快照（供"改名/ST 前缀变化"判定）。"""
         today = pd.Timestamp.now().strftime('%Y-%m-%d')
         hist = pd.read_parquet(NAMES_F) if os.path.exists(NAMES_F) else pd.DataFrame(columns=['code', 'date', 'name'])
-        last = hist.sort_values('date').groupby('code').tail(1).set_index('code')['name'].to_dict()
         snap = pd.DataFrame([{'code': c, 'date': today, 'name': n} for c, n in code2name.items()])
         hist = pd.concat([hist, snap], ignore_index=True).drop_duplicates(['code', 'date'], keep='last')
         os.makedirs(AUX_DIR, exist_ok=True)
         hist.to_parquet(NAMES_F)
+
+    def _isst_by_name(self, codes, code2name, target):
+        """当天行以扶摇名单为准（ST 前缀变化的票记一行日志）；已正确则不动文件。"""
+        hist = pd.read_parquet(NAMES_F) if os.path.exists(NAMES_F) else pd.DataFrame(columns=['code', 'date', 'name'])
+        last = hist.sort_values('date').groupby('code').tail(1).set_index('code')['name'].to_dict()
         changed = [c for c in codes if c in code2name and _is_st_name(code2name[c]) != _is_st_name(last.get(c, ''))]
-        target = self._target_date()
         filled = 0
         for code in codes:
             if code not in code2name:
@@ -841,15 +853,13 @@ class KlineV2Builder:
             tail = read_last_lines(path, n_lines=1) if os.path.exists(path) else []
             parts = tail[-1].split(',') if tail else []
             if len(parts) < 13 or parts[0] != target:
-                continue                       # 当天无行（如已退市/无数据）→ 无处标注
+                continue                              # 当天无行 → 无处标注
             cur = _num(parts[12])
             if cur is not None and int(cur) == val:
-                continue                       # 当天行 isST 已正确 → 不重写文件（保持廉价）
+                continue                              # 当天行已正确 → 不重写文件
             df = read_v2(code)
             if df.empty:
                 continue
-            # 与 rebuild 路径同规矩：ST 状态向后延续、首个交易日之前按 0；当天行以今日名单为准。
-            # 整列归一化成 0/1 整数，避免 read_csv 把含空值的列读成 float → 写成 '0.0' 这种混杂写法
             col = pd.to_numeric(df['isST'], errors='coerce').ffill().fillna(0).astype(int)
             col.loc[df['date'] == target] = val
             df['isST'] = col
@@ -857,10 +867,37 @@ class KlineV2Builder:
             filled += 1
         for code in changed:
             logger.info(f'[isst] 名字变化: {code} {last.get(code)} → {code2name[code]}')
-        logger.info(f'[isst] update: 名单 {len(code2name)} 只，名字变化 {len(changed)} 只，'
-                    f'补写当天 isST {filled} 只')
+        return filled
 
     # ==================== 内部：m15 ====================
+
+    def _plan_m15(self, code, cal, last_td):
+        """该票 m15 缺口计划 → (datalen, force_merge) / 'old' / None。
+
+        新浪只支持"最近 N 根"：N 按缺口长度换算（16 根/日）；缺口早于 64 交易日窗 → 'old'（需全史手段）。
+        """
+        path = os.path.join(M15_KLINE_DIR, f'{code}.csv')
+        i_last = cal.index(last_td)
+        if not os.path.exists(path):
+            return 1023, True
+        dates = set(pd.read_csv(path, usecols=['date'], dtype={'date': str})['date'])
+        i0 = cal.index(min(dates))
+        miss = [d for d in cal[i0:i_last + 1] if d not in dates]
+        if not miss:
+            return None
+        win_start = cal[max(0, i_last - 62)]
+        win_miss = [d for d in miss if d >= win_start]
+        if not win_miss:
+            return 'old'
+        if len(win_miss) < len(miss):
+            logger.info(f'[m15] {code}: {len(miss) - len(win_miss)} 天缺口早于新浪窗（{miss[0]} 起），不可回补')
+        datalen = min(SINA_MAX_BARS, (i_last - cal.index(win_miss[0]) + 1) * BARS_PER_DAY + BARS_PER_DAY)
+        return datalen, min(win_miss) <= max(dates)   # 缺口中段→合并；仅尾部→追加
+
+    def _delegate_history(self, codes):
+        """整段历史：委托旧器 update_kline.py（baostock 15 分钟全史，列与 v2 同构，逐票续传）。"""
+        from AshareData.datautils.kline_scripts.update_kline import UpdateKline
+        UpdateKline().update_kline_daily(codes=codes, frequencies=['15'])
 
     def _fetch_m15(self, code, datalen):
         sym = code.replace('.', '')
@@ -876,13 +913,11 @@ class KlineV2Builder:
                 arr = json.loads(r.text.strip())
                 if not isinstance(arr, list) or not arr:
                     return pd.DataFrame()
-                rows = []
-                for it in arr:
-                    day = it['day']
-                    rows.append({'date': day[:10], 'time': int(day[11:13]) * 100 + int(day[14:16]),
-                                 'open': float(it['open']), 'high': float(it['high']), 'low': float(it['low']),
-                                 'close': float(it['close']), 'volume': int(float(it['volume'])),
-                                 'amount': float(it['amount'])})
+                rows = [{'date': it['day'][:10],
+                         'time': int(it['day'][11:13]) * 100 + int(it['day'][14:16]),
+                         'open': float(it['open']), 'high': float(it['high']), 'low': float(it['low']),
+                         'close': float(it['close']), 'volume': int(float(it['volume'])),
+                         'amount': float(it['amount'])} for it in arr]
                 time.sleep(random.uniform(0.02, 0.06))
                 return pd.DataFrame(rows)
             except Exception as e:
@@ -892,35 +927,76 @@ class KlineV2Builder:
 
     def _m15_upsert(self, code, rows, force_merge=False):
         path = os.path.join(M15_KLINE_DIR, f'{code}.csv')
-        cols = ['date', 'time', 'code', 'open', 'high', 'low', 'close', 'volume', 'amount']
         os.makedirs(M15_KLINE_DIR, exist_ok=True)   # to_csv 不会建父目录；空库首跑否则 OSError
         if not os.path.exists(path):
             rows.insert(1, 'code', code)
-            rows[cols].to_csv(path, index=False)
+            rows[M15_COLS].to_csv(path, index=False)
             return True
         tail = read_last_lines(path, n_lines=1)
-        last = (tail[-1].split(',') if tail else None)
+        last = tail[-1].split(',') if tail else None
         last_dt = (last[0], int(last[1])) if last and len(last) >= 2 else None
-        new_rows = rows if last_dt is None else rows[[((r.date, r.time) > last_dt) for r in rows.itertuples()]]
+        new_rows = rows if last_dt is None else rows[[(r.date, r.time) > last_dt for r in rows.itertuples()]]
         if len(new_rows) == 0 and not force_merge:
             return False
         if not force_merge and list(new_rows.index) == list(range(len(rows) - len(new_rows), len(rows))):
             out = new_rows.copy()   # 抓取窗与本地衔接（新区间=连续后缀）→ 直接追加
             out.insert(1, 'code', code)
-            out[cols].to_csv(path, mode='a', header=False, index=False)
+            out[M15_COLS].to_csv(path, mode='a', header=False, index=False)
             return True
         old = pd.read_csv(path, dtype={'date': str})
         m = pd.concat([old, rows.assign(code=code)], ignore_index=True)
         m = m.drop_duplicates(['date', 'time'], keep='last').sort_values(['date', 'time'])
-        m[cols].to_csv(path, index=False)
+        m[M15_COLS].to_csv(path, index=False)
         return True
 
-    # ==================== 内部：杂项 ====================
+    # ==================== 内部：辅助表 ====================
+
+    def _sync_delisted(self, prev, meta):
+        """退市表维护：名单消失→记入；重新出现→移出；首建时用旧库独有票播种。"""
+        def codes_of(frame):
+            if frame is None:
+                return set(), {}
+            sub = frame[frame['thscode'].str.endswith(('.SH', '.SZ'))]
+            cs = {f"{x.split('.')[1].lower()}.{x.split('.')[0]}" for x in sub['thscode']}
+            nm = {f"{x.split('.')[1].lower()}.{x.split('.')[0]}": n for x, n in zip(sub['thscode'], sub['name'])}
+            return cs, nm
+        cur, _ = codes_of(meta)
+        hist = (pd.read_parquet(DELISTED_F) if os.path.exists(DELISTED_F)
+                else pd.DataFrame(columns=['code', 'name', 'last_date', 'detect_date']))
+        today = pd.Timestamp.now().strftime('%Y-%m-%d')
+        gone = {}
+        if prev is None:
+            if os.path.isdir(DAILY_KLINE_DIR):
+                for f in sorted(os.listdir(DAILY_KLINE_DIR)):
+                    c = f[:-4]
+                    if f.endswith('.csv') and c not in cur:
+                        tail = read_last_lines(os.path.join(DAILY_KLINE_DIR, f), n_lines=1)
+                        last = tail[-1].split(',')[0] if tail else ''
+                        gone[c] = {'code': c, 'name': '', 'last_date': last, 'detect_date': last}
+        else:
+            pc, pn = codes_of(prev)
+            for c in sorted(pc - cur):
+                p = os.path.join(V2_DIR, f'{c}.csv')
+                tail = read_last_lines(p, n_lines=1) if os.path.exists(p) else []
+                gone[c] = {'code': c, 'name': pn.get(c) or '',
+                           'last_date': tail[-1].split(',')[0] if tail else '', 'detect_date': today}
+        known = set(hist['code'])
+        add = [v for k, v in gone.items() if k not in known]
+        back = sorted(known & cur)
+        if back:
+            hist = hist[~hist['code'].isin(back)]
+        if add:
+            hist = pd.concat([hist, pd.DataFrame(add)], ignore_index=True)
+        if add or back:
+            os.makedirs(AUX_DIR, exist_ok=True)
+            hist.sort_values('code').to_parquet(DELISTED_F)
+        if add:
+            logger.info(f'[meta] 新增退市 {len(add)} 只: {[r["code"] for r in add[:10]]}')
+        if back:
+            logger.info(f'[meta] 名单回归（移出退市表）: {back}')
 
     def _load_prev_close(self):
-        d = {}
-        if self._prev_close_mem:
-            d.update(self._prev_close_mem)
+        d = dict(self._prev_close_mem)
         if os.path.exists(PREVCLOSE_F):
             p = pd.read_parquet(PREVCLOSE_F)
             for c, v in zip(p['code'], p['prev_close']):
@@ -941,84 +1017,60 @@ class KlineV2Builder:
         return pd.Series(dates).map(m)
 
 
-def _num(v):
-    """CSV 字段 → float；空/nan/非数字 → None（'1' 与 '1.0' 都算 1）。"""
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return None
-    return f if f == f else None
-
-
-def _had_turn(path, n=60):
-    """该票最近 n 行是否出现过 turn 值：区分 turn 缺失是「滞后」还是「结构性无量」。"""
-    for ln in read_last_lines(path, n_lines=n):
-        parts = ln.split(',')
-        if len(parts) >= 13 and _num(parts[9]) is not None:
-            return True
-    return False
-
-
 def is_latest(quiet=False):
-    """v2 日线库各字段 + m15 是否都已更新到最近交易日（get_target_trade_date）。
+    """整库各字段是否都无缺口（复用与 update_* 同一套缺口判定，不另写一份）。
 
-    逐票抽末行检查（语义等同旧器 update_kline.py 的 all_latest）：末行 date 达目标日；当天真成交
-    （tradestatus=1）的票 volume/amount/preclose/pctChg/turn 非空、isST 非空；当天有成交的票 m15
-    末 bar 达目标日。豁免「源不提供、重跑也补不回来」的票，否则会永远报未达：退市
-    （_aux/delisted.parquet）、无数据行（只有表头的空 CSV）、结构性无量（末 60 行 turn 全空，
-    如 sh.689009 这类新浪/扶摇都给不出股本的标的）。
-    判据是**全库**的，只回答「整库是否已齐」；某一步拿它当守卫（不关心别列）时传 quiet=True。
+    逐票：①交易日覆盖 [上市日或库起点, 目标日] 无缺；②真成交行（volume 非空）的
+    preclose/amount/turn/pctChg 与 isST 非空；③有成交的票 m15 无缺口（同一个 _plan_m15）。
+    豁免「重跑也补不回来」的票：退市、本地无数据、结构性无量（全表从未算出过 turn，
+    如新浪/扶摇都给不出股本的 sh.689009）。代价是要读全表，比抽末行慢（约十几秒）。
     """
-    target = get_target_trade_date()
-    if not target:
-        return False
-    tgt = f'{target[:4]}-{target[4:6]}-{target[6:8]}'
-    delisted = set(pd.read_parquet(DELISTED_F)['code']) if os.path.exists(DELISTED_F) else set()
-    lags, exempt = {}, {}
-    files = sorted(f for f in os.listdir(V2_DIR) if f.endswith('.csv')) if os.path.isdir(V2_DIR) else []
-    if not files:
+    b = KlineV2Builder()
+    tgt = b._target_date()
+    codes = b._codes()
+    if not codes:
         if not quiet:
             logger.warning(f'[is_latest] v2 库为空（{V2_DIR}）→ False')
         return False
-    traded = set()
-    for f in files:
-        code = f[:-4]
+    delisted = set(pd.read_parquet(DELISTED_F)['code']) if os.path.exists(DELISTED_F) else set()
+    ev = pd.read_parquet(SHARE_F) if os.path.exists(SHARE_F) else pd.DataFrame(columns=['code', 'date', 'shares_wan'])
+    first_ev = ev.groupby('code')['date'].min().to_dict() if len(ev) else {}
+    lags, exempt = {}, {}
+    for code in codes:
         if code in delisted:
-            continue   # 退市票：行情本就终结于退市日，以退市表豁免
-        path = os.path.join(V2_DIR, f)
-        tail = read_last_lines(path, n_lines=1)
-        parts = tail[-1].split(',') if tail else []
-        if len(parts) < 13 or not parts[0][:1].isdigit():
-            exempt.setdefault('no_data', []).append(code)   # 空表/只有表头 → 源里本就没这票
+            exempt.setdefault('delisted', []).append(code)
             continue
-        if parts[0] < tgt:
+        df = read_v2(code)
+        if df.empty:
+            exempt.setdefault('no_data', []).append(code)      # 源里没有该票（或尚未建库）
+            continue
+        if b._missing(code, df):
             lags.setdefault('date', []).append(code)
-            continue
-        if _num(parts[10]) == 1:   # 真成交行（'1' / '1.0' 都认）：量/额/前收/涨跌幅/换手必须有值
-            traded.add(code)
-            for name, i in (('volume', 7), ('amount', 8), ('preclose', 6), ('pctChg', 11)):
-                if _num(parts[i]) is None:
-                    lags.setdefault(name, []).append(code)
-            if _num(parts[9]) is None:
-                # turn 缺失：最近 60 行有过值=真滞后；从没有=源无股本，重跑也算不出 → 豁免
-                if _had_turn(path):
-                    lags.setdefault('turn', []).append(code)
+        traded = df[df['volume'].notna()]
+        if len(traded):
+            for col in ('preclose', 'pctChg'):
+                blank = pd.to_numeric(traded[col], errors='coerce').isna()
+                if blank.any() and not (blank.sum() == 1 and bool(blank.iloc[0])):
+                    lags.setdefault(col, []).append(code)      # 首行无前收（新股）当例外
+            if pd.to_numeric(traded['amount'], errors='coerce').isna().any():
+                lags.setdefault('amount', []).append(code)
+            blank_turn = pd.to_numeric(traded['turn'], errors='coerce').isna()
+            if blank_turn.any():
+                ev0 = first_ev.get(code)
+                if ev0 is not None and not blank_turn[traded['date'] >= ev0].any():
+                    exempt.setdefault('turn', []).append(code)  # 只缺首个股本事件之前的行
+                elif ev0 is None:
+                    exempt.setdefault('turn', []).append(code)  # 源完全没有股本事件 → 算不出
                 else:
-                    exempt.setdefault('turn', []).append(code)
-        if _num(parts[12]) is None:
-            lags.setdefault('isST', []).append(code)
-    if os.path.isdir(M15_KLINE_DIR):
-        for code in sorted(traded):
-            p = os.path.join(M15_KLINE_DIR, f'{code}.csv')
-            tail = read_last_lines(p, n_lines=1) if os.path.exists(p) else []
-            if not tail or tail[-1].split(',')[0] < tgt:
+                    lags.setdefault('turn', []).append(code)
+            if b._plan_m15(code, _cal(), tgt) is not None:
                 lags.setdefault('m15', []).append(code)
-    elif traded:
-        lags['m15'] = sorted(traded)   # m15 库缺失：当日有行情的票全部计入滞后
+        if pd.to_numeric(df['isST'], errors='coerce').isna().any():
+            lags.setdefault('isST', []).append(code)
     note = '，'.join(f'{k}={len(v)}' for k, v in sorted(exempt.items()))
     if not lags:
         if not quiet:
-            logger.info(f'[is_latest] 全部字段已达 {tgt}（日线 {len(files)} 只'
+            logger.info(f'[is_latest] 全部字段已达 {tgt}（{len(codes)} 只'
                         + (f'；已豁免 {note}' if note else '') + '）')
         return True
     if not quiet:
@@ -1030,21 +1082,18 @@ def is_latest(quiet=False):
 
 
 def main():
-    ap = argparse.ArgumentParser(description='日K v2 构建器（rebuild/backfill/update）')
-    ap.add_argument('--mode', required=True, choices=['rebuild', 'backfill', 'update'])
+    ap = argparse.ArgumentParser(description='日K v2 构建器（字段自维护：缺口与手段自动判定）')
     ap.add_argument('--codes', default='', help='逗号分隔，如 600519,sz.000001（缺省=全市场沪深）')
-    ap.add_argument('--start', default=None)
-    ap.add_argument('--end', default=None)
-    ap.add_argument('--isst-from', default='baostock', choices=['baostock', 'old'],
-                    help='rebuild/backfill 的 isST 来源：baostock 回扫 或 旧库移植')
-    ap.add_argument('--skip', default='', help='跳过列方法，如 m15,isst')
-    ap.add_argument('--force', action='store_true')
+    ap.add_argument('--skip', default='', help='跳过字段，如 m15,isst')
+    ap.add_argument('--force', action='store_true', help='强制重取（忽略"已齐/已抓过"的跳过判断）')
+    ap.add_argument('--latest', action='store_true', help='只做整库状态问答（is_latest），不抓数据')
     a = ap.parse_args()
+    if a.latest:
+        sys.exit(0 if is_latest() else 1)
     codes = norm_codes(a.codes) if a.codes else None
-    builder = KlineV2Builder(isst_from=a.isst_from, force=a.force)
-    builder.run(a.mode, codes, norm_date(a.start), norm_date(a.end),
-                skip=[s for s in a.skip.split(',') if s])
+    KlineV2Builder(force=a.force).run(codes, skip=[s for s in a.skip.split(',') if s])
 
 
 if __name__ == '__main__':
     main()
+
