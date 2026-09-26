@@ -27,7 +27,6 @@ import random
 import re
 import threading
 import time
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -39,11 +38,6 @@ from AshareData.paths import ASHARE_ROOT, DAILY_KLINE_DIR, DAILY_KLINE_V2_DIR, M
 from AshareData.utils.exchanges_utils.a_open import get_target_trade_date, get_trade_date_list
 from AshareData.utils.log_util import get_logger
 from AshareData.utils.read_file_utils import get_first_last_line_from_csv, read_last_lines
-
-# pandas 已在 requirements 里固定 <3：这条 FutureWarning 预告的是 3.0 起「空/全 NA 帧也参与 concat
-# 的 dtype 推断」，采纳它会改变落盘字节（如 tradestatus 从 '1' 变 '1.0'），而我们要的正是 2.x 语义
-warnings.filterwarnings('ignore', category=FutureWarning,
-                        message=r'The behavior of DataFrame concatenation with empty or all-NA entries')
 
 logger = get_logger('日Kv2')
 
@@ -278,7 +272,9 @@ class KlineV2Builder:
                 rows['turn'] = np.nan
                 rows['pctChg'] = np.nan
                 rows['isST'] = np.nan
-                df = pd.concat([df, rows], ignore_index=True)
+                # 空骨架帧不进 concat（pandas 官方给的做法：concat 前排除空/全 NA 帧）——否则空帧
+                # 参与 dtype 推断，既触发 FutureWarning，又让结果 dtype 随 pandas 版本浮动
+                df = rows if df.empty else pd.concat([df, rows], ignore_index=True)
             if df.empty:
                 continue
             df = self._materialize(df, market_last)
@@ -718,6 +714,7 @@ class KlineV2Builder:
         df = df.sort_values('date').reset_index(drop=True)
         df.loc[df['volume'].notna(), 'tradestatus'] = 1
         df.loc[df['volume'].isna(), 'tradestatus'] = 0
+        df['tradestatus'] = df['tradestatus'].astype(int)   # 0/1 标志列显式定型，不随 concat 推断变 float
         return df
 
     # ==================== 内部：股本 ====================
@@ -771,7 +768,9 @@ class KlineV2Builder:
                 if done % 500 == 0:
                     logger.info(f'[share] {done}/{len(todo)}')
         if new:
-            ev_all = pd.concat([ev_all, pd.DataFrame(new)], ignore_index=True)
+            new = pd.DataFrame(new)
+            # 空累加帧不进 concat（同 update_ohlcvt：pandas 官方做法，避免空/全 NA 帧参与 dtype 推断）
+            ev_all = new if ev_all.empty else pd.concat([ev_all, new], ignore_index=True)
             ev_all = ev_all.drop_duplicates(['code', 'date'], keep='last').sort_values(['code', 'date'])
             ev_all.to_parquet(SHARE_F)
         json.dump(log, open(SHARE_LOG_F, 'w'))
