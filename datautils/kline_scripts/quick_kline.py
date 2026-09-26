@@ -267,7 +267,7 @@ class KlineV2Builder:
         """OHLCV+额（含停牌占位行与 tradestatus）：按缺口自动选 全量 dump / 增量 dump / 当天快照。"""
         codes = self._codes(codes)
         target = self._target_date()
-        full, recent, today = [], [], []
+        full, recent, today, repair = [], [], [], []
         for code in codes:
             df = read_v2(code)
             if df.empty:
@@ -277,11 +277,14 @@ class KlineV2Builder:
             if [d for d in miss if d < target]:
                 recent.append(code)                   # 缺历史中间段
             if target in miss or self._stale_today(code):
-                today.append(code)                    # 缺当天（或当天行是收盘前写的）
-        if not (full or recent or today):
+                today.append(code)                    # 缺当天 / 当天行是收盘前写的
+            if self._bad_today(code):
+                repair.append(code)                   # 当天行有量无价 → 无论快照回不回都要重建
+        if not (full or recent or today or repair):
             logger.info('[ohlcvt] 各票均已齐 → 跳过')
             return
-        logger.info(f'[ohlcvt] 全史 {len(full)} 只 / 历史缺口 {len(recent)} 只 / 当天 {len(today)} 只')
+        logger.info(f'[ohlcvt] 全史 {len(full)} 只 / 历史缺口 {len(recent)} 只 / 当天 {len(today)} 只'
+                    + (f' / 待重建当天行 {len(repair)} 只' if repair else ''))
         src = {}
         if full:
             src.update(self._fetch_history(full))
@@ -290,6 +293,8 @@ class KlineV2Builder:
             src.update(self._fetch_recent(gaps))
         if today:
             src.update(self._fetch_today(today))
+        for code in repair:
+            src.setdefault(code, (None, target))       # 无真成交也要落一行（占位），否则当天永远缺行
         n, t0 = 0, time.time()
         # 源里没有这些天行情（长期停牌、库起点前）时仍需落行：按“每交易日一行”补占位行
         todo = [c for c in codes if c in src] + [c for c in recent if c not in src]
@@ -563,14 +568,20 @@ class KlineV2Builder:
         return self._list_dates
 
     def _start_of(self, code):
-        """该票应覆盖的首个交易日 = max(库起点, 上市日)：新股从上市日算，上市前不算缺口。"""
+        """该票应覆盖的首个交易日 = max(库起点, 上市日)：新股从上市日算，上市前不算缺口。
+
+        无上市日（扶摇名单里的预留/未开板代码，如 301718.SZ）→ None：这类源里一行行情都没有，
+        不能按库起点要求它，否则会凭空造出一整段停牌占位行。
+        """
         ld = self._list_dates_map().get(code)
-        return max(FLOOR, ld) if ld else FLOOR
+        return max(FLOOR, ld) if ld else None
 
     def _missing(self, code, df):
-        """[上市日或库起点, 目标日] 内本地缺失的交易日。"""
+        """[上市日或库起点, 目标日] 内本地缺失的交易日；无本地数据则[]。"""
+        if df.empty:
+            return []
         have = set(df['date'])
-        lo = self._start_of(code)
+        lo = self._start_of(code) or df['date'].iloc[0]     # 无上市日 → 不要求已有数据之前的日子
         tgt = self._target_date()
         return [d for d in _cal() if lo <= d <= tgt and d not in have]
 
@@ -592,6 +603,17 @@ class KlineV2Builder:
         if not os.path.exists(p):
             return False
         return os.path.getmtime(p) < pd.Timestamp(f'{today} 15:00').timestamp()
+
+    def _bad_today(self, code):
+        """目标日行不可信：有量无价（停牌票被当天快照写成了成交行）→ 要重取/改判为停牌占位。"""
+        df = read_v2(code)
+        if df.empty:
+            return False
+        r = df[df['date'] == self._target_date()]
+        if not len(r):
+            return False
+        r = r.iloc[-1]
+        return _num(r['volume']) is not None and _num(r['close']) is None
 
     def _target_date(self):
         """目标交易日：get_target_trade_date（交易日 15:00 前取上一交易日）。"""
@@ -678,8 +700,15 @@ class KlineV2Builder:
         df = df.sort_values('date').drop_duplicates('date', keep='last').reset_index(drop=True)
         if df.empty:
             return df
+        # 有量无价的行不是真成交（当天快照对停牌票写的 0 行）→ 丢掉，按缺行补成停牌占位行
+        bad = df['volume'].notna() & pd.to_numeric(df['close'], errors='coerce').isna()
+        if bad.any() and (~bad).any():
+            df = df[~bad].reset_index(drop=True)
         cal = _cal()
-        d0 = min(df['date'].iloc[0], self._start_of(code)) if code else df['date'].iloc[0]
+        d0 = df['date'].iloc[0]
+        if code:
+            s = self._start_of(code)
+            d0 = min(d0, s) if s else d0
         d1 = min(market_last, cal[-1]) if market_last else df['date'].iloc[-1]
         if d1 < d0:
             d1 = df['date'].iloc[-1]
