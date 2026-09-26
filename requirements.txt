@@ -1,12 +1,15 @@
-# 只声明下限、不设上限：pip 会按当前解释器自动选兼容的最新版，
-# 因此不要求用户为这个库固定 Python 版本（Python 3.9+ 均可安装）。
-# 下限是「API 可用」的最低版本，不是锁版本；需要复现精确环境时用 requirements.lock 或 pip freeze。
+# 只声明下限、不设上限：pip 按当前解释器自动选兼容的最新版，因此不要求用户固定 Python 版本
+# （Python 3.9+ 均可安装）。
+# 例外：pandas 加 `<3` 上限。pandas 3.0 改了 concat 空/全NA 列的 dtype 推断、字符串默认 dtype
+# （object→str）、Copy-on-Write 默认开启等行为，会让不同机器写出不同 dtype 的数据；限在 2.x
+# 以确保各设备行为一致（2.3.3 同时覆盖 Python 3.9~3.14）。
+# 需要复现精确环境时用 requirements.lock 或 pip freeze。
 baostock>=0.8.9
 beautifulsoup4>=4.12
 lxml>=5.0
 numpy>=1.24
 openpyxl>=3.1
-pandas>=2.0
+pandas>=2.0,<3
 pillow>=10.0
 polars>=1.0
 pyarrow>=15.0

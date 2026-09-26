@@ -13,7 +13,8 @@
   - 空库一律从 2020-01-01 起；各步幂等，可随时中断重跑（缺口/断点驱动）
   - 每步失败自动重试（--retry，默认 2 次重试／退避 20s・40s）；最终失败不阻塞后续，
     结束时 [ALERT] 告警 + 状态写入 .cache/update_all_status.log + 非 0 退出
-  - 全程 tqdm：外层=步骤进度，内层=当前步尝试次数与已用时间
+  - 输出：各步**原样透出**——子进程继承终端，脚本自己的日志/进度条怎么打就怎么显示，
+    本脚本不捕获、不整理、不落盘，只在每步前后各打一行边界标记 + 末尾一张汇总表
 用法:
   python AshareData/datautils/update_all.py                  # 全流程
   python AshareData/datautils/update_all.py --skip feature   # 跳过指定步骤
@@ -25,8 +26,6 @@ import subprocess
 import sys
 import time
 from datetime import datetime
-
-from tqdm import tqdm
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ASHARE = os.path.dirname(HERE)
@@ -40,7 +39,7 @@ PY = sys.executable
 D = f'{ASHARE}/datautils'
 KK = f'{D}/kline_scripts/quick_kline.py'
 FLOOR = '2020-01-01'
-ALERT_F = f'{ASHARE}/.cache/update_all_status.log'
+ALERT_F = f'{ASHARE}/.cache/update_all_status.log'   # 每步结果存档（终端不显示）
 
 
 def _count(d):
@@ -73,25 +72,27 @@ def plan_steps():
     return steps, info
 
 
-def _run_step(cmd, env, desc, attempts):
-    """子进程执行一步（tqdm 秒表显示尝试/已用），失败退避重试；返回 (rc, 已试次数)。"""
+def _run_step(cmd, env, desc, attempts, idx, total):
+    """前台跑一步（子进程继承终端，输出原样透出），失败退避重试；返回 (rc, 已试次数, 用时)。"""
+    print('=' * 72, flush=True)
+    print(f'[{idx}/{total}] {desc}', flush=True)
+    print('=' * 72, flush=True)
     t0 = time.time()
     rc, tried = -1, 0
     for a in range(1, attempts + 1):
         tried = a
-        proc = subprocess.Popen(cmd, cwd=ROOT, env=env)
-        with tqdm(total=0, bar_format='{desc}', position=1, leave=False) as bar:
-            while proc.poll() is None:
-                bar.set_description_str(f'  {desc} 尝试{a}/{attempts} 已用 {time.time() - t0:.0f}s')
-                bar.refresh()
-                time.sleep(0.5)
-        rc = proc.returncode
+        if a > 1:
+            print(f'[{idx}/{total}] 第 {a}/{attempts} 次尝试…', flush=True)
+        rc = subprocess.call(cmd, cwd=ROOT, env=env)
         if rc == 0:
             break
         if a < attempts:
-            print(f'[update_all] {desc} 失败(rc={rc}) → {20 * a}s 后重试', flush=True)
+            print(f'[{idx}/{total}] 失败(rc={rc}) → {20 * a}s 后重试', flush=True)
             time.sleep(20 * a)
-    return rc, tried
+    dt = time.time() - t0
+    mark = '完成' if rc == 0 else f'失败 rc={rc}'
+    print(f'[{idx}/{total}] {mark}  用时 {dt:.0f}s', flush=True)
+    return rc, tried, dt
 
 
 def _log_status(line):
@@ -117,22 +118,18 @@ def main():
     print(f'[update_all] {info}；共 {len(steps)} 步：{[k for k, _, _ in steps]}', flush=True)
     _log_status(f'==== {datetime.now():%F %T} run start（{len(steps)} 步） ====')
     results, t_all = [], time.time()
-    bar = tqdm(total=len(steps), desc='update_all', unit='步', position=0)
-    for key, name, cmd in steps:
-        bar.set_description_str(f'update_all {key}')
-        t0 = time.time()
-        rc, tried = _run_step(cmd, env, name, max(1, a.retry + 1))
-        dt = time.time() - t0
+    for i, (key, name, cmd) in enumerate(steps, 1):
+        rc, tried, dt = _run_step(cmd, env, name, max(1, a.retry + 1), i, len(steps))
         results.append((key, name, rc, dt, tried))
         status = 'OK' if rc == 0 else f'FAILED rc={rc} x{tried}'
         _log_status(f'{datetime.now():%F %T} {status:>15}  {key:<14}{dt:>8.0f}s  {name}')
         if rc != 0:
             print(f'[ALERT] 步骤失败: {name}（尝试 {tried} 次仍失败 rc={rc}）', flush=True)
-        bar.update(1)
-    bar.close()
     print('\n===== update_all 汇总 =====')
     for key, name, rc, dt, tried in results:
-        print(f'  {"✔" if rc == 0 else "✘"} {key:<14}{dt:>8.0f}s  {name}' + ('' if rc == 0 else f'  [尝试{tried}次]'))
+        mark = '✔' if rc == 0 else '✘'
+        tail = '' if rc == 0 else f'  [尝试 {tried} 次]'
+        print(f'  {mark} {key:<14}{dt:>8.0f}s  {name}{tail}')
     print(f'  总计 {time.time() - t_all:.0f}s；状态记录: {ALERT_F}')
     failed = [r for r in results if r[2] != 0]
     if failed:

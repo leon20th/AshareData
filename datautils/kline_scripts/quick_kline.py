@@ -247,9 +247,13 @@ class KlineV2Builder:
 
     def update_ohlcvt(self, mode, codes, start, end):
         if mode == 'update':
-            now_hm = pd.Timestamp.now().strftime('%H:%M')
-            if now_hm < '15:30' and not self.force:
-                logger.info(f'[ohlcvt] 现在 {now_hm} 未到收盘，跳过（--force 可强跑）')
+            # 是否需要更新交给 is_latest 统一判定（其基准 get_target_trade_date 已含收盘时点：
+            # 交易日 15:00 前取上一交易日）；不再自算 15:30，否则两套时点不一致时，15:00~15:30
+            # 会出现「目标日已滚动到当天、却仍被判为未收盘」的空窗。
+            # quiet=True：它是全库判据（m15/turn/isST 都在内），那些列各有自己的步骤负责，
+            # 不能在本步的日志里替它们报账
+            if not self.force and is_latest(quiet=True):
+                logger.info('[ohlcvt] 已是最新，跳过（--force 可强跑）')
                 return
             src = self._source_update(codes)
             market_last = norm_date(end) or self._target_date()
@@ -423,7 +427,7 @@ class KlineV2Builder:
             self._m15_rebuild_baostock(codes, norm_date(start, DEFAULT_START), norm_date(end))
             return
         cal = _cal()
-        last_td = self._m15_last_td(cal)
+        last_td = self._target_date()   # 统一到 get_target_trade_date（交易日 15:00 后含当天）
         plan = {}
         for code in codes:
             try:
@@ -463,7 +467,7 @@ class KlineV2Builder:
         """
         from AshareData.utils.kline_data_utils.query_kline_utils import QueryKlineUtils
         qu = QueryKlineUtils()
-        tgt_end = end or self._m15_last_td(_cal())
+        tgt_end = end or self._target_date()
         meta = pd.read_parquet(META_F) if os.path.exists(META_F) else None
         ld = {}
         if meta is not None:
@@ -522,14 +526,6 @@ class KlineV2Builder:
                 logger.info(f'[m15] rebuild 进度 {i + 1}/{len(todo)} ok={ok} empty={empty} fail={fail} '
                             f'已用 {el / 3600:.1f}h ETA {eta / 3600:.1f}h')
         logger.info(f'[m15] rebuild 完成: ok={ok} empty={empty} fail={fail}，共 {(time.time() - t0) / 3600:.1f}h')
-
-    def _m15_last_td(self, cal):
-        """最近一个已收盘交易日（15:30 前不含今天）。"""
-        now = pd.Timestamp.now()
-        today = now.strftime('%Y-%m-%d')
-        if today in cal and now.strftime('%H:%M') >= '15:30':
-            return today
-        return [d for d in cal if d < today][-1]
 
     def _m15_plan(self, mode, code, cal, last_td):
         """按本地缺口计算抓取计划 → (datalen, force_merge)；None=无需抓取。
@@ -846,14 +842,33 @@ class KlineV2Builder:
         hist.to_parquet(NAMES_F)
         changed = [c for c in codes if c in code2name and _is_st_name(code2name[c]) != _is_st_name(last.get(c, ''))]
         target = self._target_date()
-        for code in changed:
+        filled = 0
+        for code in codes:
+            if code not in code2name:
+                continue
+            val = int(_is_st_name(code2name[code]))
+            path = os.path.join(V2_DIR, f'{code}.csv')
+            tail = read_last_lines(path, n_lines=1) if os.path.exists(path) else []
+            parts = tail[-1].split(',') if tail else []
+            if len(parts) < 13 or parts[0] != target:
+                continue                       # 当天无行（如已退市/无数据）→ 无处标注
+            cur = _num(parts[12])
+            if cur is not None and int(cur) == val:
+                continue                       # 当天行 isST 已正确 → 不重写文件（保持廉价）
             df = read_v2(code)
             if df.empty:
                 continue
-            df.loc[df['date'] == target, 'isST'] = int(_is_st_name(code2name[code]))
+            # 与 rebuild 路径同规矩：ST 状态向后延续、首个交易日之前按 0；当天行以今日名单为准。
+            # 整列归一化成 0/1 整数，避免 read_csv 把含空值的列读成 float → 写成 '0.0' 这种混杂写法
+            col = pd.to_numeric(df['isST'], errors='coerce').ffill().fillna(0).astype(int)
+            col.loc[df['date'] == target] = val
+            df['isST'] = col
             write_v2(code, df)
+            filled += 1
+        for code in changed:
             logger.info(f'[isst] 名字变化: {code} {last.get(code)} → {code2name[code]}')
-        logger.info(f'[isst] update: 名单 {len(code2name)} 只，变化 {len(changed)} 只')
+        logger.info(f'[isst] update: 名单 {len(code2name)} 只，名字变化 {len(changed)} 只，'
+                    f'补写当天 isST {filled} 只')
 
     # ==================== 内部：m15 ====================
 
@@ -888,6 +903,7 @@ class KlineV2Builder:
     def _m15_upsert(self, code, rows, force_merge=False):
         path = os.path.join(M15_KLINE_DIR, f'{code}.csv')
         cols = ['date', 'time', 'code', 'open', 'high', 'low', 'close', 'volume', 'amount']
+        os.makedirs(M15_KLINE_DIR, exist_ok=True)   # to_csv 不会建父目录；空库首跑否则 OSError
         if not os.path.exists(path):
             rows.insert(1, 'code', code)
             rows[cols].to_csv(path, index=False)
@@ -935,38 +951,72 @@ class KlineV2Builder:
         return pd.Series(dates).map(m)
 
 
-def is_latest():
-    """v2 日线库各字段 + m15 是否都已更新到最近交易日（get_target_trade_date）。无参。
+def _num(v):
+    """CSV 字段 → float；空/nan/非数字 → None（'1' 与 '1.0' 都算 1）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None
 
-    逐票抽末行检查：date 网格达目标日；真实行 volume/amount/preclose/pctChg/turn 非空；
-    isST 非空；当日有行情的票 m15 末 bar 达目标日。退市票（_aux/delisted.parquet）豁免。
+
+def _had_turn(path, n=60):
+    """该票最近 n 行是否出现过 turn 值：区分 turn 缺失是「滞后」还是「结构性无量」。"""
+    for ln in read_last_lines(path, n_lines=n):
+        parts = ln.split(',')
+        if len(parts) >= 13 and _num(parts[9]) is not None:
+            return True
+    return False
+
+
+def is_latest(quiet=False):
+    """v2 日线库各字段 + m15 是否都已更新到最近交易日（get_target_trade_date）。
+
+    逐票抽末行检查（语义等同旧器 update_kline.py 的 all_latest）：末行 date 达目标日；当天真成交
+    （tradestatus=1）的票 volume/amount/preclose/pctChg/turn 非空、isST 非空；当天有成交的票 m15
+    末 bar 达目标日。豁免「源不提供、重跑也补不回来」的票，否则会永远报未达：退市
+    （_aux/delisted.parquet）、无数据行（只有表头的空 CSV）、结构性无量（末 60 行 turn 全空，
+    如 sh.689009 这类新浪/扶摇都给不出股本的标的）。
+    判据是**全库**的，只回答「整库是否已齐」；某一步拿它当守卫（不关心别列）时传 quiet=True。
     """
     target = get_target_trade_date()
     if not target:
         return False
     tgt = f'{target[:4]}-{target[4:6]}-{target[6:8]}'
     delisted = set(pd.read_parquet(DELISTED_F)['code']) if os.path.exists(DELISTED_F) else set()
-    lags = {}
+    lags, exempt = {}, {}
     files = sorted(f for f in os.listdir(V2_DIR) if f.endswith('.csv')) if os.path.isdir(V2_DIR) else []
     if not files:
-        logger.warning(f'[is_latest] v2 库为空（{V2_DIR}）→ False')
+        if not quiet:
+            logger.warning(f'[is_latest] v2 库为空（{V2_DIR}）→ False')
         return False
     traded = set()
     for f in files:
-        if f[:-4] in delisted:
+        code = f[:-4]
+        if code in delisted:
             continue   # 退市票：行情本就终结于退市日，以退市表豁免
-        tail = read_last_lines(os.path.join(V2_DIR, f), n_lines=1)
+        path = os.path.join(V2_DIR, f)
+        tail = read_last_lines(path, n_lines=1)
         parts = tail[-1].split(',') if tail else []
-        if len(parts) < 13 or parts[0] < tgt:
-            lags.setdefault('date', []).append(f[:-4])
+        if len(parts) < 13 or not parts[0][:1].isdigit():
+            exempt.setdefault('no_data', []).append(code)   # 空表/只有表头 → 源里本就没这票
             continue
-        if parts[10] == '1':   # tradestatus=1 → 真实行：量/额/前收/涨跌幅/换手都必须有值
-            traded.add(f[:-4])
-            for name, i in (('volume', 7), ('amount', 8), ('turn', 9), ('preclose', 6), ('pctChg', 11)):
-                if parts[i] in ('', 'nan'):
-                    lags.setdefault(name, []).append(f[:-4])
-        if parts[12] in ('', 'nan'):
-            lags.setdefault('isST', []).append(f[:-4])
+        if parts[0] < tgt:
+            lags.setdefault('date', []).append(code)
+            continue
+        if _num(parts[10]) == 1:   # 真成交行（'1' / '1.0' 都认）：量/额/前收/涨跌幅/换手必须有值
+            traded.add(code)
+            for name, i in (('volume', 7), ('amount', 8), ('preclose', 6), ('pctChg', 11)):
+                if _num(parts[i]) is None:
+                    lags.setdefault(name, []).append(code)
+            if _num(parts[9]) is None:
+                # turn 缺失：最近 60 行有过值=真滞后；从没有=源无股本，重跑也算不出 → 豁免
+                if _had_turn(path):
+                    lags.setdefault('turn', []).append(code)
+                else:
+                    exempt.setdefault('turn', []).append(code)
+        if _num(parts[12]) is None:
+            lags.setdefault('isST', []).append(code)
     if os.path.isdir(M15_KLINE_DIR):
         for code in sorted(traded):
             p = os.path.join(M15_KLINE_DIR, f'{code}.csv')
@@ -975,11 +1025,17 @@ def is_latest():
                 lags.setdefault('m15', []).append(code)
     elif traded:
         lags['m15'] = sorted(traded)   # m15 库缺失：当日有行情的票全部计入滞后
+    note = '，'.join(f'{k}={len(v)}' for k, v in sorted(exempt.items()))
     if not lags:
-        logger.info(f'[is_latest] 全部字段已达 {tgt}（日线 {len(files)} 只）')
+        if not quiet:
+            logger.info(f'[is_latest] 全部字段已达 {tgt}（日线 {len(files)} 只'
+                        + (f'；已豁免 {note}' if note else '') + '）')
         return True
-    for k, v in sorted(lags.items()):
-        logger.warning(f'[is_latest] {k} 未达 {tgt}: {len(v)} 只（样例: {v[:5]}）')
+    if not quiet:
+        for k, v in sorted(lags.items()):
+            logger.warning(f'[is_latest] {k} 未达 {tgt}: {len(v)} 只（样例: {v[:5]}）')
+        if note:
+            logger.info(f'[is_latest] 已豁免（源不提供，重跑无效）: {note}')
     return False
 
 
