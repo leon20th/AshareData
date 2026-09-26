@@ -27,6 +27,7 @@ import random
 import re
 import threading
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -38,6 +39,11 @@ from AshareData.paths import ASHARE_ROOT, DAILY_KLINE_DIR, DAILY_KLINE_V2_DIR, M
 from AshareData.utils.exchanges_utils.a_open import get_target_trade_date, get_trade_date_list
 from AshareData.utils.log_util import get_logger
 from AshareData.utils.read_file_utils import get_first_last_line_from_csv, read_last_lines
+
+# pandas 已在 requirements 里固定 <3：这条 FutureWarning 预告的是 3.0 起「空/全 NA 帧也参与 concat
+# 的 dtype 推断」，采纳它会改变落盘字节（如 tradestatus 从 '1' 变 '1.0'），而我们要的正是 2.x 语义
+warnings.filterwarnings('ignore', category=FutureWarning,
+                        message=r'The behavior of DataFrame concatenation with empty or all-NA entries')
 
 logger = get_logger('日Kv2')
 
