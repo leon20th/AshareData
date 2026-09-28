@@ -1,13 +1,13 @@
 import os
 import pandas as pd
-from AshareData.paths import BASE_FEATURE_DIR, DAILY_KLINE_V2_DIR, M15_KLINE_DIR
+from AshareData.paths import BASE_FEATURE_DIR, DAILY_KLINE_TS_DIR, M15_KLINE_TS_DIR
 from AshareData.datautils.dataloaders.feature_build.feature_utils import *
-from AshareData.utils.kline_data_utils.kline_v2_reader import read_daily
+from AshareData.utils.kline_data_utils.kline_ts_reader import read_daily
 
-# daily 已切 v2（读时复权 adapter）；KLINE_DIRS['daily'] 仅用于存在性检查/目录遍历
+# daily 已切 ts（读时复权 adapter）；KLINE_DIRS['daily'] 仅用于存在性检查/目录遍历
 KLINE_DIRS = {
-    'daily': DAILY_KLINE_V2_DIR,
-    'm15':   M15_KLINE_DIR,
+    'daily': DAILY_KLINE_TS_DIR,
+    'm15':   M15_KLINE_TS_DIR,
 }
 FeatDIR = BASE_FEATURE_DIR
 _PRICE_COLS = ('open', 'high', 'low', 'close', 'preclose')
@@ -19,7 +19,7 @@ PARQUET_NUM_SCHEMA = {
 }
 
 def read_kline(kline_type='daily', code=None, end_date=None, **kwargs):
-    """读取 kline。daily=v2 读时复权（默认 qfq，价格列随除权连续；usecols 不含价格列时直读原值加速）；
+    """读取 kline。daily=ts 读时复权（默认 qfq，价格列随除权连续；usecols 不含价格列时直读原值加速）；
     m15=直读目录 CSV（kwargs 透传给 read_csv）。指定 code 读单只，否则读全目录。end_date 截断到该日期。"""
     usecols = kwargs.get('usecols')
     need_price = not usecols or any(c in usecols for c in _PRICE_COLS)

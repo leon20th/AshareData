@@ -24,10 +24,10 @@ AshareData/
 
 | 目录 | 内容 |
 | --- | --- |
-| `kline_data/daily_kline_v2/` | 日线 v2 CSV（未复权原值 + 事件因子，**读时复权**；旧库 `daily_kline/` 已于 2026-09-26 撤除） |
-| `kline_data/daily_kline_ts/` | 日线 tushare 版 CSV（未复权原值 + 复权因子 aux，**读时复权**；token 见 `.keys/.tushare_token`） |
-| `kline_data/m15_kline/` | 15 分钟线 CSV |
-| `kline_data/m15_kline_ts/` | 15 分钟线 tushare 版（不复权原值；历史由旧库换算重建 + 去重修复，增量补齐走新浪 + baostock；stk_mins 独立权限未开通） |
+| `kline_data/daily_kline_v2/` | 日线 v2 CSV（未复权原值 + 事件因子，**读时复权**；2026-09-28 起消费链已切 ts 版，本目录留档） |
+| `kline_data/daily_kline_ts/` | **当前日线主源**：tushare 版 CSV（未复权原值 + 复权因子 aux，**读时复权**；token 见 `.keys/.tushare_token`） |
+| `kline_data/m15_kline/` | 15 分钟线 CSV（老库；2026-09-28 起消费链已切 m15_kline_ts） |
+| `kline_data/m15_kline_ts/` | **当前 m15 主源**：tushare 版（不复权原值；历史由旧库换算重建 + 去重修复，增量补齐走新浪 + baostock；stk_mins 独立权限未开通） |
 | `kline_data/info/` | 交易信息（如 `notrade_yet.csv` 停牌记录） |
 | `scrap_data/zhangtingban/`、`scrap_data/dietingban/` | 涨停板 / 跌停板抓取产物（xlsx） |
 | `scrap_data/longhu/` | 龙虎榜抓取产物（json） |

@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""update_all —— 依次更新所有依赖数据（K线v2 / 停牌名单 / 新闻双源 / 榜单四源 / 特征构建）。
+"""update_all —— 依次更新所有依赖数据（K线ts / 停牌名单 / 新闻双源 / 榜单四源 / 特征构建）。
 
 顺序：
-  1) v2 日线     空库自动全史重建（floor=2020-01-01，首个交易日 01-02）；isST 源=有旧库走移植、无则 baostock 回扫
-  2) v2 m15      空库自动 baostock 全史慢扫（唯一免费全史源，可中断重跑续传）；否则新浪缺口增量
-  3) 停牌名单    v2 全量扫描重建 notrade_yet.csv（Lushan 停牌显示源）
+  1) ts 日线      tushare 全量（daily/turn/adj/isst；缺口判定 + 最小请求，可中断续传）
+  2) ts m15       新浪缺口增量 + baostock 老段（stk_mins 独立权限未开通；逐票落盘续传）
+  3) 停牌名单    ts 全量扫描重建 notrade_yet.csv（Lushan 停牌显示源）
   4) 新闻        财联社 / 东财7x24（增量；空目录自动从 2020-01-01 回填）
   5) 榜单        开盘啦 / 涨跌停（问财）/ 龙虎榜（增量补齐缺失日期）
-  6) 特征构建    base_feature（自增量；经读时复权 adapter 读 v2 日线，无旧库依赖）
+  6) 特征构建    base_feature（自增量；经读时复权 adapter 读 ts 日线，无旧库依赖）
 
 约定：
   - 空库一律从 2020-01-01 起；各步幂等，可随时中断重跑（缺口/断点驱动）
@@ -33,11 +33,11 @@ ROOT = os.path.dirname(ASHARE)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from AshareData.paths import DAILY_KLINE_V2_DIR, M15_KLINE_DIR
+from AshareData.paths import DAILY_KLINE_TS_DIR, M15_KLINE_TS_DIR
 
 PY = sys.executable
 D = f'{ASHARE}/datautils'
-KK = f'{D}/kline_scripts/quick_kline.py'
+TSK = f'{D}/kline_scripts/tushare_kline.py'
 FLOOR = '2020-01-01'
 ALERT_F = f'{ASHARE}/.cache/update_all_status.log'   # 每步结果存档（终端不显示）
 
@@ -47,12 +47,12 @@ def _count(d):
 
 
 def plan_steps():
-    v2_n, m15_n = _count(DAILY_KLINE_V2_DIR), _count(M15_KLINE_DIR)
+    ts_n, m15_n = _count(DAILY_KLINE_TS_DIR), _count(M15_KLINE_TS_DIR)
     steps = [
-        # quick_kline 自己判断每票每字段的缺口与手段，这里不再传模式/区间
-        ('v2', 'v2 日线', [PY, '-u', KK, '--skip', 'm15']),
-        ('m15', 'v2 m15', [PY, '-u', KK, '--skip', 'adjust,ohlcvt,preclose,turn,isst']),
-        ('notrade', '停牌名单（v2 重建）', [PY, '-u', f'{D}/kline_scripts/update_notrade.py']),
+        # tushare_kline 自己判断每票每字段的缺口与手段，这里不再传模式/区间
+        ('v2', 'ts 日K（tushare）', [PY, '-u', TSK, '--skip', 'm15']),
+        ('m15', 'ts m15（tushare）', [PY, '-u', TSK, '--skip', 'daily,turn,adj,isst']),
+        ('notrade', '停牌名单（ts 重建）', [PY, '-u', f'{D}/kline_scripts/update_notrade.py']),
         ('cls', '新闻·财联社', [PY, '-u', f'{D}/regime_scripts/scrap_news_cls.py']),
         ('em724', '新闻·东财7x24', [PY, '-u', f'{D}/regime_scripts/scrap_news_em724.py']),
         ('kaipanla', '榜单·开盘啦', [PY, '-u', f'{D}/regime_scripts/scrap_kaipanla.py', '--start', FLOOR]),
@@ -61,7 +61,7 @@ def plan_steps():
         ('longhu', '榜单·龙虎榜（同花顺）', [PY, '-u', f'{D}/regime_scripts/scrap_longhu.py']),
         ('feature', '特征构建 base_feature', [PY, '-u', f'{D}/dataloaders/feature_build/build_all_feature.py']),
     ]
-    info = f'库状态: v2={v2_n} 只, m15={m15_n} 只'
+    info = f'库状态: ts={ts_n} 只, m15={m15_n} 只'
     return steps, info
 
 

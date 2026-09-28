@@ -22,7 +22,7 @@
      - turn ：按缺失票日汇总 → 按交易日全市场各取一次、现场回填（不落缓存，无持久状态）。
      - adj  ：按交易日缺口全市场各取一次；已抓日期记 _aux/adj_fetch_log.json。
      - namechange：按公告年份分段续传，水位记 _aux/namechange_log.json。
-     - m15 ：缺口分窗路由——近 ~64 交易日窗内缺口用新浪（快、可并发）；更早缺口/整段用 baostock（单线程慢扫、逐票续传）。
+     - m15 ：缺口分窗路由——近 ~64 交易日窗内缺口用新浪（快、可并发）；更早缺口只拉缺口区间、库起点起整段才拉全（baostock 单线程慢扫、逐票续传）。
   4. 口径与 v2（quick_kline）逐位对齐：13 列 schema 与列序、未复权原值、每交易日一行、
      停牌占位（volume==0：价格 carry、amount=0、turn/pctChg 空、tradestatus=0）、
      覆盖 [max(库起点, 上市日), min(目标日, 退市日)]、首行前收基准（库起点前收盘，_aux/prev_close）。
@@ -622,7 +622,7 @@ class TushareKline:
         logger.info(f'[isst] 写 {n} 只（共 {len(codes)}）')
 
     def update_m15(self, codes=None):
-        """15 分钟线（不复权原值）：近 64 交易日窗内缺口→新浪（并发）；更早缺口/整段→baostock（单线程，逐票续传）。"""
+        """15 分钟线（不复权原值）：近 64 交易日窗内缺口→新浪（并发）；更早缺口→baostock 只拉缺口区间（单线程，逐票续传）。"""
         codes = self._codes(codes)
         cal = _cal()
         sina, bs_plan, failed = {}, [], []
@@ -637,7 +637,7 @@ class TushareKline:
             if plan[0] == 'sina':
                 sina[code] = plan[1:]
             else:
-                bs_plan.append((code, plan[1], plan[2]))
+                bs_plan.append((code, *plan[1:]))
         logger.info(f'[m15] 新浪 {len(sina)} 只 / baostock {len(bs_plan)} 只'
                     + ('（baostock 单线程慢扫、逐票落盘续传，可 --codes 分批）' if bs_plan else ''))
         rows_by_code = {}
@@ -659,9 +659,11 @@ class TushareKline:
             if self._m15_upsert(code, rows, force_merge=fm):
                 nw += 1
         t0 = time.time()
-        for i, (code, start, end) in enumerate(bs_plan, 1):
+        for i, (code, start, end, miss) in enumerate(bs_plan, 1):
             try:
                 rows = self._fetch_m15_bs(code, start, end)
+                if miss is not None and len(rows):
+                    rows = rows[[d in miss for d in rows['date']]]
                 if len(rows) and self._m15_upsert(code, rows, force_merge=True):
                     nw += 1
             except Exception as e:
@@ -951,20 +953,20 @@ class TushareKline:
     # ==================== 内部：m15（新浪补缺口 / baostock 老段） ====================
 
     def _plan_m15(self, code, cal, end_td):
-        """该票 m15 缺口计划 → ('sina', datalen, force_merge) / ('bs', start, end) / None（已齐）。
+        """该票 m15 缺口计划 → ('sina', datalen, force_merge) / ('bs', start, end, miss_set|None) / None（已齐）。
 
         新浪只支持"最近 N 根"（≈64 交易日窗）：窗内缺口用新浪（快、可并发）；
-        窗口外的老缺口与库起点起整段用 baostock（慢、单线程、但全，可续传）。
+        窗口外的老缺口用 baostock 只拉「最早~最晚缺口」区间、库起点起整段才拉全（单线程、可续传）。
         只要求「真成交日」（日线 volume>0）的分钟 bar：停牌日没有任何源的 bar，不算缺口。
         """
         path = os.path.join(M15_DIR, f'{code}.csv')
         start_td = self._start_of(code) or FLOOR
         i_end = bisect.bisect_left(cal, end_td)
         if not os.path.exists(path):
-            return ('bs', start_td, end_td)
+            return ('bs', start_td, end_td, None)
         dates = set(pd.read_csv(path, usecols=['date'], dtype={'date': str})['date'])
         if not dates:
-            return ('bs', start_td, end_td)
+            return ('bs', start_td, end_td, None)
         dp = os.path.join(TS_DIR, f'{code}.csv')
         if os.path.exists(dp):
             dd = pd.read_csv(dp, usecols=['date', 'volume'], dtype={'date': str})
@@ -977,7 +979,7 @@ class TushareKline:
         if not miss:
             return None
         if miss[0] < cal[max(0, i_end - SINA_WIN)]:
-            return ('bs', miss[0], end_td)             # 老缺口超出新浪窗 → baostock 一段补齐
+            return ('bs', miss[0], miss[-1], set(miss))   # 老缺口超出新浪窗 → baostock 只拉缺口区间
         datalen = min(SINA_MAX_BARS, (i_end - bisect.bisect_left(cal, miss[0]) + 1) * BARS_PER_DAY + BARS_PER_DAY)
         return ('sina', datalen, min(miss) <= max(dates))   # 缺口中段→合并；仅尾部→追加
 
