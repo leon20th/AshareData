@@ -1,14 +1,29 @@
+import functools
 import os
 import pandas as pd
-from AshareData.paths import BASE_FEATURE_DIR, DAILY_KLINE_TS_DIR, M15_KLINE_TS_DIR
+from AshareData.paths import (BASE_FEATURE_DIR, DAILY_KLINE_TS_DIR,
+                              DAILY_KLINE_V2_DIR, M15_KLINE_TS_DIR)
 from AshareData.datautils.dataloaders.feature_build.feature_utils import *
-from AshareData.utils.kline_data_utils.kline_ts_reader import read_daily
 
-# daily 已切 ts（读时复权 adapter）；KLINE_DIRS['daily'] 仅用于存在性检查/目录遍历
+# daily 读口随管线（环境变量 ASHARE_DAILY_SOURCE：tushare 默认 / mix；update_all --daily 或
+# build_all_feature --daily-source 设置）：tushare→daily_kline_ts+kline_ts_reader；
+# mix→daily_kline_v2+kline_v2_reader（读时复权同构）。m15 两管线共用 m15_kline_ts。
 KLINE_DIRS = {
     'daily': DAILY_KLINE_TS_DIR,
     'm15':   M15_KLINE_TS_DIR,
 }
+
+
+@functools.lru_cache(maxsize=1)
+def _daily_reader():
+    """按 ASHARE_DAILY_SOURCE 返回 read_daily 并同步 KLINE_DIRS['daily']（首次读数时判定）。"""
+    if os.environ.get('ASHARE_DAILY_SOURCE', 'tushare') == 'mix':
+        from AshareData.utils.kline_data_utils.kline_v2_reader import read_daily
+        KLINE_DIRS['daily'] = DAILY_KLINE_V2_DIR
+        return read_daily
+    from AshareData.utils.kline_data_utils.kline_ts_reader import read_daily
+    KLINE_DIRS['daily'] = DAILY_KLINE_TS_DIR
+    return read_daily
 FeatDIR = BASE_FEATURE_DIR
 _PRICE_COLS = ('open', 'high', 'low', 'close', 'preclose')
 
@@ -19,14 +34,16 @@ PARQUET_NUM_SCHEMA = {
 }
 
 def read_kline(kline_type='daily', code=None, end_date=None, **kwargs):
-    """读取 kline。daily=ts 读时复权（默认 qfq，价格列随除权连续；usecols 不含价格列时直读原值加速）；
+    """读取 kline。daily=读时复权（随 ASHARE_DAILY_SOURCE 管线；默认 qfq，价格列随除权连续；usecols 不含价格列时直读原值加速）；
     m15=直读目录 CSV（kwargs 透传给 read_csv）。指定 code 读单只，否则读全目录。end_date 截断到该日期。"""
+    if kline_type == 'daily':
+        _daily_reader()                     # 首用同步读口与 KLINE_DIRS['daily']
     usecols = kwargs.get('usecols')
     need_price = not usecols or any(c in usecols for c in _PRICE_COLS)
 
     def _read(code_):
         if kline_type == 'daily':
-            df = read_daily(code_, 'qfq' if need_price else 'raw')
+            df = _daily_reader()(code_, 'qfq' if need_price else 'raw')
             return df[[c for c in usecols if c in df.columns]] if usecols else df
         df = pd.read_csv(f'{KLINE_DIRS[kline_type]}/{code_}.csv', **kwargs)
         # 上游脏数据：time 列可能是 YYYYMMDDHHMMSS 格式（如 20260624094500000），修正为 HHMM

@@ -22,7 +22,7 @@ import pandas as pd
 import requests
 import tqdm
 
-from AshareData.datautils.kline_scripts.tushare_kline import _pro as _ts_pro
+from AshareData.datautils.kline_scripts.tushare.tushare_kline import _pro as _ts_pro
 from AshareData.paths import ASHARE_ROOT, DAILY_KLINE_TS_DIR, INFO_DIR
 from AshareData.utils.exchanges_utils.a_open import get_target_trade_date, get_trade_date_list
 from AshareData.utils.log_util import get_logger

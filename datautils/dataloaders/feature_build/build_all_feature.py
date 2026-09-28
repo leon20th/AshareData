@@ -91,8 +91,12 @@ def build_base_feature(codes=None, workers=16, rebuild=False):
 if __name__ == '__main__':
     import argparse
     ap = argparse.ArgumentParser(description='特征构建（base_feature 增量；--rebuild 全史重建）')
-    ap.add_argument('--rebuild', action='store_true', help='base_feature 全量重建（读 v2 读时复权源，已存在 parquet 一并重算）')
+    ap.add_argument('--rebuild', action='store_true', help='base_feature 全量重建（读时复权源，已存在 parquet 一并重算）')
+    ap.add_argument('--daily-source', default='', choices=['', 'tushare', 'mix'],
+                    help='日K读口管线（默认按环境变量 ASHARE_DAILY_SOURCE / tushare）')
     a = ap.parse_args()
+    if a.daily_source:
+        os.environ['ASHARE_DAILY_SOURCE'] = a.daily_source
     build_base_feature(rebuild=a.rebuild)
     build_updown_limit_feature(update=True)
     build_market_features(update=True)

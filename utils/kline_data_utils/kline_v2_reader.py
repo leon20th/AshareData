@@ -21,7 +21,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from AshareData.datautils.kline_scripts.quick_kline import V2_DIR
+from AshareData.paths import DAILY_KLINE_V2_DIR as V2_DIR
 
 PRICE_COLS = ['open', 'high', 'low', 'close', 'preclose']
 

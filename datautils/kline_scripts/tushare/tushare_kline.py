@@ -15,50 +15,43 @@
      名单/上市退市日                stock_basic     L/D/P 三态
      tradestatus（停牌占位行）      ——              由本地交易日历 + daily 缺行派生（与 v2 同语义）
      交易日历/目标日                ——              沿用本地 a_open（baostock 维护），与全站一致
-     m15（15 分钟线）              ——              新浪补缺口（近 ~64 交易日窗）+ baostock 老段；不复权原值
 
   3. 抓取策略（最小请求）：
      - daily：按票缺口贪心分批（多代码一次调用，6000 行/次上限）；只请求缺失区间（冷建多取库起点前一段）。
      - turn ：按缺失票日汇总 → 按交易日全市场各取一次、现场回填（不落缓存，无持久状态）。
      - adj  ：按交易日缺口全市场各取一次；已抓日期记 _aux/adj_fetch_log.json。
      - namechange：按公告年份分段续传，水位记 _aux/namechange_log.json。
-     - m15 ：缺口分窗路由——近 ~64 交易日窗内缺口用新浪（快、可并发）；更早缺口只拉缺口区间、库起点起整段才拉全（baostock 单线程慢扫、逐票续传）。
   4. 口径与 v2（quick_kline）逐位对齐：13 列 schema 与列序、未复权原值、每交易日一行、
      停牌占位（volume==0：价格 carry、amount=0、turn/pctChg 空、tradestatus=0）、
      覆盖 [max(库起点, 上市日), min(目标日, 退市日)]、首行前收基准（库起点前收盘，_aux/prev_close）。
      当日（目标日==今天）源未入库时不落占位行，留缺口下轮补（源已入库则当晚补齐停牌票）。
   5. 老数据不移植（用户定案）：fresh 建库，不读旧库做历史覆盖。
 
-产物: daily_kline_ts/{sh.600000.csv} 13 列 + m15_kline_ts/{sh.600000.csv} 9 列（均为未复权原值）
+产物: daily_kline_ts/{sh.600000.csv} 13 列（未复权原值）；m15 由共用模块 kline_scripts/m15/update_m15.py 维护（m15_kline_ts，两管线共用）
 辅助: daily_kline_ts/_aux/（meta_tickers / adj_factor+日志 / namechange+日志 / prev_close）
 用法:
-  python AshareData/datautils/kline_scripts/tushare_kline.py [--codes 600519,sz.000001] [--skip turn,isst]
-  python AshareData/datautils/kline_scripts/tushare_kline.py --latest   # 只问库状态，不抓数据
-  python AshareData/datautils/kline_scripts/tushare_kline.py --probe    # 连通性/权限自检（不写数据）
+  python AshareData/datautils/kline_scripts/tushare/tushare_kline.py [--codes 600519,sz.000001] [--skip turn,isst]
+  python AshareData/datautils/kline_scripts/tushare/tushare_kline.py --latest   # 只问库状态，不抓数据
+  python AshareData/datautils/kline_scripts/tushare/tushare_kline.py --probe    # 连通性/权限自检（不写数据）
 token: 环境变量 TUSHARE_TOKEN 优先，其次 AshareData/.keys/.tushare_token（单行纯文本；配置见 setup.sh）
-参考耗时（全市场 2020 起冷建）：日线部分 ≈5.1k 次调用、约 15 分钟；m15 老段走 baostock 单线程（逐票慢扫，全市场需数天，可 --codes 分批续传）。
-备注: m15 不用 tushare 分钟接口（stk_mins 需单独权限）；新浪/baostock 均为不复权原值，复权读出口用 _aux/adj_factor 折算。
+参考耗时（全市场 2020 起冷建）：日线部分 ≈5.1k 次调用、约 15 分钟。
 """
 import argparse
 import bisect
 import json
 import os
-import queue
-import random
 import re
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
-import requests
 
-from AshareData.paths import ASHARE_ROOT, DAILY_KLINE_TS_DIR, M15_KLINE_TS_DIR
+from AshareData.paths import ASHARE_ROOT, DAILY_KLINE_TS_DIR
 from AshareData.utils.exchanges_utils.a_open import get_target_trade_date, get_trade_date_list
 from AshareData.utils.log_util import get_logger
-from AshareData.utils.read_file_utils import read_last_lines
 
 logger = get_logger('日Kts')
 
@@ -72,13 +65,6 @@ NAME_F = os.path.join(AUX_DIR, 'namechange.parquet')
 NAME_LOG = os.path.join(AUX_DIR, 'namechange_log.json')
 PREV_F = os.path.join(AUX_DIR, 'prev_close.parquet')
 
-M15_DIR = M15_KLINE_TS_DIR
-M15_COLS = ['date', 'time', 'code', 'open', 'high', 'low', 'close', 'volume', 'amount']
-SINA_KLINE = 'https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData'
-SINA_MAX_BARS = 1023             # 新浪单次请求上限（≈64 个交易日的 15 分钟 bar）
-SINA_WIN = 62                    # 新浪可回补窗口（交易日数）
-BARS_PER_DAY = 16
-BS_TIMEOUT = 120                 # baostock 单次查询看门狗（连接半开有卡死前科）
 
 COLS = ['date', 'code', 'open', 'high', 'low', 'close', 'preclose',
         'volume', 'amount', 'turn', 'tradestatus', 'pctChg', 'isST']
@@ -95,8 +81,6 @@ _CAL = None
 _PRO = None
 _PACE_LK = threading.Lock()
 _PACE_LAST = [0.0]
-_BS_ON = False                  # baostock 登录态（卡死/断线后强制重登）
-_TLS = threading.local()
 
 
 # ==================== 通用工具 ====================
@@ -197,7 +181,10 @@ def norm_codes(text):
 # ==================== tushare 调用层（重试 / 频控 / 权限识别） ====================
 
 def _pro():
-    """tushare 客户端（懒初始化）：环境变量 TUSHARE_TOKEN 优先，其次 .keys/.tushare_token。"""
+    """tushare 客户端（懒初始化）：环境变量 TUSHARE_TOKEN 优先，其次 .keys/.tushare_token。
+
+    注：本项目 kline_scripts/tushare/ 与 PyPI 包同名，导入前剔除遮蔽路径，确保拿到真包。
+    """
     global _PRO
     if _PRO is None:
         token = os.environ.get('TUSHARE_TOKEN', '').strip()
@@ -206,7 +193,19 @@ def _pro():
         if not token:
             raise RuntimeError(f'缺少 tushare token：写入 {TOKEN_FILE}（单行纯文本）'
                                f'或设环境变量 TUSHARE_TOKEN（配置见 AshareData/setup.sh）')
-        import tushare as ts
+        # 本项目 kline_scripts/tushare/ 与 PyPI 包同名：当 kline_scripts/ 位于 sys.path 前部
+        # （如从该目录下的脚本启动）时，裸 import 会命中本地包；先剔除遮蔽路径与假缓存
+        import sys as _sys
+        _mod = _sys.modules.get('tushare')
+        if _mod is not None and not hasattr(_mod, 'pro_api'):
+            del _sys.modules['tushare']
+        _shadow = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # .../kline_scripts
+        _saved = _sys.path[:]
+        try:
+            _sys.path[:] = [p for p in _sys.path if os.path.abspath(p or '.') != _shadow]
+            import tushare as ts
+        finally:
+            _sys.path[:] = _saved
         _PRO = ts.pro_api(token)
     return _PRO
 
@@ -297,79 +296,6 @@ def write_ts(code, df):
     df.to_csv(os.path.join(TS_DIR, f'{code}.csv'), index=False)
 
 
-# ==================== baostock 直连（m15 老段） ====================
-
-def _bs_ensure_login():
-    """baostock 登录（全局一次；卡死/断线后由 _bs_rows 置回 False 强制重登）。"""
-    global _BS_ON
-    if _BS_ON:
-        return
-    import baostock as bs
-    lg = bs.login()
-    if lg.error_code != '0':
-        raise RuntimeError(f'baostock 登录失败: {lg.error_msg}')
-    _BS_ON = True
-
-
-def _bs_call(fn, timeout=BS_TIMEOUT):
-    """守护线程里跑 baostock 调用：连接半开卡死时超时放弃，不阻塞整轮。返回 (ok, 结果或异常)。"""
-    q = queue.Queue(maxsize=1)
-
-    def run():
-        try:
-            q.put((True, fn()))
-        except Exception as e:
-            q.put((False, e))
-
-    threading.Thread(target=run, daemon=True).start()
-    try:
-        return q.get(timeout=timeout)
-    except queue.Empty:
-        return False, TimeoutError(f'baostock 调用超时>{timeout}s')
-
-
-def _bs_rows(code, fields, start, end, frequency='d', adjustflag='3', retries=3):
-    """baostock 拉一段 K 线（逐段串行；超时看门狗 + 断线重登录重试）。空段返回 []，失败抛异常。"""
-    import baostock as bs   # noqa: F401  延迟导入：不用 m15 的环境不需要装 baostock
-    global _BS_ON
-    last = None
-    for attempt in range(retries):
-        try:
-            _bs_ensure_login()
-            ok, rs = _bs_call(lambda: bs.query_history_k_data_plus(
-                code, fields, start_date=start, end_date=end,
-                frequency=frequency, adjustflag=adjustflag))
-            if not ok:
-                raise rs
-            if rs.error_code != '0':
-                raise RuntimeError(rs.error_msg)
-
-            def drain():
-                out = []
-                while rs.error_code == '0' and rs.next():
-                    out.append(rs.get_row_data())
-                return out
-
-            ok, rows = _bs_call(drain)
-            if not ok:
-                raise rows
-            return rows
-        except Exception as e:
-            last = e
-            _BS_ON = False                      # 卡死/断线后下一轮强制重登录
-            time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f'{code} {frequency} {start}~{end} 拉取失败: {last}')
-
-
-def _fail(tag, code, err, failed, cap=3):
-    """逐票失败（网络/服务等不可避免的缺失）：前 cap 条详列，之后只计数（末尾汇总）。"""
-    failed.append(code)
-    if len(failed) <= cap:
-        logger.warning(f'{tag} {code} 失败: {err}')
-    elif len(failed) == cap + 1:
-        logger.warning(f'{tag} 失败已超 {cap} 条，后续只计数')
-
-
 # ==================== 构建器 ====================
 
 class TushareKline:
@@ -379,8 +305,7 @@ class TushareKline:
     """
 
     FIELDS = (('daily', 'OHLCV+前收/涨跌幅+停牌占位'), ('turn', '换手率'),
-              ('adj', '复权因子（读时复权用）'), ('isst', 'isST'),
-              ('m15', '15分钟线（新浪补全 / baostock 老段）'))
+              ('adj', '复权因子（读时复权用）'), ('isst', 'isST'))
 
     def __init__(self, force=False):
         self.force = force                 # 强制重取（忽略缺口/已抓日志）
@@ -620,57 +545,6 @@ class TushareKline:
             write_ts(code, df)
             n += 1
         logger.info(f'[isst] 写 {n} 只（共 {len(codes)}）')
-
-    def update_m15(self, codes=None):
-        """15 分钟线（不复权原值）：近 64 交易日窗内缺口→新浪（并发）；更早缺口→baostock 只拉缺口区间（单线程，逐票续传）。"""
-        codes = self._codes(codes)
-        cal = _cal()
-        sina, bs_plan, failed = {}, [], []
-        for code in codes:
-            try:
-                plan = self._plan_m15(code, cal, self._end_of(code))
-            except Exception as e:
-                _fail('[m15]', code, e, failed)
-                continue
-            if plan is None:
-                continue
-            if plan[0] == 'sina':
-                sina[code] = plan[1:]
-            else:
-                bs_plan.append((code, *plan[1:]))
-        logger.info(f'[m15] 新浪 {len(sina)} 只 / baostock {len(bs_plan)} 只'
-                    + ('（baostock 单线程慢扫、逐票落盘续传，可 --codes 分批）' if bs_plan else ''))
-        rows_by_code = {}
-        done, t0 = 0, time.time()
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            futs = {ex.submit(self._fetch_m15, c, dl): (c, fm) for c, (dl, fm) in sina.items()}
-            for f in as_completed(futs):
-                done += 1
-                c, fm = futs[f]
-                _progress(done, len(futs), t0, '[m15] 新浪', f'已得 {len(rows_by_code)} 失败 {len(failed)}')
-                try:
-                    rows_by_code[c] = (f.result(), fm)
-                except Exception as e:
-                    _fail('[m15]', c, e, failed)
-        nw = 0
-        for code, (rows, fm) in rows_by_code.items():
-            if rows is None or rows.empty:
-                continue
-            if self._m15_upsert(code, rows, force_merge=fm):
-                nw += 1
-        t0 = time.time()
-        for i, (code, start, end, miss) in enumerate(bs_plan, 1):
-            try:
-                rows = self._fetch_m15_bs(code, start, end)
-                if miss is not None and len(rows):
-                    rows = rows[[d in miss for d in rows['date']]]
-                if len(rows) and self._m15_upsert(code, rows, force_merge=True):
-                    nw += 1
-            except Exception as e:
-                _fail('[m15]', code, e, failed)
-            _progress(i, len(bs_plan), t0, '[m15] baostock',
-                      f'已写 {nw} 失败 {len(failed)} 未处理 {len(bs_plan) - i}', every=3)
-        logger.info(f'[m15] 更新 {nw}/{len(codes)} 只，失败 {len(failed)} 只（重跑续传）')
 
     # ==================== 内部：边界判定 ====================
 
@@ -950,107 +824,13 @@ class TushareKline:
         self._prev_mem = {}
         self._prev = None                     # 使下次 _load_prev 重读
 
-    # ==================== 内部：m15（新浪补缺口 / baostock 老段） ====================
-
-    def _plan_m15(self, code, cal, end_td):
-        """该票 m15 缺口计划 → ('sina', datalen, force_merge) / ('bs', start, end, miss_set|None) / None（已齐）。
-
-        新浪只支持"最近 N 根"（≈64 交易日窗）：窗内缺口用新浪（快、可并发）；
-        窗口外的老缺口用 baostock 只拉「最早~最晚缺口」区间、库起点起整段才拉全（单线程、可续传）。
-        只要求「真成交日」（日线 volume>0）的分钟 bar：停牌日没有任何源的 bar，不算缺口。
-        """
-        path = os.path.join(M15_DIR, f'{code}.csv')
-        start_td = self._start_of(code) or FLOOR
-        i_end = bisect.bisect_left(cal, end_td)
-        if not os.path.exists(path):
-            return ('bs', start_td, end_td, None)
-        dates = set(pd.read_csv(path, usecols=['date'], dtype={'date': str})['date'])
-        if not dates:
-            return ('bs', start_td, end_td, None)
-        dp = os.path.join(TS_DIR, f'{code}.csv')
-        if os.path.exists(dp):
-            dd = pd.read_csv(dp, usecols=['date', 'volume'], dtype={'date': str})
-            expect = set(dd.loc[pd.to_numeric(dd['volume'], errors='coerce') > 0, 'date'])
-        else:
-            expect = None                       # 无日线参照 → 按全部交易日要求
-        lo = self._start_of(code) or min(dates)
-        i0 = bisect.bisect_left(cal, lo)
-        miss = [d for d in cal[i0:i_end + 1] if d not in dates and (expect is None or d in expect)]
-        if not miss:
-            return None
-        if miss[0] < cal[max(0, i_end - SINA_WIN)]:
-            return ('bs', miss[0], miss[-1], set(miss))   # 老缺口超出新浪窗 → baostock 只拉缺口区间
-        datalen = min(SINA_MAX_BARS, (i_end - bisect.bisect_left(cal, miss[0]) + 1) * BARS_PER_DAY + BARS_PER_DAY)
-        return ('sina', datalen, min(miss) <= max(dates))   # 缺口中段→合并；仅尾部→追加
-
-    def _fetch_m15(self, code, datalen):
-        sym = code.replace('.', '')
-        s = getattr(_TLS, 'sina', None)
-        if s is None:
-            s = _TLS.sina = requests.Session()
-            s.headers['User-Agent'] = 'Mozilla/5.0'
-        last = None
-        for _ in range(3):
-            try:
-                r = s.get(SINA_KLINE, params={'symbol': sym, 'scale': '15', 'ma': 'no', 'datalen': str(datalen)},
-                          timeout=10)
-                arr = json.loads(r.text.strip())
-                if not isinstance(arr, list) or not arr:
-                    return pd.DataFrame()
-                rows = [{'date': it['day'][:10],
-                         'time': int(it['day'][11:13]) * 100 + int(it['day'][14:16]),
-                         'open': float(it['open']), 'high': float(it['high']), 'low': float(it['low']),
-                         'close': float(it['close']), 'volume': int(float(it['volume'])),
-                         'amount': float(it['amount'])} for it in arr]
-                time.sleep(random.uniform(0.02, 0.06))
-                return pd.DataFrame(rows)
-            except Exception as e:
-                last = e
-                time.sleep(random.uniform(0.5, 1.5))
-        raise last
-
-    def _fetch_m15_bs(self, code, start, end):
-        """baostock 15 分钟一段（不复权 adjustflag='3'，与新浪同口径）→ 与新浪同构的行帧（time=HHMM 整数）。"""
-        rows = _bs_rows(code, 'date,time,open,high,low,close,volume,amount', start, end,
-                        frequency='15', adjustflag='3')
-        out = [{'date': r[0], 'time': int(r[1][8:12]),
-                'open': _num(r[2]), 'high': _num(r[3]), 'low': _num(r[4]),
-                'close': _num(r[5]), 'volume': _num(r[6]), 'amount': _num(r[7])}
-               for r in rows if _num(r[5]) is not None]
-        return pd.DataFrame(out)
-
-    def _m15_upsert(self, code, rows, force_merge=False):
-        path = os.path.join(M15_DIR, f'{code}.csv')
-        os.makedirs(M15_DIR, exist_ok=True)   # to_csv 不会建父目录；空库首跑否则 OSError
-        if not os.path.exists(path):
-            rows.insert(1, 'code', code)
-            rows[M15_COLS].to_csv(path, index=False)
-            return True
-        tail = read_last_lines(path, n_lines=1)
-        last = tail[-1].split(',') if tail else None
-        last_dt = (last[0], int(last[1])) if last and len(last) >= 2 else None
-        new_rows = rows if last_dt is None else rows[[(r.date, r.time) > last_dt for r in rows.itertuples()]]
-        if len(new_rows) == 0 and not force_merge:
-            return False
-        if not force_merge and list(new_rows.index) == list(range(len(rows) - len(new_rows), len(rows))):
-            out = new_rows.copy()   # 抓取窗与本地衔接（新区间=连续后缀）→ 直接追加
-            out.insert(1, 'code', code)
-            out[M15_COLS].to_csv(path, mode='a', header=False, index=False)
-            return True
-        old = pd.read_csv(path, dtype={'date': str})
-        m = pd.concat([old, rows.assign(code=code)], ignore_index=True)
-        m = m.drop_duplicates(['date', 'time'], keep='last').sort_values(['date', 'time'])
-        m[M15_COLS].to_csv(path, index=False)
-        return True
-
-
 # ==================== 状态问答 / 自检 ====================
 
 def is_latest(quiet=False):
     """整库各字段是否都无缺口（复用与 update_* 同一套缺口判定）。
 
     逐票：①覆盖区间 [上市日或库起点, 退市日或目标日] 无缺日；②真成交行（volume>0）的
-    preclose/pctChg/amount/turn 非空；③isST 非空；④有成交的票 m15 无缺口（同一个 _plan_m15）。
+    preclose/pctChg/amount/turn 非空；③isST 非空。（m15 由共用模块 kline_scripts/m15/update_m15.py 自检）
     豁免「重跑也补不回来」的票：退市、本地无数据（源里没有该票）、turn 整票全缺（源不覆盖）。
     注：代价是要读全表，比抽末行慢。
     """
@@ -1096,8 +876,6 @@ def is_latest(quiet=False):
                     exempt.setdefault('turn', []).append(code)  # 整票无换手率（源缺）→ 算不出
                 else:
                     lags.setdefault('turn', []).append(code)
-            if b._plan_m15(code, cal, b._end_of(code)) is not None:
-                lags.setdefault('m15', []).append(code)
         if pd.to_numeric(df['isST'], errors='coerce').isna().any():
             lags.setdefault('isST', []).append(code)
     if not n_data:
