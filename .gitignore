@@ -6,3 +6,4 @@ __pycache__/
 models/
 .keys/
 .cache/
+.DS_Store
