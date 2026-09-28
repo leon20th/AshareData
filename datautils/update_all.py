@@ -52,7 +52,7 @@ def plan_steps():
         # tushare_kline 自己判断每票每字段的缺口与手段，这里不再传模式/区间
         ('v2', 'ts 日K（tushare）', [PY, '-u', TSK, '--skip', 'm15']),
         ('m15', 'ts m15（tushare）', [PY, '-u', TSK, '--skip', 'daily,turn,adj,isst']),
-        ('notrade', '停牌名单（ts 重建）', [PY, '-u', f'{D}/kline_scripts/update_notrade.py']),
+        ('notrade', '停牌名单（tushare suspend_d）', [PY, '-u', f'{D}/kline_scripts/update_notrade.py', '--source', 'tushare']),
         ('cls', '新闻·财联社', [PY, '-u', f'{D}/regime_scripts/scrap_news_cls.py']),
         ('em724', '新闻·东财7x24', [PY, '-u', f'{D}/regime_scripts/scrap_news_em724.py']),
         ('kaipanla', '榜单·开盘啦', [PY, '-u', f'{D}/regime_scripts/scrap_kaipanla.py', '--start', FLOOR]),

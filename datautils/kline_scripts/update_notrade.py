@@ -1,14 +1,57 @@
+"""update_notrade —— 当前停牌名单（notrade_yet.csv）双轨更新器。
+
+轨一 tushare（默认，新管线用）：suspend_d 官方停复牌，锚日规则——最近已收盘
+    交易日当天出现在 S 清单 = 停牌中（含下一交易日"预停"记录）；notrade_date
+    = 连续 S 段起点（按交易日历回溯）。
+轨二 fuyao（备用/对账）：扶摇 daily-k-10d dump，在市票（stock_basic L）∩ 锚日
+    无 bar = 停牌；起点按 dump 窗口（10 交易日）回溯，超窗记窗口首日。
+旧法（--source daily）：本地日线尾部 tradestatus=0 段扫描（回退路径；缺点：
+    退市/摘牌票不清理，会残留历史脏数据）。
+
+用法:
+  python update_notrade.py                  # tushare 轨全量重建（默认）
+  python update_notrade.py --source fuyao   # fuyao 轨全量重建
+  python update_notrade.py --compare        # tushare 写盘 + 与 fuyao 对账打印
+"""
+import argparse
+import io
+import json
 import os
 
 import pandas as pd
+import requests
 import tqdm
 
-from AshareData.paths import DAILY_KLINE_TS_DIR, INFO_DIR
+from AshareData.datautils.kline_scripts.tushare_kline import _pro as _ts_pro
+from AshareData.paths import ASHARE_ROOT, DAILY_KLINE_TS_DIR, INFO_DIR
+from AshareData.utils.exchanges_utils.a_open import get_target_trade_date, get_trade_date_list
 from AshareData.utils.log_util import get_logger
 from AshareData.utils.read_file_utils import read_csv_by_tail
 
 logger = get_logger('更新停牌数据')
 
+FUYAO_BASE = 'https://fuyao.aicubes.cn'
+FUYAO_KEY_FILE = os.path.join(ASHARE_ROOT, '.keys', '.fuyao_api.json')
+
+
+def _local_code(ts_code):
+    """tushare '600363.SH' → 本地 'sh.600363'。"""
+    c, ex = ts_code.split('.')
+    return f'{ex.lower()}.{c}'
+
+
+def _fuyao_key():
+    """扶摇 API key（JSON 单值文件）。"""
+    if not os.path.exists(FUYAO_KEY_FILE):
+        raise RuntimeError(f'缺少扶摇 API key 文件: {FUYAO_KEY_FILE}')
+    key = next((v for v in json.load(open(FUYAO_KEY_FILE)).values()
+                if isinstance(v, str) and len(v) > 10), None)
+    if not key:
+        raise RuntimeError(f'扶摇 API key 文件里没有可用 key: {FUYAO_KEY_FILE}')
+    return key
+
+
+# 仅旧法（--source daily）使用的历史人工补充（新轨已由官方数据覆盖，不再需要）
 manual_update = [
     ('sz.300029', '2026-07-11'),
     ('sz.000004', '2026-07-14'),
@@ -26,8 +69,9 @@ class UpdateNotrade:
     # Number of tail rows to scan per stock CSV when detecting suspension runs.
     TAIL_SCAN_ROWS = 500
 
-    def __init__(self, force_init=False):
-        self.daily_database = DAILY_KLINE_TS_DIR   # 2026-09-28 起扫 ts 日线（tushare 源）
+    def __init__(self, force_init=False, source='tushare'):
+        self._source = source
+        self.daily_database = DAILY_KLINE_TS_DIR   # 旧法（--source daily）读 ts 日线
         self.notrade_dir = os.path.dirname(self.NOTRADE_CSV)
         self.df_notrade_yet = self._load_notrade_yet(force_init=force_init)
         self.changed = False
@@ -36,8 +80,35 @@ class UpdateNotrade:
     # public API
     # ------------------------------------------------------------------
 
-    def init_notrade_yet(self):
-        """Scan all daily CSVs and (re)build the notrade_yet table from scratch.
+    def init_notrade_yet(self, source=None):
+        """全量重建 notrade_yet（source: tushare 默认 | fuyao | daily）。
+
+        tushare：suspend_d 锚日规则（最近已收盘交易日当天在 S 清单 = 停牌中，
+                  含下一交易日"预停"记录；notrade_date = 连续 S 段起点）。
+        fuyao ：扶摇 daily-k-10d dump，在市票（stock_basic L）∩ 锚日无 bar = 停牌；
+                起点按 dump 窗口回溯（超窗记窗口首日）。
+        daily ：旧法——本地日线尾部 tradestatus=0 段扫描（回退用；退市票不清理）。
+        """
+        source = source or self._source
+        if source == 'tushare':
+            records = self._fetch_tushare()
+        elif source == 'fuyao':
+            records = self._fetch_fuyao()
+        elif source == 'daily':
+            records = self._scan_daily()
+        else:
+            raise ValueError(f'未知 source: {source}')
+
+        df = pd.DataFrame(records, columns=self.COLUMNS).sort_values('code').reset_index(drop=True)
+        os.makedirs(self.notrade_dir, exist_ok=True)
+        df.to_csv(self.NOTRADE_CSV, index=False)
+        self.df_notrade_yet = df.copy()
+        self.changed = False
+        logger.info(f'init_notrade_yet({source}) 完成: 共 {len(df)} 支停牌股票, 已写入 {self.NOTRADE_CSV}')
+        return df
+
+    def _scan_daily(self):
+        """旧法（回退）：扫描全部日线尾部 tradestatus=0 连续段（含 manual_update 补充）。
 
         A stock is considered currently suspended when the last known row has
         tradestatus=0.  We walk the tail backwards to find the first consecutive
@@ -55,13 +126,76 @@ class UpdateNotrade:
         #manual updates
         for code, notrade_date in manual_update:
             records.append({'code': code, 'notrade_date': notrade_date})
+        return records
 
-        df = pd.DataFrame(records, columns=self.COLUMNS)
-        os.makedirs(self.notrade_dir, exist_ok=True)
-        df.to_csv(self.NOTRADE_CSV, index=False)
-        self.df_notrade_yet = df.copy()
-        self.changed = False
-        logger.info(f'init_notrade_yet 完成: 共 {len(df)} 支停牌股票, 已写入 {self.NOTRADE_CSV}')
+    def _fetch_tushare(self):
+        """tushare suspend_d 轨：锚日 S 集合 = 当前停牌；notrade_date = 连续 S 段起点。"""
+        pro = _ts_pro()
+        anchor = pd.to_datetime(str(get_target_trade_date())).strftime('%Y-%m-%d')
+        cal = [pd.to_datetime(str(d)).strftime('%Y-%m-%d') for d in get_trade_date_list()]
+        t0 = pd.Timestamp(anchor)
+        frames = []
+        for s, e in [(t0 - pd.Timedelta(days=220), t0 - pd.Timedelta(days=20)),
+                     (t0 - pd.Timedelta(days=21), t0 + pd.Timedelta(days=10))]:
+            frames.append(pro.suspend_d(suspend_type='S',
+                                        start_date=s.strftime('%Y%m%d'),
+                                        end_date=e.strftime('%Y%m%d')))
+        ev = pd.concat(frames, ignore_index=True).drop_duplicates()
+        ev['td'] = pd.to_datetime(ev['trade_date']).dt.strftime('%Y-%m-%d')
+        records = []
+        for code, g in ev.groupby('ts_code'):
+            ds = set(g['td'])
+            latest = max(ds)
+            if anchor not in ds and latest <= anchor:
+                continue                       # 锚日无 S 且无未来预停 → 已复牌/摘牌
+            cur = latest if latest > anchor else anchor
+            i = cal.index(cur)
+            while i - 1 >= 0 and cal[i - 1] in ds:
+                i -= 1
+            records.append((_local_code(code), cal[i]))
+        logger.info(f'[tushare] suspend_d {len(ev)} 事件 / {ev.ts_code.nunique()} 票 → 当前停牌 {len(records)} 只')
+        return records
+
+    def _fetch_fuyao(self):
+        """扶摇 dump 轨：在市票 ∩ 锚日无 bar = 停牌；起点按 dump 窗口回溯（超窗记窗口首日）。"""
+        anchor = pd.to_datetime(str(get_target_trade_date())).strftime('%Y-%m-%d')
+        s = requests.Session()
+        s.headers['X-api-key'] = _fuyao_key()
+        u = s.get(f'{FUYAO_BASE}/api/dump/market-dumps/daily-k-10d/download-url', timeout=60).json()
+        url = (u.get('data') or {}).get('presigned_url') or ''
+        if not url:
+            raise RuntimeError(f'扶摇 dump 签名失败: {u.get("code")} {u.get("message")}')
+        blob = requests.get(url, timeout=300).content
+        d = pd.read_parquet(io.BytesIO(blob))
+        d['date'] = (pd.to_datetime(d['date_ms'], unit='ms', utc=True)
+                     .dt.tz_convert('Asia/Shanghai').dt.strftime('%Y-%m-%d'))
+        days = sorted(d['date'].unique())
+        eff = anchor if anchor in days else days[-1]
+        if eff != anchor:
+            logger.warning(f'[fuyao] dump 最新日 {eff} < 锚日 {anchor}，按 {eff} 判定')
+        live = set(_ts_pro().stock_basic(exchange='', list_status='L')['ts_code'])
+        bars = set(d.loc[d['date'] == eff, 'thscode'])
+        ii = days.index(eff)
+        records = []
+        for tc in sorted(live - bars):
+            ds = set(d.loc[d['thscode'] == tc, 'date'])
+            i = ii
+            while i - 1 >= 0 and days[i - 1] in ds:
+                i -= 1
+            records.append((_local_code(tc), days[i]))
+        capped = sum(1 for _, dt in records if dt == days[0])
+        logger.info(f'[fuyao] 在市 {len(live)} / 锚日有 bar {len(bars & live)} → 当前停牌 {len(records)} 只'
+                    + (f'（{capped} 只起点超窗记窗口首日 {days[0]}）' if capped else ''))
+        return records
+
+    def compare_sources(self):
+        """两轨对账：tushare（写盘为准）vs fuyao，差异打日志。"""
+        df = self.init_notrade_yet(source='tushare')
+        t_codes = set(df['code'])
+        f_codes = {c for c, _ in self._fetch_fuyao()}
+        logger.info(f'[对账] tushare {len(t_codes)} vs fuyao {len(f_codes)} | 交集 {len(t_codes & f_codes)}')
+        logger.info(f'[对账] 仅 tushare（含下一交易日预停）: {sorted(t_codes - f_codes)}')
+        logger.info(f'[对账] 仅 fuyao: {sorted(f_codes - t_codes)}')
         return df
 
     def get_notrade_yet(self):
@@ -256,7 +390,7 @@ class UpdateNotrade:
         - If directory exists but file missing/empty, return empty DataFrame.
         """
         if not os.path.isdir(self.notrade_dir) or force_init:
-            return self.init_notrade_yet()
+            return self.init_notrade_yet(source=self._source)
         if not os.path.exists(self.NOTRADE_CSV) or os.path.getsize(self.NOTRADE_CSV) == 0:
             return pd.DataFrame(columns=self.COLUMNS)
         return pd.read_csv(self.NOTRADE_CSV, dtype=str)
@@ -296,4 +430,12 @@ class UpdateNotrade:
             return str(notrade_date)
 
 if __name__ == '__main__':
-    UpdateNotrade(force_init=True)   # 无参入口：全量扫描 v2 日线重建 notrade_yet.csv（含 manual_update 补充）
+    ap = argparse.ArgumentParser(description='停牌名单更新（双轨：tushare 默认 / fuyao；daily 为旧法回退）')
+    ap.add_argument('--source', default='tushare', choices=['tushare', 'fuyao', 'daily'])
+    ap.add_argument('--compare', action='store_true', help='tushare 写盘并与 fuyao 对账打印')
+    a = ap.parse_args()
+    updater = UpdateNotrade(source=a.source)
+    if a.compare:
+        updater.compare_sources()
+    else:
+        updater.init_notrade_yet(source=a.source)
