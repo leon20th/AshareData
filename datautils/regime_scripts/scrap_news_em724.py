@@ -103,6 +103,7 @@ def main():
     cursor = None if incremental else st['oldest_us']
     stop_ts = st['newest_us'] // 1_000_000 if incremental else start_ts
     req = n_new = 0
+    walk_newest_us = st['newest_us']          # 本次已见最新时间（增量覆盖确认后才落盘）
     while True:
         if args.max_req and req >= args.max_req:
             logger.info(f'达到 --max-req={args.max_req}，正常退出（状态已存，重跑续传）')
@@ -136,20 +137,27 @@ def main():
                 {k: it.get(k) for k in ('code', 'title', 'summary', 'showTime', 'stockList', 'realSort')})
         for day, its in buckets.items():
             n_new += save_day(day, its)
-        st['newest_us'] = max(st['newest_us'], max(item_ts(it) for it in items) * 1_000_000)
+        # 游标推进（两种模式都走）：增量也需逐页回溯到上次覆盖位置；未推进则停止防死循环
+        page_newest_us = max(item_ts(it) for it in items) * 1_000_000
+        walk_newest_us = max(walk_newest_us, page_newest_us)
+        prev = cursor
+        cursor = next_us
         if not incremental:
-            if cursor is not None and next_us >= cursor:
-                logger.warning(f'sortEnd 未推进({next_us})，停止防死循环')
-                st['done'] = True
-                st['floor'] = args.start
-                break
-            cursor = next_us
             st['oldest_us'] = cursor
+        if prev is not None and cursor >= prev:
+            logger.warning(f'sortEnd 未推进({cursor})，停止防死循环')
+            st['done'] = True
+            st['floor'] = args.start
+            break
         if hit_end:
+            # 增量模式：确认覆盖到旧数据后才推进 newest_us 并落盘（中断不留空洞）
+            st['newest_us'] = max(st['newest_us'], walk_newest_us)
             st['done'] = True
             st['floor'] = args.start
             logger.info(f'到达下界 → 完成（floor={args.start}）')
             break
+        if not incremental:
+            st['newest_us'] = max(st['newest_us'], page_newest_us)
         json.dump(st, open(STATE_F, 'w', encoding='utf-8'))
         if req % 20 == 0:
             reached = datetime.fromtimestamp((next_us or 0) / 1_000_000, TZ).strftime('%Y-%m-%d')

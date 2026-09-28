@@ -110,6 +110,7 @@ def main():
     cursor = None if incremental else st['oldest_ts']
     stop_ts = st['newest_ts'] if incremental else start_ts
     req = n_new = 0
+    walk_newest = st['newest_ts']            # 本次已见最新时间（增量覆盖确认后才落盘）
     while True:
         if args.max_req and req >= args.max_req:
             logger.info(f'达到 --max-req={args.max_req}，正常退出（状态已存，重跑续传）')
@@ -142,18 +143,30 @@ def main():
             buckets.setdefault(datetime.fromtimestamp(ts, TZ).strftime('%Y-%m-%d'), []).append(slim(it))
         for day, its in buckets.items():
             n_new += save_day(day, its)
-        st['newest_ts'] = max(st['newest_ts'], max(int(it['ctime']) for it in items))
+        # 游标推进（两种模式都走）：增量也需逐页回溯，直到触达上次覆盖位置；未推进则停止防死循环
+        page_newest = max(int(it['ctime']) for it in items)
+        walk_newest = max(walk_newest, page_newest)
+        prev = cursor
+        cursor = min(int(it['ctime']) for it in items) - 1
         if not incremental:
-            cursor = min(int(it['ctime']) for it in items) - 1
             st['oldest_ts'] = cursor
+        if prev is not None and cursor >= prev:
+            logger.warning(f'last_time 未推进({cursor})，停止防死循环')
+            st['done'] = True
+            st['floor'] = args.start
+            break
         if hit_end:
+            # 增量模式：确认覆盖到旧数据后才推进 newest_ts 并落盘（中断不留空洞）
+            st['newest_ts'] = max(st['newest_ts'], walk_newest)
             st['done'] = True
             st['floor'] = args.start
             logger.info(f'到达下界 → 完成（floor={args.start}）')
             break
+        if not incremental:
+            st['newest_ts'] = max(st['newest_ts'], page_newest)
         json.dump(st, open(STATE_F, 'w', encoding='utf-8'))
         if req % 20 == 0:
-            reached = datetime.fromtimestamp(cursor or 0, TZ).strftime('%Y-%m-%d %H:%M')
+            reached = datetime.fromtimestamp(cursor, TZ).strftime('%Y-%m-%d %H:%M')
             logger.info(f'req={req} 进度至 {reached} 累计新增={n_new}')
         time.sleep(args.sleep + random.uniform(0, args.sleep * 0.5))
     json.dump(st, open(STATE_F, 'w', encoding='utf-8'))

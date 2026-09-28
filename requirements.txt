@@ -19,3 +19,4 @@ selenium>=4.20
 torch>=2.0
 torchvision>=0.15
 tqdm>=4.66
+tushare>=1.2

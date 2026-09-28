@@ -33,7 +33,7 @@ ROOT = os.path.dirname(ASHARE)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from AshareData.paths import DAILY_KLINE_DIR, DAILY_KLINE_V2_DIR, M15_KLINE_DIR
+from AshareData.paths import DAILY_KLINE_V2_DIR, M15_KLINE_DIR
 
 PY = sys.executable
 D = f'{ASHARE}/datautils'
@@ -47,7 +47,7 @@ def _count(d):
 
 
 def plan_steps():
-    v2_n, m15_n, old_n = _count(DAILY_KLINE_V2_DIR), _count(M15_KLINE_DIR), _count(DAILY_KLINE_DIR)
+    v2_n, m15_n = _count(DAILY_KLINE_V2_DIR), _count(M15_KLINE_DIR)
     steps = [
         # quick_kline 自己判断每票每字段的缺口与手段，这里不再传模式/区间
         ('v2', 'v2 日线', [PY, '-u', KK, '--skip', 'm15']),
@@ -61,7 +61,7 @@ def plan_steps():
         ('longhu', '榜单·龙虎榜（同花顺）', [PY, '-u', f'{D}/regime_scripts/scrap_longhu.py']),
         ('feature', '特征构建 base_feature', [PY, '-u', f'{D}/dataloaders/feature_build/build_all_feature.py']),
     ]
-    info = f'库状态: v2={v2_n} 只, m15={m15_n} 只, 旧库={old_n} 只'
+    info = f'库状态: v2={v2_n} 只, m15={m15_n} 只'
     return steps, info
 
 

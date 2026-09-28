@@ -10,7 +10,7 @@ AshareData/
 ├── paths.py                       # 路径寻址（以本包位置为基准自动定位）
 ├── datautils/
 │   ├── dataloaders/feature_build/ # 特征构建（base_feature / 涨跌停 / 市场统计 / 龙虎榜 / 横截面排名 / 股性 traits / 开盘啦事件结构）
-│   ├── kline_scripts/             # 行情 v2 构建（quick_kline）/ 15分钟线 / 停牌名单 / update_all 统一入口
+│   ├── kline_scripts/             # 行情构建（v2=quick_kline / tushare 版=tushare_kline）/ 15分钟线 / 停牌名单 / update_all 统一入口
 │   └── regime_scripts/            # 爬虫（涨停板 / 跌停板 / 龙虎榜 / 开盘啦题材榜）
 └── utils/
     ├── exchanges_utils/           # 交易日历、股票代码 ↔ 名称检索
@@ -25,7 +25,9 @@ AshareData/
 | 目录 | 内容 |
 | --- | --- |
 | `kline_data/daily_kline_v2/` | 日线 v2 CSV（未复权原值 + 事件因子，**读时复权**；旧库 `daily_kline/` 已于 2026-09-26 撤除） |
+| `kline_data/daily_kline_ts/` | 日线 tushare 版 CSV（未复权原值 + 复权因子 aux，**读时复权**；token 见 `.keys/.tushare_token`） |
 | `kline_data/m15_kline/` | 15 分钟线 CSV |
+| `kline_data/m15_kline_ts/` | 15 分钟线 tushare 版（不复权原值；历史由旧库换算重建 + 去重修复，增量补齐走新浪 + baostock；stk_mins 独立权限未开通） |
 | `kline_data/info/` | 交易信息（如 `notrade_yet.csv` 停牌记录） |
 | `scrap_data/zhangtingban/`、`scrap_data/dietingban/` | 涨停板 / 跌停板抓取产物（xlsx） |
 | `scrap_data/longhu/` | 龙虎榜抓取产物（json） |
@@ -38,6 +40,9 @@ AshareData/
 ```bash
 # 全量更新（v2 日线 / m15 / 停牌名单 / 新闻 / 榜单 / 特征，含重试与告警）
 python AshareData/datautils/update_all.py
+
+# tushare 版日K（增量；--probe 连通/权限自检、--latest 库状态问答）
+python AshareData/datautils/kline_scripts/tushare_kline.py
 
 # 抓取开盘啦题材榜（增量补齐）
 python AshareData/datautils/regime_scripts/scrap_kaipanla.py --update
@@ -56,7 +61,7 @@ from AshareData.dataloader import KlineDataConfig, build_train_and_val_dataloade
 
 ## 依赖与外部文件
 
-- Python 3.9+（依赖只设下限，`pip` 自动选择与当前解释器兼容的版本，不要求固定 Python 版本；仅 `pandas` 带 `<3` 上限，以保证各机器写出的数据 dtype 一致）；依赖清单见 `requirements.txt`（`setup.sh` 自动安装）：`pandas`、`pyarrow`、`polars`、`numpy`、`tqdm`、`selenium`、`baostock`、`openpyxl`、`pypinyin`（可选）、`torch`/`torchvision`（滑块定位模型）。
+- Python 3.9+（依赖只设下限，`pip` 自动选择与当前解释器兼容的版本，不要求固定 Python 版本；仅 `pandas` 带 `<3` 上限，以保证各机器写出的数据 dtype 一致）；依赖清单见 `requirements.txt`（`setup.sh` 自动安装）：`pandas`、`pyarrow`、`polars`、`numpy`、`tqdm`、`selenium`、`baostock`、`openpyxl`、`pypinyin`（可选）、`tushare`、`torch`/`torchvision`（滑块定位模型）。
 - **chromedriver**：爬虫用；`setup.sh` 安装到 `~/.asharedata_deps/`，按 环境变量 `CHROME_DRIVER_PATH` → 该目录 → 系统路径 → `PATH` 依次探测。
 - **子模块**：首次克隆后执行 `git submodule update --init`。
 

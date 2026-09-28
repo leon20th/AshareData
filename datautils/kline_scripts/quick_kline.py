@@ -417,6 +417,11 @@ class KlineV2Builder:
                 rows['code'] = code
                 for col in ('preclose', 'turn', 'pctChg', 'isST'):
                     rows[col] = np.nan
+                # 快照缺字段（None）会推断成 object 全 NA 列 → concat 触发 FutureWarning（pandas 未来
+                # 判定结果 dtype 不再忽略全 NA 列）；非标识列统一转 float 与 df 同型，结果行为不变
+                for c in rows:
+                    if c not in ('date', 'code') and rows[c].dtype == object:
+                        rows[c] = rows[c].astype(float)
                 # 空骨架帧不进 concat（pandas 官方做法：concat 前排除空/全 NA 帧）
                 df = rows if df.empty else pd.concat([df, rows], ignore_index=True)
             if df.empty:

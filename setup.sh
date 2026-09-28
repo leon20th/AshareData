@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # AshareData 环境安装：
-#   1) 同花顺账号密码 + 扶摇 API Key → 写入本地缓存（已配置则跳过；可用环境变量非交互传入）
+#   1) 同花顺账号密码 + 扶摇 API Key + tushare token → 写入本地缓存（已配置则跳过；可用环境变量非交互传入）
 #   2) 安装 Python 依赖（requirements.txt）
 #   3) 安装 Chrome + chromedriver（macOS / Linux 自动分支）
 set -euo pipefail
@@ -10,6 +10,7 @@ ROOT="$(pwd)"
 TMP_DIR="$ROOT/.cache"
 ACCOUNT_FILE="$TMP_DIR/tsh_account.json"
 FUYAO_KEY_FILE="$ROOT/.keys/.fuyao_api.json"
+TUSHARE_TOKEN_FILE="$ROOT/.keys/.tushare_token"
 DEPS_DIR="$HOME/.asharedata_deps"
 OS="$(uname -s)"
 
@@ -66,10 +67,36 @@ if [ -z "${FUYAO_CACHED}" ]; then
     fi
 fi
 
+# ---- tushare token ----
+# 读取端见 datautils/kline_scripts/tushare_kline.py 的 _pro()：环境变量 TUSHARE_TOKEN 优先，
+# 其次本文件（单行纯文本）。
+TUSHARE_TOKEN="${TUSHARE_TOKEN:-}"
+TUSHARE_CACHED=""
+if [ -n "${TUSHARE_TOKEN}" ]; then
+    echo "==> 使用环境变量 TUSHARE_TOKEN 写入本地"
+elif [ -s "${TUSHARE_TOKEN_FILE}" ]; then
+    echo "==> 已配置 tushare token，跳过输入（如需更换：删除 ${TUSHARE_TOKEN_FILE} 后重跑）"
+    TUSHARE_CACHED=1
+else
+    echo "==> 配置 tushare token（tushare.pro → 个人主页 → 接口TOKEN，用于日K tushare 版行情）"
+    read -r -p "token（直接回车跳过）: " TUSHARE_TOKEN || { echo "读取输入失败：请在交互式终端中运行" >&2; exit 1; }
+fi
+
+if [ -z "${TUSHARE_CACHED}" ]; then
+    if [ -z "${TUSHARE_TOKEN}" ]; then
+        echo "注意：未配置 tushare token，tushare 版行情脚本将不可用（可稍后重跑本脚本）" >&2
+    else
+        mkdir -p "${ROOT}/.keys"
+        printf '%s\n' "${TUSHARE_TOKEN}" > "${TUSHARE_TOKEN_FILE}"
+        chmod 600 "${TUSHARE_TOKEN_FILE}"
+        echo "已写入 ${TUSHARE_TOKEN_FILE}"
+    fi
+fi
+
 # ---------------- 2. Python 依赖 ----------------
 PYTHON="${PYTHON:-$(command -v python || command -v python3 || echo python3)}"
 echo "==> Python 依赖（${PYTHON}）"
-if "$PYTHON" -c "import pandas, numpy, polars, pyarrow, openpyxl, requests, tqdm, bs4, lxml, selenium, baostock, pypinyin, torch, torchvision, PIL" 2>/dev/null; then
+if "$PYTHON" -c "import pandas, numpy, polars, pyarrow, openpyxl, requests, tqdm, bs4, lxml, selenium, baostock, pypinyin, torch, torchvision, PIL, tushare" 2>/dev/null; then
     echo "依赖已满足，跳过安装"
 elif ! "$PYTHON" -m pip install -r "$ROOT/requirements.txt"; then
     echo "pip 安装失败。若报 externally-managed-environment（系统 Python 限制），请指定虚拟环境的解释器重跑：" >&2
