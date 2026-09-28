@@ -1,38 +1,55 @@
 # -*- coding: utf-8 -*-
 """quick_kline —— 日K v2 构建器（字段自维护：缺口自动判定、手段自动选择）
 
-设计原则（2026-09-26 定稿）
+设计原则（2026-09-26 定稿，同日重构收敛）
   1. 每个字段只对外暴露一个 `update_<字段>` 接口：该补哪一段、用哪种手段，全在接口内部判断。
      调用方不需要、也不应该知道 rebuild / backfill / update 的区别——模式概念已从接口移除。
   2. 接口内按「每只票 × 每个字段」的缺口选手段：
 
      情形                     手段
      ---------------------   ---------------------------------------------------------------
-     无本地数据（整段历史）    OHLCV: 扶摇 daily-k 全量 dump
-                             m15:   旧器 update_kline.py（baostock 15 分钟全史）
+     无本地数据（2020 起整段）  OHLCV: 扶摇 daily-k 全量 dump
+                             m15:   baostock 15 分钟整段（2020-01-01 起，单线程直连，逐票续传）
                              isST:  baostock 回扫（有旧库则优先旧库移植）
      缺历史中间段              OHLCV: 扶摇 daily-k-10d（更早的缺口回落全量 dump）
-                             m15:   新浪 getKLineData（≤1023 根 ≈ 64 交易日窗，超窗报不可回补）
+                             m15:   64 交易日窗内 → 新浪 getKLineData；更早 → baostock 补段
                              isST:  baostock 只补缺段（逐票 checkpoint，可续跑）
-                             turn:  新浪股本事件 as-of 回填
      只缺当天                  OHLCV: 扶摇 prices/snapshot（批量 100）
-                             turn:  扶摇 auction/snapshot（竞价快照）
                              isST:  扶摇名单比对（ST 前缀变化）
      都不缺                    直接跳过（幂等：重复跑不重复抓）
+
+     turn 不在此表：股本事件表每日每票最多抓一次（新浪 jsonp），其余整列（含当天）
+     纯本地 as-of 回填。不取竞价快照——实测快照反推股本与事件表逐位一致（同源），
+     维护两套股本来源无收益。
 
      缺口起点由「上市日」决定：新股从上市日起算，上市前的空档不算缺口。
   3. 旧库（daily_kline）存在时，其 turn / pctChg / isST 作为历史权威值覆盖（移植）；
      没有旧库则自动回落 baostock / 新浪，无需任何参数。
 
+行约定（每交易日一行；volume==0 是"没有成交量"的唯一判定信号）
+  - 真成交行  volume>0 且 close>0   → tradestatus=1，各字段能算尽算
+  - 停牌行    volume==0（源给 0 / 整日缺行补出 / 有量无价坏行归位）
+              → 价格列=carry（上一真实收盘；首个真实行之前用库起点前收盘）、amount=0、
+                turn/pctChg 空、tradestatus=0
+  - 退市票    覆盖到退市日（delisted 表 last_date）为止：其后不算缺口、不落占位行
+  - 新上市    起点=max(FLOOR, 上市日)；首行前收为空是常态（新股无昨收，is_latest 豁免）
+  - 未上市/预留码（名单无上市日且本地无数据）不要求任何行、不落盘
+  - m15     只要求「真成交日」（日线 volume>0）的分钟 bar：停牌日没有任何源的 bar，
+            不算缺口（否则每次重跑都白抓）。范围固定 2020-01-01 起（FLOOR=2020-01-02
+            为 2020 首个交易日）至目标日，**不是上市起全历史**
+
 产物: daily_kline_v2/{sh.600000.csv} 13 列（与旧库同 schema，OHLCV 为未复权原值）
 辅助: daily_kline_v2/_aux/、_dumps/，以及 m15_kline/
 用法:
   python AshareData/datautils/kline_scripts/quick_kline.py [--codes 600519,sz.000001] [--skip m15,isst]
+  python AshareData/datautils/kline_scripts/quick_kline.py --latest   # 只问库状态，不抓数据
 """
 import argparse
+import bisect
 import io
 import json
 import os
+import queue
 import random
 import re
 import sys
@@ -74,35 +91,51 @@ SINA_KLINE = 'https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.get
 SINA_SHARE = ('https://stock.finance.sina.com.cn/stock/api/jsonp.php/'
               'var%20KKE_ShareAmount_{sym}=/StockService.getAmountBySymbol?_=20&symbol={sym}')
 SINA_MAX_BARS = 1023                     # 新浪单次请求上限（≈64 个交易日的 15 分钟 bar）
+SINA_WIN = 62                            # 新浪可回补窗口（交易日数）
 BARS_PER_DAY = 16
+BS_TIMEOUT = 120                         # baostock 单次查询看门狗（连接半开有卡死前科）
 
 _CAL = None
+_BS_ON = False                           # baostock 登录态（卡死/断线后强制重登）
 _TLS = threading.local()
 
 
 # ==================== 通用工具（与字段无关） ====================
 
 def _cal():
-    """全部交易日（'YYYY-MM-DD'，含已发布的前瞻日期）。"""
+    """全部交易日（'YYYY-MM-DD' 升序，含已发布的前瞻日期）。"""
     global _CAL
     if _CAL is None:
-        _CAL = [f'{d[:4]}-{d[4:6]}-{d[6:8]}' for d in get_trade_date_list()]
+        _CAL = sorted(f'{d[:4]}-{d[4:6]}-{d[6:8]}' for d in get_trade_date_list())
     return _CAL
 
 
 def _sess():
-    key = next(v for v in json.load(open(KEY_FILE)).values() if isinstance(v, str) and len(v) > 10)
+    """扶摇 API 会话。key 缺失/无效是配置问题（重试无意义）→ 直接抛 fatal。"""
+    if not os.path.exists(KEY_FILE):
+        raise RuntimeError(f'缺少扶摇 API key 文件: {KEY_FILE}（配置见 AshareData/setup.sh）')
+    key = next((v for v in json.load(open(KEY_FILE)).values() if isinstance(v, str) and len(v) > 10), None)
+    if not key:
+        raise RuntimeError(f'扶摇 API key 文件里没有可用 key: {KEY_FILE}')
     s = requests.Session()
     s.headers['X-api-key'] = key
     return s
 
 
-def api_json(path, params=None, timeout=60):
-    r = _sess().get(BASE + path, params=params, timeout=timeout)
-    j = r.json()
-    if j.get('code') != 0:
-        raise RuntimeError(f'{path} -> code={j.get("code")} msg={j.get("message")}')
-    return j.get('data')
+def api_json(path, params=None, timeout=60, retries=3):
+    """扶摇 REST：带重试的 GET。网络抖动属"不可避免的缺失"，不该一次失败就断整轮。"""
+    last = None
+    for attempt in range(retries):
+        try:
+            r = _sess().get(BASE + path, params=params, timeout=timeout)
+            j = r.json()
+            if j.get('code') != 0:
+                raise RuntimeError(f'{path} -> code={j.get("code")} msg={j.get("message")}')
+            return j.get('data')
+        except Exception as e:
+            last = e
+            time.sleep(1 + attempt)
+    raise RuntimeError(f'{path} 请求失败（重试 {retries} 次）: {last}')
 
 
 def ensure_dump(name, max_age_h=6, force=False):
@@ -165,11 +198,21 @@ def read_v2(code):
     p = os.path.join(V2_DIR, f'{code}.csv')
     if not os.path.exists(p):
         return pd.DataFrame(columns=COLS)
-    return pd.read_csv(p, dtype={'date': str})
+    # float_precision='round_trip'：精确往返解析——默认解析对 16 位小数差 1 ULP，
+    # 会让"重算值 ≠ 读到值"永远不相等（无变化跳过失效），反复重写还会让数值漂移
+    return pd.read_csv(p, dtype={'date': str}, float_precision='round_trip')
 
 
 def write_v2(code, df):
     df = df.reindex(columns=COLS).sort_values('date').drop_duplicates('date', keep='last').reset_index(drop=True)
+    # 落盘归一（volume==0 即停牌判定信号）：非成交行量额归 0、比率列留空；真成交行原样
+    nv = pd.to_numeric(df['volume'], errors='coerce')
+    off = ~(nv > 0)
+    if off.any():
+        df.loc[off, 'volume'] = 0.0
+        df.loc[off, 'amount'] = 0.0
+        df.loc[off, 'turn'] = np.nan
+        df.loc[off, 'pctChg'] = np.nan
     os.makedirs(V2_DIR, exist_ok=True)
     df.to_csv(os.path.join(V2_DIR, f'{code}.csv'), index=False)
 
@@ -210,25 +253,91 @@ def _progress(i, n, t0, tag, extra='', every=500):
 
 
 def _fail(tag, code, err, failed, cap=3):
-    """逐票失败：前 cap 条详列，之后只计数（末尾汇总），避免整屏都是失败行。"""
+    """逐票失败（网络/服务等不可避免的缺失）：前 cap 条详列，之后只计数（末尾汇总）。"""
     failed.append(code)
     if len(failed) <= cap:
-        logger.info(f'{tag} {code} 失败: {err}')
+        logger.warning(f'{tag} {code} 失败: {err}')
     elif len(failed) == cap + 1:
-        logger.info(f'{tag} 失败已超 {cap} 条，后续只计数')
+        logger.warning(f'{tag} 失败已超 {cap} 条，后续只计数')
+
+
+# ==================== baostock 直连（m15 整段 / isST 回扫） ====================
+
+def _bs_ensure_login():
+    """baostock 登录（全局一次；卡死/断线后由 _bs_rows 置回 False 强制重登）。"""
+    global _BS_ON
+    if _BS_ON:
+        return
+    import baostock as bs
+    lg = bs.login()
+    if lg.error_code != '0':
+        raise RuntimeError(f'baostock 登录失败: {lg.error_msg}')
+    _BS_ON = True
+
+
+def _bs_call(fn, timeout=BS_TIMEOUT):
+    """守护线程里跑 baostock 调用：连接半开卡死时超时放弃，不阻塞整轮。返回 (ok, 结果或异常)。"""
+    q = queue.Queue(maxsize=1)
+
+    def run():
+        try:
+            q.put((True, fn()))
+        except Exception as e:
+            q.put((False, e))
+
+    threading.Thread(target=run, daemon=True).start()
+    try:
+        return q.get(timeout=timeout)
+    except queue.Empty:
+        return False, TimeoutError(f'baostock 调用超时>{timeout}s')
+
+
+def _bs_rows(code, fields, start, end, frequency='d', adjustflag='2', retries=3):
+    """baostock 拉一段 K 线（逐段串行；超时看门狗 + 断线重登录重试）。空段返回 []，失败抛异常。"""
+    import baostock as bs   # noqa: F401  延迟导入：跳过 m15/isst 的环境不需要装 baostock
+    global _BS_ON
+    last = None
+    for attempt in range(retries):
+        try:
+            _bs_ensure_login()
+            ok, rs = _bs_call(lambda: bs.query_history_k_data_plus(
+                code, fields, start_date=start, end_date=end,
+                frequency=frequency, adjustflag=adjustflag))
+            if not ok:
+                raise rs
+            if rs.error_code != '0':
+                raise RuntimeError(rs.error_msg)
+
+            def drain():
+                out = []
+                while rs.error_code == '0' and rs.next():
+                    out.append(rs.get_row_data())
+                return out
+
+            ok, rows = _bs_call(drain)
+            if not ok:
+                raise rows
+            return rows
+        except Exception as e:
+            last = e
+            _BS_ON = False                      # 卡死/断线后下一轮强制重登录
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f'{code} {frequency} {start}~{end} 拉取失败: {last}')
 
 
 class KlineV2Builder:
     """字段自维护构建器：对外只有 update_* 接口，缺口判定与手段选择全在内部。
 
-    统一签名 update_<字段>(codes=None)：codes 为 None 时取 meta 全市场沪深。
+    统一签名 update_<字段>(codes=None)：codes 为 None 时取 meta 全市场沪深（未上市/预留码除外）。
     """
 
     def __init__(self, force=False):
         self.force = force                 # 强制重取（忽略"已齐/已抓过"的跳过判断）
-        self._bs_logged = False
         self._prev_close_mem = {}
+        self._prev_file = None
         self._list_dates = None
+        self._delisted = None
+        self._tgt = None
 
     # 字段执行顺序（--skip 的取值也来自这里）
     FIELDS = (('adjust', '复权事件'), ('ohlcvt', 'OHLCV+停牌占位'), ('preclose', '前收/涨跌幅'),
@@ -270,20 +379,21 @@ class KlineV2Builder:
         full, recent, today, repair = [], [], [], []
         for code in codes:
             df = read_v2(code)
+            end = self._end_of(code)
             if df.empty:
                 full.append(code)                     # 无本地数据 → 整段历史
                 continue
             miss = self._missing(code, df)
             if [d for d in miss if d < target]:
-                recent.append(code)                   # 缺历史中间段
-            if target in miss or self._stale_today(code):
+                recent.append(code)                   # 缺历史中间段（退市票缺口止于退市日）
+            if end == target and (target in miss or self._stale_today(code)):
                 today.append(code)                    # 缺当天 / 当天行是收盘前写的
-            if self._bad_today(code):
-                repair.append(code)                   # 当天行有量无价 → 无论快照回不回都要重建
+            if end == target and (self._bad_today(code) or self._needs_rebuild(code, df)):
+                repair.append(code)                   # 坏行/缺价停牌行 → 重建归位（不重抓）
         if not (full or recent or today or repair):
             logger.info('[ohlcvt] 各票均已齐 → 跳过')
             return
-        logger.info(f'[ohlcvt] 全史 {len(full)} 只 / 历史缺口 {len(recent)} 只 / 当天 {len(today)} 只'
+        logger.info(f'[ohlcvt] 2020 起整段 {len(full)} 只 / 历史缺口 {len(recent)} 只 / 当天 {len(today)} 只'
                     + (f' / 待重建当天行 {len(repair)} 只' if repair else ''))
         src = {}
         if full:
@@ -319,14 +429,17 @@ class KlineV2Builder:
         """preclose/pctChg：纯本地派生（依赖 adjust 事件表），旧库有值的历史行以旧库为准。"""
         codes = self._codes(codes)
         prev_map = self._load_prev_close()
-        need_pre = [c for c in codes if c not in prev_map and self._first_traded_blank(c, 'preclose')]
+        # 只有库起点前上市的票才可能有"首行前收"基准；新股首行无昨收是常态，别每轮空跑全量 dump
+        need_pre = [c for c in codes
+                    if c not in prev_map and self._start_of(c) == FLOOR
+                    and self._first_traded_blank(c, 'preclose')]
         if need_pre:
-            logger.info(f'[preclose] {len(need_pre)} 只缺首行前收 → 取全量 dump 库起点前收盘')
+            logger.info(f'[preclose] {len(need_pre)} 只缺首行前收（2020 前最后收盘）→ 从 dump 取基准（取不到记空哨兵，不重试）')
             self._remember_prev_close(self._dump_daily('daily-k'), need_pre)
             prev_map = self._load_prev_close()
         adj = pd.read_parquet(ADJ_F) if os.path.exists(ADJ_F) else pd.DataFrame(
             columns=['code', 'ex_date', 'dividend_per_share', 'per_share_bonus', 'allotment_ratio', 'allotment_price'])
-        n, t0 = 0, time.time()
+        n, skip, t0 = 0, 0, time.time()
         for i, code in enumerate(codes, 1):
             _progress(i, len(codes), t0, '[preclose]', f'已写 {n}')
             df = read_v2(code)
@@ -348,7 +461,7 @@ class KlineV2Builder:
             closes = pd.to_numeric(df['close'], errors='coerce').to_numpy()
             vols = pd.to_numeric(df['volume'], errors='coerce').to_numpy()
             for j in range(len(df)):
-                if not np.isfinite(vols[j]):        # 停牌占位行：preclose 保持 carry
+                if not vols[j] > 0:              # 停牌/非成交行（volume==0 或空）：preclose 保持 carry
                     pre[j] = closes[j]
                     continue
                 d = dates[j]
@@ -378,62 +491,53 @@ class KlineV2Builder:
                 if np.isfinite(pc) and pc > 0 and np.isfinite(closes[j]):
                     pch[j] = (closes[j] / pc - 1.0) * 100.0
                 last_close, last_mark = closes[j], d
+            old_pre = pd.to_numeric(df['preclose'], errors='coerce').to_numpy()
+            old_pch = pd.to_numeric(df['pctChg'], errors='coerce').to_numpy()
             df['preclose'] = pre
             df['pctChg'] = pch
             overlay = self._old_col(code, 'pctChg', df['date'])   # 旧库历史值权威
             if overlay is not None:
                 df['pctChg'] = np.where(overlay.notna(), overlay, df['pctChg'])
+            if (np.array_equal(pre, old_pre, equal_nan=True)
+                    and np.array_equal(df['pctChg'].to_numpy(), old_pch, equal_nan=True)):
+                skip += 1                          # 派生列无变化 → 不重写（省盘、免 mtime 抖动）
+                continue
             write_v2(code, df)
             n += 1
-        logger.info(f'[preclose] 写 {n} 只')
+        logger.info(f'[preclose] 写 {n} 只' + (f'，无变化跳过 {skip} 只' if skip else ''))
 
     def update_turn(self, codes=None):
-        """换手率：历史段=新浪股本事件 as-of；当天=扶摇竞价快照优先；旧库有值则覆盖。"""
+        """换手率：新浪股本事件 as-of 回填（含当天，纯本地计算）；旧库有值则覆盖。"""
         codes = self._codes(codes)
-        target = self._target_date()
         self._fetch_share_events(codes)                    # 每天只抓一次（share_fetch_log）
         events = self._load_share_events()
-        need_snap = []
-        for code in codes:
-            df = read_v2(code)
-            if df.empty or target not in set(df['date']):
-                continue
-            row = df.loc[df['date'] == target, 'turn']
-            if len(row) and (_num(row.iloc[0]) is None or self._stale_today(code)):
-                need_snap.append(code)
-        snap = self._auction_snapshot(need_snap) if need_snap else {}
-        logger.info(f'[turn] 股本事件 {len(events)} 条；需当天快照 {len(need_snap)} 只')
-        refetch, n, t0 = [], 0, time.time()
+        logger.info(f'[turn] 股本事件表 {len(events)} 条（本地累计，每日每票最多抓一次）')
+        n, skip, t0 = 0, 0, time.time()
         for i, code in enumerate(codes, 1):
             _progress(i, len(codes), t0, '[turn]', f'已写 {n}')
             df = read_v2(code)
             if df.empty:
                 continue
+            old_turn = pd.to_numeric(df['turn'], errors='coerce').to_numpy()
             ev = events[events['code'] == code].sort_values('date')
             if not ev.empty:
                 idx = np.searchsorted(ev['date'].to_numpy(), df['date'].to_numpy(), side='right') - 1
                 shares = np.where(idx >= 0, ev['shares_wan'].to_numpy()[np.clip(idx, 0, None)], np.nan)
                 vols = pd.to_numeric(df['volume'], errors='coerce').to_numpy()
-                df['turn'] = vols / (shares * 1e4) * 100
-            it = snap.get(code)
-            if it and it.get('last_price') and it.get('float_market_cap'):
-                shares = it['float_market_cap'] / it['last_price']     # 股
-                if shares > 0:
-                    idx = df.index[df['date'] == target]
-                    vol = pd.to_numeric(df.loc[idx, 'volume'], errors='coerce').iloc[0]
-                    df.loc[idx, 'turn'] = vol / shares * 100 if np.isfinite(vol) else np.nan
-                    if len(ev):                                        # 快照股本与事件表偏差过大 → 下轮重抓
-                        last_wan = float(ev['shares_wan'].iloc[-1])
-                        if last_wan > 0 and abs(shares / 1e4 - last_wan) / last_wan > 0.005:
-                            refetch.append(code)
+                turn = np.full(len(df), np.nan)
+                real = vols > 0                            # 停牌行（volume==0）换手留空
+                with np.errstate(invalid='ignore', divide='ignore'):
+                    turn[real] = vols[real] / (shares[real] * 1e4) * 100
+                df['turn'] = turn
             overlay = self._old_col(code, 'turn', df['date'])
             if overlay is not None:
                 df['turn'] = np.where(overlay.notna(), overlay, df['turn'])
+            if np.array_equal(df['turn'].to_numpy(), old_turn, equal_nan=True):
+                skip += 1                          # 派生列无变化 → 不重写
+                continue
             write_v2(code, df)
             n += 1
-        if refetch:
-            logger.info(f'[turn] 快照股本与事件表偏差 → 下轮重抓 {len(refetch)} 只: {refetch[:8]}')
-        logger.info(f'[turn] 写 {n} 只')
+        logger.info(f'[turn] 写 {n} 只' + (f'，无变化跳过 {skip} 只' if skip else ''))
 
     def update_isst(self, codes=None):
         """isST：历史段=旧库移植（无则 baostock 只补缺段）；当天行=扶摇名单比对。按票缺口分档。"""
@@ -486,39 +590,32 @@ class KlineV2Builder:
         logger.info(f'[isst] 回扫 {n} 只，本地补齐 {filled} 只，失败 {len(failed)} 只（失败可重跑续传）')
 
     def update_m15(self, codes=None):
-        """15 分钟线：无本地文件 → 旧器 update_kline.py（baostock 全史）；有文件缺段 → 新浪（≤64 交易日窗）。"""
+        """15 分钟线：64 交易日窗内缺口→新浪（并发）；更早缺口/2020 起整段→baostock（单线程，逐票续传）。"""
         codes = self._codes(codes)
-        cal, last_td = _cal(), self._target_date()
-        history, sina, unhealed = [], {}, []
+        cal = _cal()
+        sina, bs_plan, failed = {}, [], []
         for code in codes:
-            p = os.path.join(M15_KLINE_DIR, f'{code}.csv')
-            if self.force or not os.path.exists(p):
-                history.append(code)
-                continue
             try:
-                plan = self._plan_m15(code, cal, last_td)
+                plan = self._plan_m15(code, cal, self._end_of(code))
             except Exception as e:
-                unhealed.append(code)
-                _fail('[m15]', code, e, unhealed)
+                _fail('[m15]', code, e, failed)
                 continue
-            if isinstance(plan, tuple):
-                sina[code] = plan
-            elif plan == 'old':
-                unhealed.append(code)
-        if history:
-            logger.info(f'[m15] 无本地文件 {len(history)} 只 → 旧器 update_kline.py 全史')
-            self._delegate_history(history)
-        if unhealed:
-            logger.info(f'[m15] {len(unhealed)} 只老缺口早于新浪窗，需 --force 重建（本机用旧器）')
-        logger.info(f'[m15] 需抓 {len(sina)}/{len(codes)} 只（last_td={last_td}）')
-        rows_by_code, failed = {}, []
+            if plan is None:
+                continue
+            if plan[0] == 'sina':
+                sina[code] = plan[1:]
+            else:
+                bs_plan.append((code, plan[1], plan[2]))
+        logger.info(f'[m15] 新浪 {len(sina)} 只 / baostock {len(bs_plan)} 只'
+                    + ('（2020 起整段与老缺口：单线程约 30s/票，逐票落盘续传，可 --codes 分批）' if bs_plan else ''))
+        rows_by_code = {}
         done, t0 = 0, time.time()
         with ThreadPoolExecutor(max_workers=6) as ex:
             futs = {ex.submit(self._fetch_m15, c, dl): (c, fm) for c, (dl, fm) in sina.items()}
             for f in as_completed(futs):
                 done += 1
                 c, fm = futs[f]
-                _progress(done, len(futs), t0, '[m15] 抓取', f'已得 {len(rows_by_code)} 失败 {len(failed)}')
+                _progress(done, len(futs), t0, '[m15] 新浪', f'已得 {len(rows_by_code)} 失败 {len(failed)}')
                 try:
                     rows_by_code[c] = (f.result(), fm)
                 except Exception as e:
@@ -529,7 +626,17 @@ class KlineV2Builder:
                 continue
             if self._m15_upsert(code, rows, force_merge=fm):
                 nw += 1
-        logger.info(f'[m15] 新浪更新 {nw}/{len(codes)} 只，抓取失败 {len(failed)} 只')
+        t0 = time.time()
+        for i, (code, start, end) in enumerate(bs_plan, 1):
+            try:
+                rows = self._fetch_m15_bs(code, start, end)
+                if len(rows) and self._m15_upsert(code, rows, force_merge=True):
+                    nw += 1
+            except Exception as e:
+                _fail('[m15]', code, e, failed)
+            _progress(i, len(bs_plan), t0, '[m15] baostock',
+                      f'已写 {nw} 失败 {len(failed)} 未处理 {len(bs_plan) - i}', every=3)
+        logger.info(f'[m15] 更新 {nw}/{len(codes)} 只，失败 {len(failed)} 只（重跑续传）')
 
     def run(self, codes=None, skip=()):
         """按固定顺序跑各字段接口（每个接口自己判断缺口与手段）。"""
@@ -551,8 +658,15 @@ class KlineV2Builder:
     def _codes(self, codes=None):
         if codes:
             return sorted(codes)
-        return sorted(f"{x.split('.')[1].lower()}.{x.split('.')[0]}"
-                      for x in self._meta()['thscode'] if x.endswith(('.SH', '.SZ')))
+        out = []
+        for x in self._meta()['thscode']:
+            if not x.endswith(('.SH', '.SZ')):
+                continue
+            c = f"{x.split('.')[1].lower()}.{x.split('.')[0]}"
+            if self._start_of(c) is None and not os.path.exists(os.path.join(V2_DIR, f'{c}.csv')):
+                continue                          # 未上市/预留码：不要求任何行、不落盘
+            out.append(c)
+        return sorted(out)
 
     def _meta(self):
         return pd.read_parquet(META_F)
@@ -576,21 +690,39 @@ class KlineV2Builder:
         ld = self._list_dates_map().get(code)
         return max(FLOOR, ld) if ld else None
 
+    def _delisted_last(self):
+        """退市表 {code: last_date}（退市票覆盖到此为止，其后不算缺口）。"""
+        if self._delisted is None:
+            self._delisted = {}
+            if os.path.exists(DELISTED_F):
+                p = pd.read_parquet(DELISTED_F)
+                for c, d in zip(p['code'], p['last_date']):
+                    d = str(d)[:10]
+                    if d and d != 'nan':
+                        self._delisted[c] = d
+        return self._delisted
+
+    def _end_of(self, code):
+        """该票应覆盖的最后交易日 = min(目标日, 退市日)：退市后不再补、不虚构占位行。"""
+        tgt = self._target_date()
+        last = self._delisted_last().get(code)
+        return min(tgt, last) if last else tgt
+
     def _missing(self, code, df):
-        """[上市日或库起点, 目标日] 内本地缺失的交易日；无本地数据则[]。"""
+        """[上市日或库起点, 退市日或目标日] 内本地缺失的交易日；无本地数据则[]。"""
         if df.empty:
             return []
         have = set(df['date'])
         lo = self._start_of(code) or df['date'].iloc[0]     # 无上市日 → 不要求已有数据之前的日子
-        tgt = self._target_date()
-        return [d for d in _cal() if lo <= d <= tgt and d not in have]
+        hi = self._end_of(code)
+        return [d for d in _cal() if lo <= d <= hi and d not in have]
 
     def _first_traded_blank(self, code, col):
-        """首个真成交行的某字段是否为空（字段级缺口：如缺起始基准、缺原始数据）。"""
+        """首个真成交行（volume>0）的某字段是否为空（字段级缺口：如缺起始基准、缺原始数据）。"""
         df = read_v2(code)
         if df.empty:
             return False
-        t = df[df['volume'].notna()]
+        t = df[pd.to_numeric(df['volume'], errors='coerce') > 0]
         return bool(len(t)) and bool(pd.to_numeric(t[col], errors='coerce').isna().iloc[0])
 
     def _stale_today(self, code):
@@ -605,7 +737,10 @@ class KlineV2Builder:
         return os.path.getmtime(p) < pd.Timestamp(f'{today} 15:00').timestamp()
 
     def _bad_today(self, code):
-        """目标日行不可信：有量无价（停牌票被当天快照写成了成交行）→ 要重取/改判为停牌占位。"""
+        """目标日行不可信：有量无价（volume>0 而 close 空，源半截/损坏）→ 重取后重建。
+
+        volume==0 是正常停牌行（OHLC 空是常态），不算坏行。
+        """
         df = read_v2(code)
         if df.empty:
             return False
@@ -613,12 +748,35 @@ class KlineV2Builder:
         if not len(r):
             return False
         r = r.iloc[-1]
-        return _num(r['volume']) is not None and _num(r['close']) is None
+        v, c = _num(r['volume']), _num(r['close'])
+        return v is not None and v > 0 and c is None
+
+    def _needs_rebuild(self, code, df):
+        """文件里有"该归位却仍缺 carry 价格"的停牌/坏行 → 走一遍 materialize 归位（不重抓）。
+
+        只在补得回来时触发（有 prior 真实行或库起点前收可依）；补不回来的
+        （首个真实行之前且无基准）不反复空转。
+        """
+        closes = pd.to_numeric(df['close'], errors='coerce').to_numpy()
+        need = ~np.isfinite(closes)
+        if not need.any():
+            return False
+        vols = pd.to_numeric(df['volume'], errors='coerce').to_numpy()
+        fixable = need.copy()
+        real_idx = np.flatnonzero(vols > 0)
+        if len(real_idx):
+            fixable[:real_idx[0]] = False            # 首个真实行之前只能靠库起点前收
+        base = self._load_prev_close().get(code)
+        if base is not None and _num(base) is not None and base > 0:
+            fixable = need
+        return bool(fixable.any())
 
     def _target_date(self):
         """目标交易日：get_target_trade_date（交易日 15:00 前取上一交易日）。"""
-        t = get_target_trade_date()
-        return pd.to_datetime(t).strftime('%Y-%m-%d') if t else pd.Timestamp.now().strftime('%Y-%m-%d')
+        if self._tgt is None:
+            t = get_target_trade_date()
+            self._tgt = pd.to_datetime(t).strftime('%Y-%m-%d') if t else pd.Timestamp.now().strftime('%Y-%m-%d')
+        return self._tgt
 
     # ==================== 内部：手段（各数据源） ====================
 
@@ -632,16 +790,22 @@ class KlineV2Builder:
         return {c: (g.drop(columns='code'), market_last) for c, g in sub.groupby('code')}
 
     def _remember_prev_close(self, dump, codes):
-        """记录这些票在库起点前的最后一个收盘（preclose 起始基准），合并写入 aux（不覆盖别的票）。"""
+        """记录这些票在库起点前的最后一个收盘（preclose 起始基准），合并写入 aux（不覆盖别的票）。
+
+        dump 里也没有库起点前数据的票记 NaN 哨兵：永久视为"无基准"，别每轮重查全量 dump。
+        """
         sub = dump[(dump['code'].isin(codes)) & (dump['date'] < FLOOR)]
-        if not len(sub):
+        prev = sub.sort_values('date').groupby('code')['close'].last() if len(sub) else pd.Series(dtype=float)
+        miss = [c for c in codes if c not in set(prev.index)]
+        if not len(prev) and not miss:
             return
-        prev = sub.sort_values('date').groupby('code')['close'].last()
         self._prev_close_mem.update(prev.to_dict())
+        self._prev_close_mem.update({c: np.nan for c in miss})
         old = (pd.read_parquet(PREVCLOSE_F) if os.path.exists(PREVCLOSE_F)
                else pd.DataFrame(columns=['code', 'prev_close']))
-        both = pd.concat([old, pd.DataFrame({'code': list(prev.index), 'prev_close': prev.values})],
-                         ignore_index=True).drop_duplicates('code', keep='last')
+        add = pd.DataFrame({'code': list(prev.index) + miss,
+                            'prev_close': list(prev.values) + [np.nan] * len(miss)})
+        both = pd.concat([old, add], ignore_index=True).drop_duplicates('code', keep='last')
         os.makedirs(AUX_DIR, exist_ok=True)
         both.to_parquet(PREVCLOSE_F)
 
@@ -665,7 +829,8 @@ class KlineV2Builder:
         miss = sum(len(v) for v in gaps.values())
         got = sum(len(v) for v in out.values())
         if miss > got:
-            logger.info(f'[ohlcvt] 缺口 {miss} 个票日，源只覆盖 {got} 个（其余下轮再试）')
+            logger.warning(f'[ohlcvt] 缺口 {miss} 个票日，源只覆盖 {got} 个'
+                           f'（源外多为停牌/退市空档，占位行补足；其余下轮再试）')
         tgt = self._target_date()
         return {c: (d.drop(columns='code'), tgt) for c, d in out.items() if len(d)}
 
@@ -678,10 +843,15 @@ class KlineV2Builder:
         return d[['code', 'date', 'open', 'high', 'low', 'close', 'volume', 'amount']]
 
     def _fetch_today(self, codes):
-        """只缺当天：扶摇 prices/snapshot（批量 100）。"""
+        """只缺当天：扶摇 prices/snapshot（批量 100）。快照暂不可用 → 空手而归，下轮再试。"""
         target = self._target_date()
         out = {}
-        for it in self._batch_snapshot('/api/a-share/prices/snapshot', codes):
+        try:
+            items = self._batch_snapshot('/api/a-share/prices/snapshot', codes)
+        except Exception as e:
+            logger.warning(f'[ohlcvt] 当天快照获取失败（{e}），{len(codes)} 只留待下轮')
+            return out
+        for it in items:
             code = f"{it['thscode'].split('.')[1].lower()}.{it['thscode'].split('.')[0]}"
             if code in codes:
                 out[code] = (pd.DataFrame([{'date': target, 'open': it.get('open_price'),
@@ -693,45 +863,60 @@ class KlineV2Builder:
     # ==================== 内部：行网格 / 停牌占位 ====================
 
     def _materialize(self, df, market_last, code=None):
-        """补齐 [max(库起点, 上市日), market_last] 的交易日网格：缺日 → 停牌占位行（OHLC=前收，量额空，tradestatus=0）。
+        """补齐 [起点, 终点] 每交易日一行：真成交行原样，其余（停牌/缺行/坏行）落停牌占位行。
 
-        传 code 时左边界取 _start_of(code)（库起点/上市日），这样库起点附近缺行也能补成占位行。
+        真成交 = volume>0 且 close>0；占位行 = 价格列 carry（上一真实收盘，首个真实行之前用
+        库起点前收盘）、volume=amount=0、turn/pctChg 空、tradestatus=0
+        （volume==0 即"没有成交量"，是停牌行的唯一判定信号）。
+        右边界 = min(market_last, 日历末日, 退市日)：退市后不虚构占位行。
         """
         df = df.sort_values('date').drop_duplicates('date', keep='last').reset_index(drop=True)
         if df.empty:
             return df
-        # 有量无价的行不是真成交（当天快照对停牌票写的 0 行）→ 丢掉，按缺行补成停牌占位行
-        bad = df['volume'].notna() & pd.to_numeric(df['close'], errors='coerce').isna()
-        if bad.any() and (~bad).any():
-            df = df[~bad].reset_index(drop=True)
+        vols = pd.to_numeric(df['volume'], errors='coerce').to_numpy()
+        closes = pd.to_numeric(df['close'], errors='coerce').to_numpy()
+        real = (vols > 0) & np.isfinite(closes) & (closes > 0)
         cal = _cal()
         d0 = df['date'].iloc[0]
         if code:
             s = self._start_of(code)
             d0 = min(d0, s) if s else d0
         d1 = min(market_last, cal[-1]) if market_last else df['date'].iloc[-1]
+        if code:
+            d1 = min(d1, self._end_of(code))
         if d1 < d0:
             d1 = df['date'].iloc[-1]
         need = [x for x in cal if d0 <= x <= d1]
-        missing = [x for x in need if x not in set(df['date'])]
-        if missing:
-            real = df[df['volume'].notna()].sort_values('date')
-            if len(real):
-                pos = np.searchsorted(real['date'].to_numpy(), np.array(missing), side='left') - 1
-                rcs = pd.to_numeric(real['close'], errors='coerce').to_numpy()
-                carry = np.where(pos >= 0, rcs[np.clip(pos, 0, None)], np.nan)  # 逐缺口前收（多段停牌各自 carry）
+        have = set(df['date'])
+        missing = [x for x in need if x not in have]
+        # 占位日期 = 整日缺行 + 非成交行（volume==0 的停牌行、有量无价的坏行一并归位）
+        dates = sorted([d for d, r in zip(df['date'].tolist(), real) if not r] + missing)
+        if dates:
+            real_dates = df.loc[real, 'date'].to_numpy()
+            real_closes = closes[real]
+            if len(real_dates):
+                pos = np.searchsorted(real_dates, np.asarray(dates), side='left') - 1
+                carry = np.where(pos >= 0, real_closes[np.clip(pos, 0, None)], np.nan)
             else:
-                carry = np.full(len(missing), np.nan)
-            place = pd.DataFrame({'date': missing, 'code': df['code'].iloc[0],
+                carry = np.full(len(dates), np.nan)
+            # 无真实行可依时：沿用行内原价（上一轮的 carry），再回落库起点前收盘，别把价格抹成空
+            own = pd.Series(closes, index=df['date']).reindex(dates).to_numpy()
+            carry = np.where(np.isfinite(carry), carry, np.where(own > 0, own, np.nan))
+            base = self._load_prev_close().get(code) if code else None
+            if base is not None and _num(base) is not None and base > 0:
+                carry = np.where(np.isfinite(carry), carry, float(base))
+        else:
+            carry = np.array([])
+        out = df[real].reset_index(drop=True)              # 真成交行原样（含已算好的派生列）
+        if dates:
+            place = pd.DataFrame({'date': dates, 'code': df['code'].iloc[0],
                                   'open': carry, 'high': carry, 'low': carry, 'close': carry,
-                                  'preclose': carry, 'volume': np.nan, 'amount': np.nan,
+                                  'preclose': carry, 'volume': 0.0, 'amount': 0.0,
                                   'turn': np.nan, 'pctChg': np.nan, 'tradestatus': 0, 'isST': np.nan})
-            df = pd.concat([df, place], ignore_index=True)
-        df = df.sort_values('date').reset_index(drop=True)
-        df.loc[df['volume'].notna(), 'tradestatus'] = 1
-        df.loc[df['volume'].isna(), 'tradestatus'] = 0
-        df['tradestatus'] = df['tradestatus'].astype(int)   # 0/1 标志列显式定型，不随 concat 推断变 float
-        return df
+            out = place if out.empty else pd.concat([out, place], ignore_index=True)
+        out = out.sort_values('date').reset_index(drop=True)
+        out['tradestatus'] = (pd.to_numeric(out['volume'], errors='coerce') > 0).astype(int)
+        return out
 
     def _batch_snapshot(self, path, codes):
         items = []
@@ -739,13 +924,6 @@ class KlineV2Builder:
             ts = ','.join(f"{c.split('.')[1]}.{c.split('.')[0].upper()}" for c in codes[i:i + 100])
             items += api_json(path, {'thscodes': ts}).get('item') or []
         return items
-
-    def _auction_snapshot(self, codes):
-        out = {}
-        for it in self._batch_snapshot('/api/a-share/auction/snapshot', codes):
-            code = f"{it['thscode'].split('.')[1].lower()}.{it['thscode'].split('.')[0]}"
-            out[code] = it
-        return out
 
     # ==================== 内部：股本事件 ====================
 
@@ -803,17 +981,18 @@ class KlineV2Builder:
             ev_all = ev_all.drop_duplicates(['code', 'date'], keep='last').sort_values(['code', 'date'])
             ev_all.to_parquet(SHARE_F)
         json.dump(log, open(SHARE_LOG_F, 'w'))
-        logger.info(f'[share] 新增 {len(new)} 条事件（累计 {len(ev_all)}），失败 {len(failed)} 只')
+        if failed:
+            logger.warning(f'[share] {len(failed)} 只股本事件获取失败（换手率留空，下轮再试）')
+        logger.info(f'[share] 新增 {len(new)} 条事件（累计 {len(ev_all)}）')
 
     # ==================== 内部：isST ====================
 
     def _scan_isst(self, code):
-        """该票 isST 全史（旧库优先，无则 baostock 回扫；逐票 checkpoint 可续跑）。"""
+        """该票 isST 全段（2020 起；旧库优先，无则 baostock 只补缺段；逐票 checkpoint 可续跑）。"""
         p = os.path.join(DAILY_KLINE_DIR, f'{code}.csv')
         if os.path.exists(p):
             df = pd.read_csv(p, dtype={'date': str})
             return df[['date', 'isST']]
-        import baostock as bs
         os.makedirs(ISST_DIR, exist_ok=True)
         path = os.path.join(ISST_DIR, f'{code}.parquet')
         have = pd.read_parquet(path) if os.path.exists(path) else pd.DataFrame(columns=['date', 'isST'])
@@ -830,27 +1009,9 @@ class KlineV2Builder:
             segs.append((FLOOR, tgt_end))
         if not segs:
             return have
-        if not self._bs_logged:
-            bs.login()
-            self._bs_logged = True
         new = pd.DataFrame(columns=['date', 'isST'])
         for qs, qe in segs:
-            rows = None
-            for attempt in range(3):
-                try:
-                    rs = bs.query_history_k_data_plus(code, 'date,isST', start_date=qs, end_date=qe,
-                                                      frequency='d', adjustflag='3')
-                    rows = []
-                    while rs.error_code == '0' and rs.next():
-                        rows.append(rs.get_row_data())
-                    if rs.error_code != '0':
-                        raise RuntimeError(rs.error_msg)
-                    break
-                except Exception:
-                    if attempt == 2:
-                        raise
-                    time.sleep(3)
-                    bs.login()
+            rows = _bs_rows(code, 'date,isST', qs, qe, frequency='d', adjustflag='3')
             df = pd.DataFrame(rows, columns=['date', 'isST'])
             df['isST'] = pd.to_numeric(df['isST'], errors='coerce')
             new = df if new.empty else pd.concat([new, df], ignore_index=True)
@@ -860,9 +1021,11 @@ class KlineV2Builder:
         return full
 
     def _snap_names(self, code2name):
-        """落一条今天的名字快照（供"改名/ST 前缀变化"判定）。"""
+        """落一条今天的名字快照（供"改名/ST 前缀变化"判定）；每天一条，拍过就不再重写。"""
         today = pd.Timestamp.now().strftime('%Y-%m-%d')
         hist = pd.read_parquet(NAMES_F) if os.path.exists(NAMES_F) else pd.DataFrame(columns=['code', 'date', 'name'])
+        if len(hist) and today in set(hist['date']):
+            return
         snap = pd.DataFrame([{'code': c, 'date': today, 'name': n} for c, n in code2name.items()])
         hist = pd.concat([hist, snap], ignore_index=True).drop_duplicates(['code', 'date'], keep='last')
         os.makedirs(AUX_DIR, exist_ok=True)
@@ -900,33 +1063,38 @@ class KlineV2Builder:
 
     # ==================== 内部：m15 ====================
 
-    def _plan_m15(self, code, cal, last_td):
-        """该票 m15 缺口计划 → (datalen, force_merge) / 'old' / None。
+    def _plan_m15(self, code, cal, end_td):
+        """该票 m15 缺口计划 → ('sina', datalen, force_merge) / ('bs', start, end) / None（已齐）。
 
-        新浪只支持"最近 N 根"：N 按缺口长度换算（16 根/日）；缺口早于 64 交易日窗 → 'old'（需全史手段）。
+        新浪只支持"最近 N 根"（≈64 交易日窗）：窗内缺口用新浪（快、可并发）；
+        窗口外的老缺口与 2020 起整段用 baostock（慢、单线程、但全，可续传）。
+        起点固定 2020-01-01（FLOOR=2020-01-02）——不是上市起全历史；新股才从上市日起。
+        只要求「真成交日」（日线 volume>0）的分钟 bar：停牌日没有成交量，任何源都不会有 bar，
+        不算缺口，否则每次重跑都会白抓（如 sh.600215 上市初期停牌段）。
         """
         path = os.path.join(M15_KLINE_DIR, f'{code}.csv')
-        i_last = cal.index(last_td)
+        start_td = self._start_of(code) or FLOOR
+        i_end = bisect.bisect_left(cal, end_td)
         if not os.path.exists(path):
-            return 1023, True
+            return ('bs', start_td, end_td)
         dates = set(pd.read_csv(path, usecols=['date'], dtype={'date': str})['date'])
-        i0 = cal.index(min(dates))
-        miss = [d for d in cal[i0:i_last + 1] if d not in dates]
+        if not dates:
+            return ('bs', start_td, end_td)
+        dp = os.path.join(V2_DIR, f'{code}.csv')
+        if os.path.exists(dp):
+            dd = pd.read_csv(dp, usecols=['date', 'volume'], dtype={'date': str})
+            expect = set(dd.loc[pd.to_numeric(dd['volume'], errors='coerce') > 0, 'date'])
+        else:
+            expect = None                       # 无日线参照 → 按全部交易日要求
+        lo = self._start_of(code) or min(dates)
+        i0 = bisect.bisect_left(cal, lo)
+        miss = [d for d in cal[i0:i_end + 1] if d not in dates and (expect is None or d in expect)]
         if not miss:
             return None
-        win_start = cal[max(0, i_last - 62)]
-        win_miss = [d for d in miss if d >= win_start]
-        if not win_miss:
-            return 'old'
-        if len(win_miss) < len(miss):
-            logger.info(f'[m15] {code}: {len(miss) - len(win_miss)} 天缺口早于新浪窗（{miss[0]} 起），不可回补')
-        datalen = min(SINA_MAX_BARS, (i_last - cal.index(win_miss[0]) + 1) * BARS_PER_DAY + BARS_PER_DAY)
-        return datalen, min(win_miss) <= max(dates)   # 缺口中段→合并；仅尾部→追加
-
-    def _delegate_history(self, codes):
-        """整段历史：委托旧器 update_kline.py（baostock 15 分钟全史，列与 v2 同构，逐票续传）。"""
-        from AshareData.datautils.kline_scripts.update_kline import UpdateKline
-        UpdateKline().update_kline_daily(codes=codes, frequencies=['15'])
+        if miss[0] < cal[max(0, i_end - SINA_WIN)]:
+            return ('bs', miss[0], end_td)             # 老缺口超出新浪窗 → baostock 一段补齐
+        datalen = min(SINA_MAX_BARS, (i_end - bisect.bisect_left(cal, miss[0]) + 1) * BARS_PER_DAY + BARS_PER_DAY)
+        return ('sina', datalen, min(miss) <= max(dates))   # 缺口中段→合并；仅尾部→追加
 
     def _fetch_m15(self, code, datalen):
         sym = code.replace('.', '')
@@ -953,6 +1121,16 @@ class KlineV2Builder:
                 last = e
                 time.sleep(random.uniform(0.5, 1.5))
         raise last
+
+    def _fetch_m15_bs(self, code, start, end):
+        """baostock 15 分钟一段（前复权，与库内历史同口径）→ 与新浪同构的行帧（time=HHMM 整数）。"""
+        rows = _bs_rows(code, 'date,time,open,high,low,close,volume,amount', start, end,
+                        frequency='15', adjustflag='2')
+        out = [{'date': r[0], 'time': int(r[1][8:12]),
+                'open': _num(r[2]), 'high': _num(r[3]), 'low': _num(r[4]),
+                'close': _num(r[5]), 'volume': _num(r[6]), 'amount': _num(r[7])}
+               for r in rows if _num(r[5]) is not None]
+        return pd.DataFrame(out)
 
     def _m15_upsert(self, code, rows, force_merge=False):
         path = os.path.join(M15_KLINE_DIR, f'{code}.csv')
@@ -1025,11 +1203,15 @@ class KlineV2Builder:
             logger.info(f'[meta] 名单回归（移出退市表）: {back}')
 
     def _load_prev_close(self):
+        """{code: 库起点前收盘}（preclose 起始基准 + 首个真实行之前的占位 carry）。文件只读一次。"""
+        if self._prev_file is None:
+            self._prev_file = {}
+            if os.path.exists(PREVCLOSE_F):
+                p = pd.read_parquet(PREVCLOSE_F)
+                self._prev_file = dict(zip(p['code'], p['prev_close']))
         d = dict(self._prev_close_mem)
-        if os.path.exists(PREVCLOSE_F):
-            p = pd.read_parquet(PREVCLOSE_F)
-            for c, v in zip(p['code'], p['prev_close']):
-                d.setdefault(c, v)
+        for c, v in self._prev_file.items():
+            d.setdefault(c, v)
         return d
 
     def _old_col(self, code, col, dates):
@@ -1049,22 +1231,26 @@ class KlineV2Builder:
 def is_latest(quiet=False):
     """整库各字段是否都无缺口（复用与 update_* 同一套缺口判定，不另写一份）。
 
-    逐票：①交易日覆盖 [上市日或库起点, 目标日] 无缺；②真成交行（volume 非空）的
+    逐票：①交易日覆盖 [上市日或库起点, 退市日或目标日] 无缺；②真成交行（volume>0）的
     preclose/amount/turn/pctChg 与 isST 非空；③有成交的票 m15 无缺口（同一个 _plan_m15）。
-    豁免「重跑也补不回来」的票：退市、本地无数据、结构性无量（全表从未算出过 turn，
-    如新浪/扶摇都给不出股本的 sh.689009）。代价是要读全表，比抽末行慢（约十几秒）。
+    豁免「重跑也补不回来」的票：退市、本地无数据、结构性无量（新浪股本事件表查不到该票，
+    如 sh.689009）。代价是要读全表，比抽末行慢（约十几秒）。
     """
+    if not os.path.exists(META_F):
+        if not quiet:
+            logger.warning(f'[is_latest] 尚未初始化（无 meta 名单）→ False')
+        return False
     b = KlineV2Builder()
     tgt = b._target_date()
     codes = b._codes()
     if not codes:
         if not quiet:
-            logger.warning(f'[is_latest] v2 库为空（{V2_DIR}）→ False')
+            logger.warning(f'[is_latest] 票池为空（{V2_DIR}）→ False')
         return False
     delisted = set(pd.read_parquet(DELISTED_F)['code']) if os.path.exists(DELISTED_F) else set()
     ev = pd.read_parquet(SHARE_F) if os.path.exists(SHARE_F) else pd.DataFrame(columns=['code', 'date', 'shares_wan'])
     first_ev = ev.groupby('code')['date'].min().to_dict() if len(ev) else {}
-    lags, exempt = {}, {}
+    lags, exempt, n_data = {}, {}, 0
     for code in codes:
         if code in delisted:
             exempt.setdefault('delisted', []).append(code)
@@ -1073,9 +1259,10 @@ def is_latest(quiet=False):
         if df.empty:
             exempt.setdefault('no_data', []).append(code)      # 源里没有该票（或尚未建库）
             continue
+        n_data += 1
         if b._missing(code, df):
             lags.setdefault('date', []).append(code)
-        traded = df[df['volume'].notna()]
+        traded = df[pd.to_numeric(df['volume'], errors='coerce') > 0]   # 真成交行（volume>0）
         if len(traded):
             for col in ('preclose', 'pctChg'):
                 blank = pd.to_numeric(traded[col], errors='coerce').isna()
@@ -1092,10 +1279,14 @@ def is_latest(quiet=False):
                     exempt.setdefault('turn', []).append(code)  # 源完全没有股本事件 → 算不出
                 else:
                     lags.setdefault('turn', []).append(code)
-            if b._plan_m15(code, _cal(), tgt) is not None:
+            if b._plan_m15(code, _cal(), b._end_of(code)) is not None:
                 lags.setdefault('m15', []).append(code)
         if pd.to_numeric(df['isST'], errors='coerce').isna().any():
             lags.setdefault('isST', []).append(code)
+    if not n_data:
+        if not quiet:
+            logger.warning(f'[is_latest] v2 库尚无任何行情（{V2_DIR}）→ False')
+        return False
     note = '，'.join(f'{k}={len(v)}' for k, v in sorted(exempt.items()))
     if not lags:
         if not quiet:
@@ -1117,12 +1308,15 @@ def main():
     ap.add_argument('--force', action='store_true', help='强制重取（忽略"已齐/已抓过"的跳过判断）')
     ap.add_argument('--latest', action='store_true', help='只做整库状态问答（is_latest），不抓数据')
     a = ap.parse_args()
-    if a.latest:
-        sys.exit(0 if is_latest() else 1)
-    codes = norm_codes(a.codes) if a.codes else None
-    KlineV2Builder(force=a.force).run(codes, skip=[s for s in a.skip.split(',') if s])
+    try:
+        if a.latest:
+            sys.exit(0 if is_latest() else 1)
+        codes = norm_codes(a.codes) if a.codes else None
+        KlineV2Builder(force=a.force).run(codes, skip=[s for s in a.skip.split(',') if s])
+    except Exception as e:
+        logger.error(f'fatal: {type(e).__name__}: {e}')   # 基础设施级失败（key/元数据/日历），重试无意义
+        sys.exit(1)
 
 
 if __name__ == '__main__':
     main()
-
