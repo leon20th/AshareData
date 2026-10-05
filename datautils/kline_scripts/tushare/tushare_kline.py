@@ -10,7 +10,7 @@
      ---------------------------   -------------   -----------------------------------------------
      OHLCV + 成交额/前收/涨跌幅    daily           未复权；vol 手→股（×100）、amount 千元→元（×1000）
      换手率 turn                   daily_basic     turnover_rate（=成交量/流通股，与 v2 自算同口径）
-     isST（历史）                  namechange      曾用名时间线 → 名称 ST 前缀；目标日行以名单现名覆盖
+     isST（历史）                  stock_st        各交易日风险警示名单（tushare 官方接口，原样落库、不做推断）
      复权因子（aux，读时复权用）    adj_factor      全市场按交易日；不做复权计算，读时另折算
      名单/上市退市日                stock_basic     L/D/P 三态
      tradestatus（停牌占位行）      ——              由本地交易日历 + daily 缺行派生（与 v2 同语义）
@@ -18,9 +18,9 @@
 
   3. 抓取策略（最小请求）：
      - daily：按票缺口贪心分批（多代码一次调用，6000 行/次上限）；只请求缺失区间（冷建多取库起点前一段）。
-     - turn ：按缺失票日汇总 → 按交易日全市场各取一次、现场回填（不落缓存，无持久状态）。
+             turn（daily_basic）与 isST（stock_st）都是"当日全市场"接口，故先按本轮要新增的交易日
+             各抓一次（多线程 + 全局限速），落盘时与 OHLCV 一并写好 —— 每只票每轮**只写一次**。
      - adj  ：按交易日缺口全市场各取一次；已抓日期记 _aux/adj_fetch_log.json。
-     - namechange：按公告年份分段续传，水位记 _aux/namechange_log.json。
   4. 口径与 v2（quick_kline）逐位对齐：13 列 schema 与列序、未复权原值、每交易日一行、
      停牌占位（volume==0：价格 carry、amount=0、turn/pctChg 空、tradestatus=0）、
      覆盖 [max(库起点, 上市日), min(目标日, 退市日)]、首行前收基准（库起点前收盘，_aux/prev_close）。
@@ -28,13 +28,13 @@
   5. 老数据不移植（用户定案）：fresh 建库，不读旧库做历史覆盖。
 
 产物: daily_kline_ts/{sh.600000.csv} 13 列（未复权原值）；m15 由共用模块 kline_scripts/m15/update_m15.py 维护（m15_kline_ts，两管线共用）
-辅助: daily_kline_ts/_aux/（meta_tickers / adj_factor+日志 / namechange+日志 / prev_close）
+辅助: daily_kline_ts/_aux/（meta_tickers / adj_factor+日志 / prev_close）
 用法:
-  python AshareData/datautils/kline_scripts/tushare/tushare_kline.py [--codes 600519,sz.000001] [--skip turn,isst]
+  python AshareData/datautils/kline_scripts/tushare/tushare_kline.py [--codes 600519,sz.000001] [--skip adj]
   python AshareData/datautils/kline_scripts/tushare/tushare_kline.py --latest   # 只问库状态，不抓数据
   python AshareData/datautils/kline_scripts/tushare/tushare_kline.py --probe    # 连通性/权限自检（不写数据）
 token: 环境变量 TUSHARE_TOKEN 优先，其次 AshareData/.keys/.tushare_token（单行纯文本；配置见 setup.sh）
-参考耗时（全市场 2020 起冷建）：日线部分 ≈5.1k 次调用、约 15 分钟。
+参考耗时（全市场 2020 起冷建）：日线部分 ≈5.1k 次调用、约 15 分钟；turn/isST 各 1636 次当日接口调用（多线程 ≈10 分钟）。此后增量只补新交易日，且每票每轮只写一次。
 """
 import argparse
 import bisect
@@ -61,8 +61,6 @@ AUX_DIR = os.path.join(TS_DIR, '_aux')
 META_F = os.path.join(AUX_DIR, 'meta_tickers.parquet')
 ADJ_F = os.path.join(AUX_DIR, 'adj_factor.parquet')
 ADJ_LOG = os.path.join(AUX_DIR, 'adj_fetch_log.json')
-NAME_F = os.path.join(AUX_DIR, 'namechange.parquet')
-NAME_LOG = os.path.join(AUX_DIR, 'namechange_log.json')
 PREV_F = os.path.join(AUX_DIR, 'prev_close.parquet')
 
 
@@ -73,7 +71,6 @@ PRE_FLOOR = '2019-10-01'        # 冷建时多取一段：供"首行前收基准
 BATCH_ROWS = 5500               # daily 单次调用行数上限（接口 6000，留余量）
 BATCH_CODES = 50                # daily 单次调用代码数上限
 FLUSH_N = 300                   # adj 抓取过程每 N 个交易日落一次盘（控内存）
-ST_RE = re.compile(r'^(S\*?ST|\*?ST)')   # 名称 ST 前缀（含 SST / S*ST 老式标记）
 WORKERS = 6                     # 并发抓取线程数（总频率由 _pace 统一限速）
 PACE_GAP = 0.15                 # 全局最小请求间隔（秒）≈ 400 次/分，留出 500/分限频余量
 
@@ -267,9 +264,15 @@ def _ts_adj(date):
     return _call(lambda: _pro().adj_factor(trade_date=date), 'adj_factor')
 
 
-def _ts_namechange(start, end):
-    """全市场按公告日段（不带 ts_code）——用于构建曾用名时间线。"""
-    return _call(lambda: _pro().namechange(start_date=start, end_date=end), 'namechange')
+def _ts_stock_st(date):
+    """ST 名单（tushare 官方 ST 接口）——按交易日返回风险警示板股票。
+
+    字段：ts_code/name/trade_date/type/type_name（type='ST'，type_name='风险警示板'）。
+    覆盖 2020-01-02 起（与库起点一致）；不带 trade_date 时可按 ts_code 取单票全历史。
+    这是 tushare 口径下 isST 的**权威来源**（无需从 name 前缀推断）。
+    """
+    return _call(lambda: _pro().stock_st(trade_date=date, fields='trade_date,ts_code,name'),
+                 'stock_st')
 
 
 # ==================== 本地读写 ====================
@@ -304,8 +307,7 @@ class TushareKline:
     统一签名 update_<字段>(codes=None)：codes 为 None 时取 meta 全市场沪深（未上市/退市票按各自边界处理）。
     """
 
-    FIELDS = (('daily', 'OHLCV+前收/涨跌幅+停牌占位'), ('turn', '换手率'),
-              ('adj', '复权因子（读时复权用）'), ('isst', 'isST'))
+    FIELDS = (('daily', 'OHLCV+前收/涨跌幅+停牌占位+换手率+isST'), ('adj', '复权因子（读时复权用）'))
 
     def __init__(self, force=False):
         self.force = force                 # 强制重取（忽略缺口/已抓日志）
@@ -313,6 +315,10 @@ class TushareKline:
         self._prev = None                  # prev_close 文件缓存
         self._prev_mem = {}                # 冷建过程中新得的"库起点前收盘"
         self._lock = threading.Lock()      # 保护 _prev_mem 的并发读写
+        self._st_mem = {}                  # {交易日: set(本地代码)}：stock_st 当日名单（本次运行内缓存）
+        self._st_lk = threading.Lock()     # 保护 _st_mem 的并发填充
+        self._turn_mem = {}                # {交易日: Series(本地代码 → 换手率)}：daily_basic（本次运行内缓存）
+        self._turn_lk = threading.Lock()   # 保护 _turn_mem 的并发填充
         self._tgt = None
 
     # ==================== 对外：字段接口 ====================
@@ -376,6 +382,8 @@ class TushareKline:
                 have = set(df['date'])
                 lo, hi = bisect.bisect_left(cal, s), bisect.bisect_right(cal, e)
                 fs = next((d for d in cal[lo:hi] if d not in have), None)
+                if fs is None and not df.empty and self._turn_lag(df, e):
+                    fs = str(e)                  # 换手率滞后自愈：目标日已成交但当日晚间才出换手率
                 if fs is None:
                     continue
             cold[code] = df.empty
@@ -385,6 +393,10 @@ class TushareKline:
         if not plan:
             logger.info('[daily] 各票均无缺口 → 跳过')
             return
+        # turn / isST 都是"当日全市场"接口：先按本轮要新增的交易日抓齐，落盘时一次写成（不二次重写）
+        need = self._plan_dates(plan, cal, tgt)
+        self._fetch_st(need)
+        self._fetch_turn(need)
         n_cold = sum(cold.values())
         batches = self._batch_daily(plan, cal, tgt)
         logger.info(f'[daily] 需补 {len(plan)} 只' + (f'（其中冷建 {n_cold} 只）' if n_cold else '')
@@ -410,58 +422,6 @@ class TushareKline:
         self._flush_prev()
         logger.info(f'[daily] 写 {n}/{len(plan)} 只'
                     + (f'（首行前收：新得 {n_new}、哨兵 {len(sent)}）' if (n_new or sent) else ''))
-
-    def update_turn(self, codes=None):
-        """换手率：daily_basic.turnover_rate，按缺失票日汇总 → 按交易日全市场抓取、现场回填（不落缓存）。"""
-        codes = self._codes(codes)
-        dates, hit = set(), set()
-        for code in codes:
-            df = read_ts(code)
-            if df.empty:
-                continue
-            v = pd.to_numeric(df['volume'], errors='coerce')
-            sel = (v > 0)
-            if not self.force:
-                sel &= pd.to_numeric(df['turn'], errors='coerce').isna()
-            if sel.any():
-                dates.update(df.loc[sel, 'date'])
-                hit.add(code)
-        if not dates:
-            logger.info('[turn] 无需回填 → 跳过')
-            return
-        logger.info(f'[turn] {len(dates)} 个交易日 / {len(hit)} 只有缺口')
-        got = self._fetch_basic(sorted(dates))          # 现场抓取（内存），抓完即回填
-        cache = {c: g.set_index('date')['turnover_rate'].to_dict()
-                 for c, g in got.groupby('code', sort=False, observed=True)} if len(got) else {}
-        n, skip, t0 = 0, 0, time.time()
-        for i, code in enumerate(sorted(hit), 1):
-            _progress(i, len(hit), t0, '[turn]', f'已写 {n} 跳过 {skip}')
-            df = read_ts(code)
-            if df.empty:
-                continue
-            m = cache.get(code)
-            if not m:
-                skip += 1
-                continue
-            di = df['date'].str.replace('-', '').astype(int)
-            rate = di.map(m)
-            v = pd.to_numeric(df['volume'], errors='coerce')
-            t = pd.to_numeric(df['turn'], errors='coerce').to_numpy()
-            if self.force:
-                upd = (v > 0).to_numpy() & rate.notna().to_numpy()
-            else:
-                upd = (v > 0).to_numpy() & np.isnan(t) & rate.notna().to_numpy()
-            if not upd.any():
-                skip += 1
-                continue
-            nt = np.where(upd, rate.to_numpy(), t)
-            if np.array_equal(nt, t, equal_nan=True):
-                skip += 1
-                continue
-            df['turn'] = nt
-            write_ts(code, df)
-            n += 1
-        logger.info(f'[turn] 写 {n} 只' + (f'，无变化/缺源跳过 {skip} 只' if skip else ''))
 
     def update_adj(self, codes=None):
         """复权因子（读时复权用）：按交易日缺口全市场抓取；已抓日期记日志。"""
@@ -505,46 +465,72 @@ class TushareKline:
         json.dump(sorted(done), open(ADJ_LOG, 'w'))
         logger.info(f'[adj] 新增 {n_rows[0]} 行（覆盖 {len(done)} 个交易日）')
 
-    def update_isst(self, codes=None):
-        """isST：namechange 曾用名时间线映射（历史），目标日行以名单现名覆盖；仅变化时重写。"""
-        codes = self._codes(codes)
-        self._fetch_namechange()
-        tgt = self._target_date()
-        ev = pd.read_parquet(NAME_F) if os.path.exists(NAME_F) else pd.DataFrame(
-            columns=['code', 'name', 'start_date', 'end_date', 'ann_date', 'change_reason'])
-        if len(ev):
-            ev = ev.copy()
-            ev['flag'] = ev['name'].map(lambda x: int(bool(ST_RE.match(str(x).strip().upper()))))
-        groups = ({c: g.sort_values('start_date') for c, g in ev.groupby('code', sort=False, observed=True)}
-                  if len(ev) else {})
-        n, t0 = 0, time.time()
-        for i, code in enumerate(codes, 1):
-            _progress(i, len(codes), t0, '[isst]', f'已写 {n}')
-            df = read_ts(code)
-            if df.empty:
-                continue
-            g = groups.get(code)
-            if g is not None and len(g):
-                starts = np.array(g['start_date'].astype(str).tolist())
-                pos = np.searchsorted(starts, np.array(df['date'].tolist()), side='right') - 1
-                isst = np.where(pos >= 0, g['flag'].to_numpy()[np.clip(pos, 0, None)], 0).astype(int)
-            else:
-                isst = np.zeros(len(df), dtype=int)
-            r = self._row(code)
-            cur = str(r['name']) if r is not None else ''
-            hit = (df['date'] == tgt).to_numpy()
-            if hit.any() and cur and cur != 'nan':
-                v = int(bool(ST_RE.match(cur.strip().upper())))
-                if isst[hit][0] != v:
-                    logger.info(f'[isst] 名单现名与时间线不一致（以现名覆盖）: {code} → {cur}')
-                    isst = np.where(hit, v, isst)
-            old = pd.to_numeric(df['isST'], errors='coerce').to_numpy()
-            if np.array_equal(old, isst.astype(float), equal_nan=True):
-                continue
-            df['isST'] = isst
-            write_ts(code, df)
-            n += 1
-        logger.info(f'[isst] 写 {n} 只（共 {len(codes)}）')
+    # ==================== 内部：turn / isST（当日全市场接口） ====================
+
+    def _turn_lag(self, df, e):
+        """末行是否"目标日已成交但换手率留空"：daily_basic 当晚才出时用它让下轮重取该日补上。
+
+        仅当该票换手率有覆盖（源覆盖该票）才算缺口——整票无覆盖的票豁免，避免每轮空转。
+        """
+        last = df.iloc[-1]
+        if str(last['date']) != str(e) or not _num(last['volume']):
+            return False
+        if _num(last['turn']) is not None:
+            return False
+        return bool(pd.to_numeric(df['turn'], errors='coerce').notna().any())
+
+    def _fetch_turn(self, dates):
+        """按交易日抓换手率（daily_basic 的 turnover_rate）→ {交易日: Series(本地代码 → 换手率)}。
+
+        只抓没抓过的日子（多线程 + 全局限速由 `_fetch_basic` 内部负责）；源缺该日则不缓存，
+        该行留空、下轮由 `_turn_lag` 触发重取。
+        """
+        todo = [d for d in dates if d not in self._turn_mem]
+        if not todo:
+            return
+        got = self._fetch_basic(sorted(todo))
+        for dt, g in got.groupby('date', sort=False, observed=True):
+            with self._turn_lk:
+                self._turn_mem[_iso(str(dt))] = pd.Series(g['turnover_rate'].to_numpy(),
+                                                          index=g['code'].to_numpy())
+
+    def _plan_dates(self, plan, cal, tgt):
+        """本轮各票要新增的交易日并集（各票 [起点, 终点] 窗口，裁到库起点）——isST 只需这些天。"""
+        mask = np.zeros(len(cal), dtype=bool)
+        for fs, e in plan.values():
+            lo, hi = bisect.bisect_left(cal, max(fs, FLOOR)), bisect.bisect_right(cal, min(e, tgt))
+            if hi > lo:
+                mask[lo:hi] = True
+        return [cal[i] for i in np.flatnonzero(mask)]
+
+    def _fetch_st(self, dates):
+        """按交易日抓 ST 名单（tushare 官方 stock_st）→ {交易日: set(本地代码)}，本次运行内缓存。
+
+        只抓没抓过的日子（6 线程 + 全局限速，与 daily_basic/adj 同模式）；返回空表视为该日
+        源暂缺（不缓存），其行不落盘、下轮再来。
+        """
+        todo = [d for d in dates if d not in self._st_mem]
+        if not todo:
+            return
+        t0, cnt = time.time(), [0]
+
+        def work(dt):
+            try:
+                r = _ts_stock_st(_ymd(dt))
+                bad = None if (r is not None and len(r)) else '无返回'
+            except Exception as e:
+                r, bad = None, f'失败 {str(e)[:80]}'
+            with self._st_lk:
+                cnt[0] += 1
+                _progress(cnt[0], len(todo), t0, '[isST] 抓 ST 名单', dt, every=200)
+                if bad:
+                    logger.warning(f'[isST] {dt} stock_st {bad}（该日留缺口下轮补）')
+                    return
+                self._st_mem[dt] = {_local(x) for x in r['ts_code']}
+
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            list(ex.map(work, todo))
+        logger.info(f'[isST] ST 名单：本轮新抓 {len(todo)} 个交易日（缓存 {len(self._st_mem)} 天）')
 
     # ==================== 内部：边界判定 ====================
 
@@ -653,6 +639,27 @@ class TushareKline:
         out = self._materialize(merged, code, pub_today)
         if out.empty:
             return False
+        # turn / isST 都直接取当日接口数据：旧行沿用已写好的值，其余按当日数据落值 → 落盘只写一次
+        pv = {c: v for c, v in zip(old['date'], pd.to_numeric(old['turn'], errors='coerce'))} if len(old) else {}
+        out['turn'] = out['date'].map(pv)
+        pv = {c: v for c, v in zip(old['date'], pd.to_numeric(old['isST'], errors='coerce'))} if len(old) else {}
+        out['isST'] = out['date'].map(pv)
+        lag_t = (pd.to_numeric(out['volume'], errors='coerce') > 0) & out['turn'].isna()
+        if lag_t.any():
+            self._fetch_turn(sorted(set(out.loc[lag_t, 'date'])))
+            hit = lag_t & out['date'].isin(list(self._turn_mem))
+            out.loc[hit, 'turn'] = [self._turn_mem[d].get(c, np.nan)
+                                    for c, d in zip(out.loc[hit, 'code'], out.loc[hit, 'date'])]
+        lag_s = out['isST'].isna()
+        if lag_s.any():
+            self._fetch_st(sorted(set(out.loc[lag_s, 'date'])))
+            hit = lag_s & out['date'].isin(list(self._st_mem))
+            out.loc[hit, 'isST'] = [1.0 if c in self._st_mem[d] else 0.0
+                                    for c, d in zip(out.loc[hit, 'code'], out.loc[hit, 'date'])]
+            out = out[out['isST'].notna()].reset_index(drop=True)   # ST 源缺日不落盘 → 留缺口下轮补
+            if out.empty:
+                return False
+        out['isST'] = out['isST'].astype(int)
         write_ts(code, out)
         return True
 
@@ -760,43 +767,6 @@ class TushareKline:
         both['date'] = both['date'].astype('int32')
         both['adj_factor'] = pd.to_numeric(both['adj_factor'], errors='coerce')
         both.sort_values(['code', 'date']).to_parquet(ADJ_F)
-
-    # ==================== 内部：namechange ====================
-
-    def _fetch_namechange(self):
-        """曾用名事件表维护：按公告年份分段抓取（全市场，不带 ts_code），水位记 NAME_LOG。"""
-        os.makedirs(AUX_DIR, exist_ok=True)
-        log = json.load(open(NAME_LOG)) if os.path.exists(NAME_LOG) else {}
-        today = pd.Timestamp.now().strftime('%Y%m%d')
-        covered = None if self.force else log.get('covered_to')
-        if covered and covered >= today:
-            return
-        cs = '19900101' if not covered else (pd.Timestamp(covered) + pd.Timedelta(days=1)).strftime('%Y%m%d')
-        frames = []
-        while cs <= today:
-            ce = min(f'{cs[:4]}1231', today)
-            r = _ts_namechange(cs, ce)
-            if r is not None and len(r):
-                frames.append(r)
-            cs = f'{int(cs[:4]) + 1}0101'
-            time.sleep(0.05)
-        if frames:
-            d = pd.concat(frames, ignore_index=True)
-            d = d[d['ts_code'].str.endswith(('.SH', '.SZ'))]
-            d = d.copy()
-            d['code'] = [_local(x) for x in d['ts_code']]
-            for c in ('start_date', 'end_date', 'ann_date'):
-                d[c] = [_d8(x) for x in d[c]]
-            d = d[['code', 'name', 'start_date', 'end_date', 'ann_date', 'change_reason']]
-            d = d[d['start_date'].notna()]
-            old = pd.read_parquet(NAME_F) if os.path.exists(NAME_F) else None
-            both = d if old is None else pd.concat([old, d], ignore_index=True)
-            both = both.drop_duplicates(['code', 'start_date'], keep='last').sort_values(['code', 'start_date'])
-            both.to_parquet(NAME_F)
-            logger.info(f'[isst] 曾用名事件累计 {len(both)} 条（本次 +{len(d)}）')
-        else:
-            logger.warning('[isst] namechange 无返回')
-        json.dump({'covered_to': today}, open(NAME_LOG, 'w'))
 
     # ==================== 内部：prev_close ====================
 
@@ -922,15 +892,15 @@ def probe():
     check(f'daily(600000.SH @ {d})', lambda: _ts_daily(['600000.SH'], _ymd(d), _ymd(d)))
     check(f'daily_basic({d})', lambda: _ts_daily_basic(_ymd(d)))
     check(f'adj_factor({d})', lambda: _ts_adj(_ymd(d)))
-    check('namechange(全市场按公告年份段)', lambda: _ts_namechange(f'{int(d[:4]) - 1}0101', _ymd(d)))
-    check('namechange(单票)', lambda: _call(lambda: _pro().namechange(ts_code='600000.SH'), 'namechange'))
+    check('stock_st(ST名单)', lambda: _call(lambda: _pro().stock_st(trade_date='20260930',
+                                                                   fields='trade_date,ts_code,name'), 'stock_st'))
     return 0 if ok else 1
 
 
 def main():
     ap = argparse.ArgumentParser(description='日K tushare 版构建器（字段自维护：缺口与最小请求）')
     ap.add_argument('--codes', default='', help='逗号分隔，如 600519,sz.000001（缺省=全市场沪深）')
-    ap.add_argument('--skip', default='', help='跳过字段，如 turn,isst')
+    ap.add_argument('--skip', default='', help='跳过字段，目前仅 adj（turn/isST 已随 daily 一次写入）')
     ap.add_argument('--force', action='store_true', help='强制重取（忽略缺口/已抓日志）')
     ap.add_argument('--latest', action='store_true', help='只做整库状态问答（is_latest），不抓数据')
     ap.add_argument('--probe', action='store_true', help='接口连通/权限自检（不写数据）')
