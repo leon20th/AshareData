@@ -25,6 +25,10 @@
      缺口起点由「上市日」决定：新股从上市日起算，上市前的空档不算缺口。
   3. 旧库（daily_kline）存在时，其 turn / pctChg / isST 作为历史权威值覆盖（移植）；
      没有旧库则自动回落 baostock / 新浪，无需任何参数。
+  4. 派生列随 ohlcvt 一次写好：落盘新行时把 turn（股本事件 as-of）、preclose/pctChg（除权事件 as-of）
+     与增量 isST（沿线值 + 当天名单）一并算出，preclose / turn / isst 三步只做**核验与自愈**
+     （逐票比对，无变化不重写）——于是每票每轮只落一次盘，而不是被四个步骤各写一遍。
+     唯一例外：整列缺 isST（冷建、或回扫前）必须留给 isst 步去旧库/baostock 取，否则历史段会被写成 0。
 
 行约定（每交易日一行；volume==0 是"没有成交量"的唯一判定信号）
   - 真成交行  volume>0 且 close>0   → tradestatus=1，各字段能算尽算
@@ -64,6 +68,7 @@ import requests
 
 from AshareData.paths import ASHARE_ROOT, DAILY_KLINE_DIR, DAILY_KLINE_V2_DIR, M15_KLINE_DIR
 from AshareData.utils.exchanges_utils.a_open import get_target_trade_date, get_trade_date_list
+from AshareData.utils.exchanges_utils.stock_utils import is_st_name
 from AshareData.utils.log_util import get_logger
 from AshareData.utils.read_file_utils import read_last_lines
 
@@ -218,7 +223,8 @@ def write_v2(code, df):
 
 
 def _is_st_name(name):
-    return bool(re.match(r'^\*?ST', str(name or '').strip().upper()))
+    """名称是否 ST（非 tushare 口径下按扶摇名单名称判定）；判定规则见 stock_utils.is_st_name。"""
+    return is_st_name(name)
 
 
 def _num(v):
@@ -338,6 +344,9 @@ class KlineV2Builder:
         self._list_dates = None
         self._delisted = None
         self._tgt = None
+        self._adj_by = None                # 除权事件按票预分组（避免逐票全表比较）
+        self._share_by = None              # 股本事件按票预分组 + 按日排序
+        self._code2name = None             # {本地代码: 名单现名}
 
     # 字段执行顺序（--skip 的取值也来自这里）
     FIELDS = (('adjust', '复权事件'), ('ohlcvt', 'OHLCV+停牌占位'), ('preclose', '前收/涨跌幅'),
@@ -370,6 +379,7 @@ class KlineV2Builder:
         d = d.rename(columns={'date': 'ex_date'}).sort_values(['code', 'ex_date'])
         os.makedirs(AUX_DIR, exist_ok=True)
         d.to_parquet(ADJ_F)
+        self._adj_by = None                    # 事件表已换 → 丢弃预分组缓存
         logger.info(f'[adjust] {len(d)} 事件 / {d["code"].nunique()} 只')
 
     def update_ohlcvt(self, codes=None):
@@ -388,7 +398,7 @@ class KlineV2Builder:
                 recent.append(code)                   # 缺历史中间段（退市票缺口止于退市日）
             if end == target and (target in miss or self._stale_today(code)):
                 today.append(code)                    # 缺当天 / 当天行是收盘前写的
-            if end == target and (self._bad_today(code) or self._needs_rebuild(code, df)):
+            if end == target and (self._bad_today(df) or self._needs_rebuild(code, df)):
                 repair.append(code)                   # 坏行/缺价停牌行 → 重建归位（不重抓）
         if not (full or recent or today or repair):
             logger.info('[ohlcvt] 各票均已齐 → 跳过')
@@ -403,8 +413,11 @@ class KlineV2Builder:
             src.update(self._fetch_recent(gaps))
         if today:
             src.update(self._fetch_today(today))
-        for code in repair:
-            src.setdefault(code, (None, target))       # 无真成交也要落一行（占位），否则当天永远缺行
+        if repair:
+            for code in repair:
+                src.setdefault(code, (None, target))       # 无真成交也要落一行（占位），否则当天永远缺行
+        # 派生列（turn）依赖股本事件表：与 turn 步同一份，日志按天去重，故这里调完那边就不会重复抓
+        self._fetch_share_events(codes)
         n, t0 = 0, time.time()
         # 源里没有这些天行情（长期停牌、库起点前）时仍需落行：按“每交易日一行”补占位行
         todo = [c for c in codes if c in src] + [c for c in recent if c not in src]
@@ -412,6 +425,9 @@ class KlineV2Builder:
             _progress(i, len(todo), t0, '[ohlcvt]', f'已写 {n}')
             rows, market_last = src.get(code, (None, None))
             df = read_v2(code)
+            # isST 是否可在本地派生：仅"原有列已完整"的增量追加能由沿线值 + 当天名单推出；
+            # 整列缺（冷建/回扫前）必须留给 isst 步去旧库/baostock 取，否则历史段会被写坏成 0
+            had_isst = bool(len(df)) and not pd.to_numeric(df['isST'], errors='coerce').isna().any()
             if rows is not None and len(rows):
                 rows = rows.copy()
                 rows['code'] = code
@@ -426,9 +442,25 @@ class KlineV2Builder:
                 df = rows if df.empty else pd.concat([df, rows], ignore_index=True)
             if df.empty:
                 continue
-            write_v2(code, self._materialize(df, market_last, code))
+            out = self._materialize(df, market_last, code)
+            # 一次写好全部派生列 → preclose/turn/isst 三步只会核验出"无变化"、不再重写同一文件
+            self._calc_preclose(out, code, self._load_prev_close())
+            self._calc_turn(out, code)
+            if had_isst:
+                out['isST'] = self._isst_fill(out, code)
+            write_v2(code, out)
             n += 1
-        logger.info(f'[ohlcvt] 写 {n} 只')
+        logger.info(f'[ohlcvt] 写 {n} 只（派生列随本次落盘一次写好）')
+
+    def _isst_fill(self, df, code):
+        """增量追加时的 isST：沿线值 ffill 到新行，目标日行以名单现名覆盖（与 isst 步同口径）。"""
+        col = pd.to_numeric(df['isST'], errors='coerce').ffill()
+        name = self._names().get(code)
+        hit = (df['date'] == self._target_date()).to_numpy()
+        if hit.any() and name:
+            col = col.copy()
+            col[hit] = int(is_st_name(name))
+        return col.fillna(0).astype(int)
 
     def update_preclose(self, codes=None):
         """preclose/pctChg：纯本地派生（依赖 adjust 事件表），旧库有值的历史行以旧库为准。"""
@@ -442,74 +474,87 @@ class KlineV2Builder:
             logger.info(f'[preclose] {len(need_pre)} 只缺首行前收（2020 前最后收盘）→ 从 dump 取基准（取不到记空哨兵，不重试）')
             self._remember_prev_close(self._dump_daily('daily-k'), need_pre)
             prev_map = self._load_prev_close()
-        adj = pd.read_parquet(ADJ_F) if os.path.exists(ADJ_F) else pd.DataFrame(
-            columns=['code', 'ex_date', 'dividend_per_share', 'per_share_bonus', 'allotment_ratio', 'allotment_price'])
+        self._load_adj_by()
         n, skip, t0 = 0, 0, time.time()
         for i, code in enumerate(codes, 1):
             _progress(i, len(codes), t0, '[preclose]', f'已写 {n}')
             df = read_v2(code)
             if df.empty:
                 continue
-            ev = adj[adj['code'] == code]
-            g = ev.groupby('ex_date').agg(D=('dividend_per_share', 'sum'), B=('per_share_bonus', 'sum'),
-                                          R=('allotment_ratio', 'sum')).reset_index()
-            ev2 = ev.copy()
-            ev2['Rp'] = ev2['allotment_ratio'].fillna(0) * ev2['allotment_price'].fillna(0)
-            g = g.merge(ev2.groupby('ex_date')['Rp'].sum().reset_index(), on='ex_date', how='left')
-            f_of = {e['ex_date']: (e['D'], e['B'], e['R'], e['Rp']) for _, e in g.iterrows()}
-            ev_dates = list(f_of)
-            cal = _cal()
-            last_close, last_mark = None, None
-            pre = np.full(len(df), np.nan)
-            pch = np.full(len(df), np.nan)
-            dates = df['date'].tolist()
-            closes = pd.to_numeric(df['close'], errors='coerce').to_numpy()
-            vols = pd.to_numeric(df['volume'], errors='coerce').to_numpy()
-            for j in range(len(df)):
-                if not vols[j] > 0:              # 停牌/非成交行（volume==0 或空）：preclose 保持 carry
-                    pre[j] = closes[j]
-                    continue
-                d = dates[j]
-                if last_close is None:
-                    base = prev_map.get(code, np.nan)
-                    k = cal.index(d) if d in cal else 0
-                    lo = cal[max(0, k - 1)] if cal else ''
-                else:
-                    base, lo = last_close, last_mark
-                f, applied, seg = 1.0, False, []
-                for ed in ev_dates:
-                    if ed > lo and ed <= d:
-                        seg.append(f_of[ed])
-                        D, B, R, Rp = f_of[ed]
-                        if base and np.isfinite(base) and base > 0:
-                            f *= (base - D + Rp) / (base * (1 + B + R))
-                            applied = True
-                pc = base * f if (base is not None and np.isfinite(base)) else np.nan
-                if applied and np.isfinite(pc):
-                    # 交易所惯例：除权参考价四舍五入到 0.01（半格边界须十进制 half-up，float 银行家舍入会错）
-                    if len(seg) == 1:
-                        D, B, R, Rp = seg[0]
-                        pc = float((Decimal(str(base)) - Decimal(str(D)) + Decimal(str(Rp)))
-                                   / (Decimal(1) + Decimal(str(B)) + Decimal(str(R))))
-                    pc = float(Decimal(str(pc)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
-                pre[j] = pc
-                if np.isfinite(pc) and pc > 0 and np.isfinite(closes[j]):
-                    pch[j] = (closes[j] / pc - 1.0) * 100.0
-                last_close, last_mark = closes[j], d
             old_pre = pd.to_numeric(df['preclose'], errors='coerce').to_numpy()
             old_pch = pd.to_numeric(df['pctChg'], errors='coerce').to_numpy()
-            df['preclose'] = pre
-            df['pctChg'] = pch
-            overlay = self._old_col(code, 'pctChg', df['date'])   # 旧库历史值权威
-            if overlay is not None:
-                df['pctChg'] = np.where(overlay.notna(), overlay, df['pctChg'])
-            if (np.array_equal(pre, old_pre, equal_nan=True)
+            self._calc_preclose(df, code, prev_map)
+            if (np.array_equal(df['preclose'].to_numpy(), old_pre, equal_nan=True)
                     and np.array_equal(df['pctChg'].to_numpy(), old_pch, equal_nan=True)):
                 skip += 1                          # 派生列无变化 → 不重写（省盘、免 mtime 抖动）
                 continue
             write_v2(code, df)
             n += 1
         logger.info(f'[preclose] 写 {n} 只' + (f'，无变化跳过 {skip} 只' if skip else ''))
+
+    def _calc_preclose(self, df, code, prev_map):
+        """就地算好 preclose/pctChg：除权参考价 as-of + 库起点前收基准，旧库历史值覆盖。
+
+        ohlcvt 落盘前也会调用它，故这里必须与 preclose 步的结果逐值一致（同源同算法）。
+        """
+        f_of = self._ex_factors(code)
+        ev_dates = list(f_of)
+        cal = _cal()
+        last_close, last_mark = None, None
+        pre = np.full(len(df), np.nan)
+        pch = np.full(len(df), np.nan)
+        dates = df['date'].tolist()
+        closes = pd.to_numeric(df['close'], errors='coerce').to_numpy()
+        vols = pd.to_numeric(df['volume'], errors='coerce').to_numpy()
+        for j in range(len(df)):
+            if not vols[j] > 0:              # 停牌/非成交行（volume==0 或空）：preclose 保持 carry
+                pre[j] = closes[j]
+                continue
+            d = dates[j]
+            if last_close is None:
+                base = prev_map.get(code, np.nan)
+                k = cal.index(d) if d in cal else 0
+                lo = cal[max(0, k - 1)] if cal else ''
+            else:
+                base, lo = last_close, last_mark
+            f, applied, seg = 1.0, False, []
+            for ed in ev_dates:
+                if ed > lo and ed <= d:
+                    seg.append(f_of[ed])
+                    D, B, R, Rp = f_of[ed]
+                    if base and np.isfinite(base) and base > 0:
+                        f *= (base - D + Rp) / (base * (1 + B + R))
+                        applied = True
+            pc = base * f if (base is not None and np.isfinite(base)) else np.nan
+            if applied and np.isfinite(pc):
+                # 交易所惯例：除权参考价四舍五入到 0.01（半格边界须十进制 half-up，float 银行家舍入会错）
+                if len(seg) == 1:
+                    D, B, R, Rp = seg[0]
+                    pc = float((Decimal(str(base)) - Decimal(str(D)) + Decimal(str(Rp)))
+                               / (Decimal(1) + Decimal(str(B)) + Decimal(str(R))))
+                pc = float(Decimal(str(pc)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+            pre[j] = pc
+            if np.isfinite(pc) and pc > 0 and np.isfinite(closes[j]):
+                pch[j] = (closes[j] / pc - 1.0) * 100.0
+            last_close, last_mark = closes[j], d
+        df['preclose'] = pre
+        df['pctChg'] = pch
+        overlay = self._old_col(code, 'pctChg', df['date'])   # 旧库历史值权威
+        if overlay is not None:
+            df['pctChg'] = np.where(overlay.notna(), overlay, df['pctChg'])
+        return df
+
+    def _ex_factors(self, code):
+        """该票除权事件 → {除权日: (每股股利, 每股送股, 配股比例, 配股价×比例)}（无事件 → 空）。"""
+        ev = self._load_adj_by().get(code)
+        if ev is None or not len(ev):
+            return {}
+        g = ev.groupby('ex_date').agg(D=('dividend_per_share', 'sum'), B=('per_share_bonus', 'sum'),
+                                      R=('allotment_ratio', 'sum')).reset_index()
+        ev2 = ev.copy()
+        ev2['Rp'] = ev2['allotment_ratio'].fillna(0) * ev2['allotment_price'].fillna(0)
+        g = g.merge(ev2.groupby('ex_date')['Rp'].sum().reset_index(), on='ex_date', how='left')
+        return {e['ex_date']: (e['D'], e['B'], e['R'], e['Rp']) for _, e in g.iterrows()}
 
     def update_turn(self, codes=None):
         """换手率：新浪股本事件 as-of 回填（含当天，纯本地计算）；旧库有值则覆盖。"""
@@ -524,19 +569,7 @@ class KlineV2Builder:
             if df.empty:
                 continue
             old_turn = pd.to_numeric(df['turn'], errors='coerce').to_numpy()
-            ev = events[events['code'] == code].sort_values('date')
-            if not ev.empty:
-                idx = np.searchsorted(ev['date'].to_numpy(), df['date'].to_numpy(), side='right') - 1
-                shares = np.where(idx >= 0, ev['shares_wan'].to_numpy()[np.clip(idx, 0, None)], np.nan)
-                vols = pd.to_numeric(df['volume'], errors='coerce').to_numpy()
-                turn = np.full(len(df), np.nan)
-                real = vols > 0                            # 停牌行（volume==0）换手留空
-                with np.errstate(invalid='ignore', divide='ignore'):
-                    turn[real] = vols[real] / (shares[real] * 1e4) * 100
-                df['turn'] = turn
-            overlay = self._old_col(code, 'turn', df['date'])
-            if overlay is not None:
-                df['turn'] = np.where(overlay.notna(), overlay, df['turn'])
+            self._calc_turn(df, code)
             if np.array_equal(df['turn'].to_numpy(), old_turn, equal_nan=True):
                 skip += 1                          # 派生列无变化 → 不重写
                 continue
@@ -544,13 +577,48 @@ class KlineV2Builder:
             n += 1
         logger.info(f'[turn] 写 {n} 只' + (f'，无变化跳过 {skip} 只' if skip else ''))
 
+    def _calc_turn(self, df, code):
+        """就地算好 turn：成交量 / 流通股本（股本事件 as-of）×100，旧库历史值覆盖；停牌行留空。
+
+        ohlcvt 落盘前也会调用它，故必须与 turn 步逐值一致（同源同算法）。
+        """
+        ev = self._load_share_by().get(code)
+        if ev is not None and not ev.empty:
+            idx = np.searchsorted(ev['date'].to_numpy(), df['date'].to_numpy(), side='right') - 1
+            shares = np.where(idx >= 0, ev['shares_wan'].to_numpy()[np.clip(idx, 0, None)], np.nan)
+            vols = pd.to_numeric(df['volume'], errors='coerce').to_numpy()
+            turn = np.full(len(df), np.nan)
+            real = vols > 0                            # 停牌行（volume==0）换手留空
+            with np.errstate(invalid='ignore', divide='ignore'):
+                turn[real] = vols[real] / (shares[real] * 1e4) * 100
+            df['turn'] = turn
+        overlay = self._old_col(code, 'turn', df['date'])
+        if overlay is not None:
+            df['turn'] = np.where(overlay.notna(), overlay, df['turn'])
+        return df
+
+    def _load_share_by(self):
+        """股本事件表按票预分组 + 按日排序一次（逐票全表比较 + 重复排序都是白花）。"""
+        if self._share_by is None:
+            ev = self._load_share_events()
+            self._share_by = ({c: g.sort_values('date') for c, g in ev.groupby('code', sort=False, observed=True)}
+                              if len(ev) else {})
+        return self._share_by
+
+    def _load_adj_by(self):
+        """除权事件表按票预分组一次（逐票全表比较在 8 万行表上要白花 ~8s）。"""
+        if self._adj_by is None:
+            adj = pd.read_parquet(ADJ_F) if os.path.exists(ADJ_F) else pd.DataFrame(
+                columns=['code', 'ex_date', 'dividend_per_share', 'per_share_bonus',
+                         'allotment_ratio', 'allotment_price'])
+            self._adj_by = ({c: g for c, g in adj.groupby('code', sort=False, observed=True)} if len(adj) else {})
+        return self._adj_by
+
     def update_isst(self, codes=None):
         """isST：历史段=旧库移植（无则 baostock 只补缺段）；当天行=扶摇名单比对。按票缺口分档。"""
         codes = self._codes(codes)
         target = self._target_date()
-        m = self._meta()
-        m = m[m['thscode'].str.endswith(('.SH', '.SZ'))]
-        code2name = {f"{x.split('.')[1].lower()}.{x.split('.')[0]}": n for x, n in zip(m['thscode'], m['name'])}
+        code2name = self._names()
         self._snap_names(code2name)                        # 每次运行落一条名单快照，供改名判定
         scan, fix_local = [], []
         for code in codes:
@@ -676,6 +744,15 @@ class KlineV2Builder:
     def _meta(self):
         return pd.read_parquet(META_F)
 
+    def _names(self):
+        """{本地代码: 名单现名}（缓存）：isST 的当天口径与改名判定都用它。"""
+        if self._code2name is None:
+            m = self._meta()
+            m = m[m['thscode'].str.endswith(('.SH', '.SZ'))]
+            self._code2name = {f"{x.split('.')[1].lower()}.{x.split('.')[0]}": n
+                               for x, n in zip(m['thscode'], m['name'])}
+        return self._code2name
+
     def _list_dates_map(self):
         if self._list_dates is None:
             m = self._meta()
@@ -741,12 +818,11 @@ class KlineV2Builder:
             return False
         return os.path.getmtime(p) < pd.Timestamp(f'{today} 15:00').timestamp()
 
-    def _bad_today(self, code):
+    def _bad_today(self, df):
         """目标日行不可信：有量无价（volume>0 而 close 空，源半截/损坏）→ 重取后重建。
 
-        volume==0 是正常停牌行（OHLC 空是常态），不算坏行。
+        volume==0 是正常停牌行（OHLC 空是常态），不算坏行。调用方已读入本票，直接传入复用。
         """
-        df = read_v2(code)
         if df.empty:
             return False
         r = df[df['date'] == self._target_date()]
@@ -985,6 +1061,7 @@ class KlineV2Builder:
             ev_all = new if ev_all.empty else pd.concat([ev_all, new], ignore_index=True)
             ev_all = ev_all.drop_duplicates(['code', 'date'], keep='last').sort_values(['code', 'date'])
             ev_all.to_parquet(SHARE_F)
+            self._share_by = None              # 事件表已换 → 丢弃预分组缓存
         json.dump(log, open(SHARE_LOG_F, 'w'))
         if failed:
             logger.warning(f'[share] {len(failed)} 只股本事件获取失败（换手率留空，下轮再试）')

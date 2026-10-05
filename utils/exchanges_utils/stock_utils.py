@@ -1,3 +1,4 @@
+from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
@@ -23,6 +24,15 @@ MAIN_BOARD_PREFIXES = ("00", "60")
 CHINEXT_PREFIXES = ("30",)
 STAR_BOARD_PREFIXES = ("68",)
 BSE_PREFIXES = ("43", "83", "87", "88")
+
+# 名称 ST 判定：除权除息当日名字会带 XD/XR/DR 前缀（如 "XDST海越"），老式标记还有 S/S*ST，
+# 因此必须允许这些前缀叠加在 ST 之前；只用 ^\*?ST 会漏判（例：XDST海越 被当成非 ST）。
+ST_NAME_RE = re.compile(r'^(?:XD|XR|DR|S)*\*?ST')
+
+
+def is_st_name(name: str | None) -> bool:
+    """股票名称是否为 ST/*ST（兼容 除息/除权/除息除权 前缀与 SST/S*ST 老式写法）。"""
+    return bool(ST_NAME_RE.match(str(name or '').strip().upper()))
 
 
 @dataclass(frozen=True)
