@@ -1,18 +1,24 @@
 # -*- coding: utf-8 -*-
 """update_m15 —— 共用 15 分钟线更新器（新浪 + baostock；两套日K管线共用）。
 
-数据源与路由:
-  - 近 ~64 交易日窗内缺口 → 新浪（getKLineData，快、并发 6 线程）
-  - 更早缺口 → baostock（只拉「最早~最晚缺口」最小区间，单线程、逐票续传）
-  - 缺口判定以日线参照库（--daily-ref）的 volume>0 为「应有 bar」标准：停牌日不算缺口。
+数据源与路由（按缺口日期分流，同一票可两边都走）:
+  - 新浪窗内（近 ~62 交易日）的缺口 → 新浪（getKLineData，快、并发 6 线程）
+  - 更早的缺口 → baostock，只覆盖「真正缺的日期」：相邻缺口归并成小段，单段 ≤ MAX_BS_SEG_TD
+    个交易日，单线程、逐段落盘续传（多年度大跨度单请求会卡死/超时，禁止把中间已入库的年份重拉）
   - 产物固定写共用库 m15_kline_ts/（tushare 管线与 mix_source 管线共用同一份 m15）。
+
+依赖日线参照库（--daily-ref；update_all 中排在本步之前的日K步）:
+  - 票池来自参照库 meta_tickers.parquet，上市/退市边界来自其 list_date/delist_date：
+    参照库没有的票不巡（末尾告警，不静默丢弃）。
+  - 缺口判定以参照库日线 volume>0 为「应有 bar」标准：停牌日不算缺口；无参照 CSV 的票本轮跳过。
 
 源坏自动跳过（2026-09-29 新增）:
   - baostock 成功返回但缺口日期无数据（源缺，如 2021-08-24 等历史事故日）→ 日期记入
     m15_kline_ts/_aux/m15_unavailable.json；此后各轮自动跳过（不再重复徒劳查询）。
   - 拉取异常（网络/超时）不记录（下轮自然重试）；--force 忽略记录强制重试全部。
-  - 安全阀：单轮新增记录超阈值（>120 只 或 >400 日期）视为源头大面积异常 → 拒绝写入
-    跳过表并告警（防止把「源暂时挂了」误记为永久跳过）。
+  - 安全阀：单轮新增记录覆盖超阈值（>120 只）视为源头大面积异常 → 拒绝写入跳过表并告警
+    （防止把「源暂时挂了」误记为永久跳过）；单票新增日期过多（> MAX_NEW_DATES_PER_CODE）
+    只丢弃该票记录并告警，不牵连其余票。
 
 用法:
   python update_m15.py                       # 全市场增量（默认参照 tushare 日线）
@@ -54,8 +60,9 @@ SINA_MAX_BARS = 1023             # 新浪单次请求上限（≈64 个交易日
 SINA_WIN = 62                    # 新浪可回补窗口（交易日数）
 BARS_PER_DAY = 16
 BS_TIMEOUT = 120                 # baostock 单次查询看门狗（连接半开有卡死前科）
-MAX_NEW_CODES = 120              # 跳过表单轮新增票数安全阀（正常首轮 ~86 只）
-MAX_NEW_DATES = 400              # 跳过表单轮新增日期数安全阀（正常首轮 ~90 个）
+MAX_BS_SEG_TD = 60               # baostock 单段最长交易日数（≈960 根 bar，单次查询秒级）
+MAX_NEW_CODES = 120              # 跳过表单轮新增票数安全阀（正常一轮 ~90 只）
+MAX_NEW_DATES_PER_CODE = 1800    # 跳过表单票新增日期安全阀（超过全部应覆盖交易日 → 判定链路异常）
 
 _CAL = None
 _BS_ON = False                   # baostock 登录态（卡死/断线后强制重登）
@@ -237,6 +244,7 @@ class M15Updater:
         self.meta_f = os.path.join(self.ts_dir, '_aux', 'meta_tickers.parquet')
         self.unavail = self._load_unavail()
         self.new_unavail = {}               # 本轮新增（提交时合并落盘）
+        self.no_ref = []                    # 日线参照库缺文件的票（本轮跳过，末尾告警）
         self._meta_df = None
         self._tgt = None
 
@@ -258,11 +266,19 @@ class M15Updater:
         new = self.new_unavail
         if not new:
             return
-        n_dates = sum(len(v) for v in new.values())
-        if len(new) > MAX_NEW_CODES or n_dates > MAX_NEW_DATES:
-            logger.warning(f'[m15] 疑似数据源大面积异常（本轮新增源缺 {len(new)} 只/{n_dates} 个日期 超阈值 '
-                           f'{MAX_NEW_CODES}只/{MAX_NEW_DATES}日期）——暂不写入跳过表，下轮自动重试')
+        over = {c: len(ds) for c, ds in new.items() if len(ds) > MAX_NEW_DATES_PER_CODE}
+        if over:
+            logger.warning(f'[m15] {len(over)} 只单票新增源缺日期超阈值 {MAX_NEW_DATES_PER_CODE}'
+                           f'（{", ".join(f"{c}:{n}" for c, n in list(over.items())[:5])}'
+                           f'{" …" if len(over) > 5 else ""}）——该票记录丢弃、下轮重试，其余票正常记录')
+            new = {c: ds for c, ds in new.items() if c not in over}
+        if len(new) > MAX_NEW_CODES:
+            logger.warning(f'[m15] 疑似数据源大面积异常（本轮新增源缺 {len(new)} 只 超阈值 '
+                           f'{MAX_NEW_CODES} 只）——暂不写入跳过表，下轮自动重试')
             return
+        if not new:
+            return
+        n_dates = sum(len(v) for v in new.values())
         for c, ds in new.items():
             self.unavail.setdefault(c, {}).update(ds)
         os.makedirs(os.path.dirname(UNAVAIL_F), exist_ok=True)
@@ -274,7 +290,7 @@ class M15Updater:
     # ------------------------------------------------------------------
 
     def update_m15(self, codes=None):
-        """15 分钟线（不复权原值）：窗内缺口→新浪（并发）；更早缺口→baostock 最小缺口区间（逐票续传）。
+        """15 分钟线（不复权原值）：按缺口日期分流——新浪窗内（并发）/ 窗外老段（baostock，分段落盘续传）。
 
         源缺自动跳过：baostock 成功返回但缺口日期无数据 → 记入跳过表，此后各轮不再请求。
         """
@@ -292,15 +308,21 @@ class M15Updater:
                 if code in self.unavail and not self.force:
                     n_skipped += 1
                 continue
-            if plan[0] == 'sina':
-                sina[code] = plan[1:]
-            else:
-                bs_plan.append((code, *plan[1:]))
-        logger.info(f'[m15] 新浪 {len(sina)} 只 / baostock {len(bs_plan)} 只'
+            sp, segs = plan
+            if sp is not None:
+                sina[code] = sp
+            if segs:
+                bs_plan.append((code, segs))
+        n_seg = sum(len(s) for _, s in bs_plan)
+        if self.no_ref:
+            logger.warning(f'[m15] {len(self.no_ref)} 只在日线参照库（{os.path.basename(self.ts_dir)}）无 CSV '
+                           f'→ 本轮不巡缺口（缺口=日线 volume>0 且有成交日）: '
+                           f'{", ".join(self.no_ref[:10])}{" …" if len(self.no_ref) > 10 else ""}')
+        logger.info(f'[m15] 新浪 {len(sina)} 只 / baostock {len(bs_plan)} 只（{n_seg} 段）'
                     + (f'（跳过表命中 {n_skipped} 只）' if n_skipped else '')
-                    + ('（baostock 单线程慢扫、逐票落盘续传，可 --codes 分批）' if bs_plan else ''))
+                    + ('（baostock 单线程慢扫、逐段落盘续传，可 --codes 分批）' if bs_plan else ''))
         rows_by_code = {}
-        done, t0 = 0, time.time()
+        written, done, t0 = set(), 0, time.time()
         with ThreadPoolExecutor(max_workers=6) as ex:
             futs = {ex.submit(self._fetch_m15, c, dl): (c, fm) for c, (dl, fm) in sina.items()}
             for f in as_completed(futs):
@@ -311,37 +333,36 @@ class M15Updater:
                     rows_by_code[c] = (f.result(), fm)
                 except Exception as e:
                     _fail('[m15]', c, e, failed)
-        nw = 0
         for code, (rows, fm) in rows_by_code.items():
             if rows is None or rows.empty:
                 continue
             if self._m15_upsert(code, rows, force_merge=fm):
-                nw += 1
-        t0 = time.time()
-        for i, (code, start, end, miss) in enumerate(bs_plan, 1):
-            try:
-                rows = self._fetch_m15_bs(code, start, end)
-                if miss is not None:
+                written.add(code)
+        t0, seg_i, today = time.time(), 0, pd.Timestamp.now().strftime('%Y-%m-%d')
+        for i, (code, segs) in enumerate(bs_plan, 1):
+            for start, end, seg_miss in segs:
+                seg_i += 1
+                try:
+                    rows = self._fetch_m15_bs(code, start, end)
                     got = set(rows['date']) if len(rows) else set()
-                    lack = [d for d in miss if d not in got]
+                    lack = sorted(seg_miss - got)
                     if lack:
                         self.new_unavail.setdefault(code, {})
-                        today = pd.Timestamp.now().strftime('%Y-%m-%d')
                         for d in lack:
                             self.new_unavail[code][d] = today     # 源缺：记录并跳过后续轮次
                     if len(rows):
-                        rows = rows[[d in miss for d in rows['date']]]
-                if len(rows) and self._m15_upsert(code, rows, force_merge=True):
-                    nw += 1
-            except Exception as e:
-                _fail('[m15]', code, e, failed)                    # 异常不记录（下轮自然重试）
+                        rows = rows[[d in seg_miss for d in rows['date']]]
+                        if self._m15_upsert(code, rows, force_merge=True):
+                            written.add(code)
+                except Exception as e:
+                    _fail('[m15]', code, e, failed)                # 异常不记录（下轮自然重试）
             _progress(i, len(bs_plan), t0, '[m15] baostock',
-                      f'已写 {nw} 失败 {len(failed)} 未处理 {len(bs_plan) - i}', every=3)
+                      f'段 {seg_i}/{n_seg} 已写 {len(written)} 失败 {len(failed)}', every=2)
         self._commit_unavail()
         if self.unavail:
             n_dates = sum(len(v) for v in self.unavail.values())
             logger.info(f'[m15] 源缺跳过表：累计 {len(self.unavail)} 只 / {n_dates} 个日期（--force 可强制重试）')
-        logger.info(f'[m15] 更新 {nw}/{len(codes)} 只，失败 {len(failed)} 只（重跑续传）')
+        logger.info(f'[m15] 更新 {len(written)}/{len(codes)} 只，失败 {len(failed)} 只（重跑续传）')
 
     # ==================== 内部：边界判定 ====================
 
@@ -399,32 +420,29 @@ class M15Updater:
     # ==================== 内部：m15（新浪补缺口 / baostock 老段） ====================
 
     def _plan_m15(self, code, cal, end_td):
-        """该票 m15 缺口计划 → ('sina', datalen, force_merge) / ('bs', start, end, miss_set|None) / None（已齐）。
+        """该票 m15 缺口计划 → (新浪计划, baostock 分段) / None（已齐）。
 
-        新浪只支持"最近 N 根"（≈64 交易日窗）：窗内缺口用新浪（快、可并发）；
-        窗口外的老缺口用 baostock 只拉「最早~最晚缺口」区间、库起点起整段才拉全（单线程、可续传）。
+        新浪计划 (datalen, force_merge)：只覆盖新浪窗内的缺口（快、可并发）；
+        baostock 分段 [(start, end, miss_set), ...]：窗外的老缺口按缺口日期切小段，
+        每段只覆盖真正缺的日期（禁止用「最早~最晚缺口」整段拉，否则 1~3 天的零星缺口
+        会把中间已入库的年份全拉一遍，单请求跨度可到数年 → 卡死/超时）。
+
         已记入"源缺跳过表"的日期直接剔除（--force 时忽略）。
         只要求「真成交日」（日线 volume>0）的分钟 bar：停牌日没有任何源的 bar，不算缺口。
         """
-        path = os.path.join(M15_DIR, f'{code}.csv')
-        start_td = self._start_of(code) or FLOOR
-        i_end = bisect.bisect_left(cal, end_td)
-        if not os.path.exists(path):
-            return ('bs', start_td, end_td, None)
-        dates = set(pd.read_csv(path, usecols=['date'], dtype={'date': str})['date'])
-        if not dates:
-            return ('bs', start_td, end_td, None)
         dp = os.path.join(self.ts_dir, f'{code}.csv')
-        if os.path.exists(dp):
-            dd = pd.read_csv(dp, usecols=['date', 'volume'], dtype={'date': str})
-            expect = set(dd.loc[pd.to_numeric(dd['volume'], errors='coerce') > 0, 'date'])
-        else:
-            # 参照库无该票文件（且 m15 已有数据）→ 不巡：无 volume 参照会把停牌日误判为缺口
-            # （如 v2 库不含的个别票；其缺口巡检由相关参照库存在的管线负责）
+        if not os.path.exists(dp):
+            # 缺口判定依赖日线参照库（volume>0 = 应有 bar）：缺参照就无法区分停牌日 → 不巡，末尾告警
+            self.no_ref.append(code)
             return None
-        lo = self._start_of(code) or min(dates)
+        dd = pd.read_csv(dp, usecols=['date', 'volume'], dtype={'date': str})
+        expect = set(dd.loc[pd.to_numeric(dd['volume'], errors='coerce') > 0, 'date'])
+        path = os.path.join(M15_DIR, f'{code}.csv')
+        have = set(pd.read_csv(path, usecols=['date'], dtype={'date': str})['date']) if os.path.exists(path) else set()
+        lo = self._start_of(code) or (min(have) if have else FLOOR)
         i0 = bisect.bisect_left(cal, lo)
-        miss = [d for d in cal[i0:i_end + 1] if d not in dates and (expect is None or d in expect)]
+        i_end = bisect.bisect_left(cal, end_td)
+        miss = [d for d in cal[i0:i_end + 1] if d in expect and d not in have]
         if not miss:
             return None
         if not self.force and code in self.unavail:
@@ -432,10 +450,34 @@ class M15Updater:
             miss = [d for d in miss if d not in skip]
             if not miss:
                 return None
-        if miss[0] < cal[max(0, i_end - SINA_WIN)]:
-            return ('bs', miss[0], miss[-1], set(miss))   # 老缺口超出新浪窗 → baostock 只拉缺口区间
-        datalen = min(SINA_MAX_BARS, (i_end - bisect.bisect_left(cal, miss[0]) + 1) * BARS_PER_DAY + BARS_PER_DAY)
-        return ('sina', datalen, min(miss) <= max(dates))   # 缺口中段→合并；仅尾部→追加
+        # 新浪只给「最近 N 根 bar」，窗口必须锚在最新交易日（而非该票 end_td）：退市票的老窗口
+        # 早已超出新浪可回溯范围，交给 baostock
+        i_now = bisect.bisect_left(cal, self._target_date())
+        cut = cal[max(0, i_now - SINA_WIN)]      # 新浪可回补窗口起点（含）
+        recent = [d for d in miss if d >= cut]
+        old = [d for d in miss if d < cut]
+        sina = None
+        if recent:
+            datalen = min(SINA_MAX_BARS, (i_now - bisect.bisect_left(cal, recent[0]) + 1) * BARS_PER_DAY + BARS_PER_DAY)
+            sina = (datalen, bool(have) and min(recent) <= max(have))   # 缺口中段→合并；仅尾部→追加
+        return sina, self._bs_segments(old, cal)
+
+    @staticmethod
+    def _bs_segments(dates, cal):
+        """老缺口交易日 → baostock 小段：段内相邻缺口归并（一次请求），单段跨度 ≤ MAX_BS_SEG_TD 交易日。
+
+        零星缺口（多为源缺/事故日）因此各自成段，只查那几天而不是整段年份。
+        """
+        segs, k = [], 0
+        while k < len(dates):
+            a = bisect.bisect_left(cal, dates[k])
+            m = k
+            while m + 1 < len(dates) and bisect.bisect_left(cal, dates[m + 1]) - a < MAX_BS_SEG_TD:
+                m += 1
+            part = dates[k:m + 1]
+            segs.append((part[0], part[-1], set(part)))
+            k = m + 1
+        return segs
 
     def _fetch_m15(self, code, datalen):
         sym = code.replace('.', '')
