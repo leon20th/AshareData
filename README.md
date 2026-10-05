@@ -70,3 +70,15 @@ from AshareData.dataloader import KlineDataConfig, build_train_and_val_dataloade
 - 所有路径经 `AshareData.paths` 自动寻址，不依赖外部环境变量或工程配置。
 - 交易元数据（股票代码表 / 交易日历）随仓库携带于 `utils/exchanges_meta/`。
 - `dataset/` 与运行期临时文件不入库，由使用方自行准备 / 生成。
+- **问财登录**：账号密码存 `AshareData/.cache/tsh_account.json`（`setup.sh` 写入，不进 git）。
+  若站点要求**短信二次验证**（风险处置页），登录会在命令行提示输入手机收到的验证码（无法绕过）；
+  成功后 cookies 写入 `.cache/wencai_cookies.json`，之后各抓取任务直接复用。
+  手动刷新 cookies：`python AshareData/utils/tsh_utils/login_util.py`（默认有头；`--headless` 无头；`--manual` 纯手动）。
+  注：非交互终端（无人值守）不会等待输入，会直接以匿名会话继续。
+  滑块验证码图取不到时（`captcha.10jqka.com.cn`）会自动重试，连续失败会明确提示并建议改用 `--manual`；
+  `--manual` 会等你手动完成（含短信验证）并自动保存 cookies（最多 5 分钟）。
+  登录按“验证阶段”循环处理：滑块与短信“安全验证”可**任意顺序/重复出现**（如 滑块→短信→再滑块），
+  逐阶段处理直到主页面“登录”入口消失即判成功并写 cookies；被服务器拒绝（如密码错误）会立即停止防锁号。
+  **登录失败时会提示改用浏览器手动登录**：可跑 `--manual`（脚本代劳），或自行在浏览器登录
+  https://www.iwencai.com 后导出 cookies 覆盖 `.cache/wencai_cookies.json`——该文件兼容
+  EditThisCookie 导出的 JSON 列表、`{"名":"值"}` 对象、或 `"k=v; k2=v2"` 字符串三种格式。
