@@ -61,7 +61,7 @@ from AshareData.dataloader import KlineDataConfig, build_train_and_val_dataloade
 
 ## 依赖与外部文件
 
-- Python 3.9+（依赖只设下限，`pip` 自动选择与当前解释器兼容的版本，不要求固定 Python 版本；仅 `pandas` 带 `<3` 上限，以保证各机器写出的数据 dtype 一致）；依赖清单见 `requirements.txt`（`setup.sh` 自动安装）：`pandas`、`pyarrow`、`polars`、`numpy`、`tqdm`、`selenium`、`baostock`、`openpyxl`、`pypinyin`（可选）、`tushare`、`torch`/`torchvision`（滑块定位模型）、`huggingface-hub`（外部模型下载）。
+- Python 3.9+（依赖只设下限，`pip` 自动选择与当前解释器兼容的版本，不要求固定 Python 版本；仅 `pandas` 带 `<3` 上限，以保证各机器写出的数据 dtype 一致）；依赖清单见 `requirements.txt`（`setup.sh` 自动安装）：`pandas`、`pyarrow`、`polars`、`numpy`、`tqdm`、`selenium`、`baostock`、`openpyxl`、`pypinyin`（可选）、`tushare`、`torch`/`torchvision`（滑块定位模型）、`huggingface-hub`（外部模型下载）、`openai`（KPL 细分/行级映射，DeepSeek 协议）、`sentence-transformers`（题材理由嵌入）。
 - **chromedriver**：爬虫用；`setup.sh` 安装到 `~/.asharedata_deps/`，按 环境变量 `CHROME_DRIVER_PATH` → 该目录 → 系统路径 → `PATH` 依次探测。
 - **外部模型**：`Fin-Retriever-base`（中文金融检索 BERT，sentence-transformers 格式，768 维，用于涨停原因 / 概念文本嵌入）由 `setup.sh` 自动下载到 `models/Fin-Retriever-base`（不入库）；运行期经 `AshareData.paths.FIN_RETRIEVER_DIR` 寻址。
 - **子模块**：首次克隆后执行 `git submodule update --init`。
