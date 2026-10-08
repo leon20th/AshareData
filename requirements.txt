@@ -6,6 +6,8 @@
 # 需要复现精确环境时用 requirements.lock 或 pip freeze。
 baostock>=0.8.9
 beautifulsoup4>=4.12
+# 外部模型下载（setup.sh 用 snapshot_download 拉取 models/Fin-Retriever-base）
+huggingface-hub>=0.20
 lxml>=5.0
 numpy>=1.24
 openpyxl>=3.1

@@ -3,6 +3,7 @@
 #   1) 同花顺账号密码 + 扶摇 API Key + tushare token → 写入本地缓存（已配置则跳过；可用环境变量非交互传入）
 #   2) 安装 Python 依赖（requirements.txt）
 #   3) 安装 Chrome + chromedriver（macOS / Linux 自动分支）
+#   4) 下载外部模型（Fin-Retriever-base → models/，不入库；已存在则跳过）
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -96,7 +97,7 @@ fi
 # ---------------- 2. Python 依赖 ----------------
 PYTHON="${PYTHON:-$(command -v python || command -v python3 || echo python3)}"
 echo "==> Python 依赖（${PYTHON}）"
-if "$PYTHON" -c "import pandas, numpy, polars, pyarrow, openpyxl, requests, tqdm, bs4, lxml, selenium, baostock, pypinyin, torch, torchvision, PIL, tushare" 2>/dev/null; then
+if "$PYTHON" -c "import pandas, numpy, polars, pyarrow, openpyxl, requests, tqdm, bs4, lxml, selenium, baostock, pypinyin, torch, torchvision, PIL, tushare, huggingface_hub" 2>/dev/null; then
     echo "依赖已满足，跳过安装"
 elif ! "$PYTHON" -m pip install -r "$ROOT/requirements.txt"; then
     echo "pip 安装失败。若报 externally-managed-environment（系统 Python 限制），请指定虚拟环境的解释器重跑：" >&2
@@ -163,6 +164,22 @@ else
     command -v unzip >/dev/null || sudo apt-get install -y unzip
     CHROME_VER="$(google-chrome --version | awk '{print $NF}')"
     install_chromedriver "$DEPS_DIR" "linux64" "$CHROME_VER"
+fi
+
+# ---------------- 4. 外部模型 ----------------
+# Fin-Retriever-base：涨停原因 / 概念文本嵌入用中文金融检索 BERT（sentence-transformers，768 维，max 512）
+# 落盘 models/（不入库）；已存在 config.json 则跳过。源：https://huggingface.co/valuesimplex-ai-lab/Fin-Retriever-base
+FIN_RETRIEVER_DIR="$ROOT/models/Fin-Retriever-base"
+if [ -f "$FIN_RETRIEVER_DIR/config.json" ]; then
+    echo "==> Fin-Retriever-base 已就绪，跳过下载"
+else
+    echo "==> 下载 Fin-Retriever-base（首次约 400MB）"
+    if "$PYTHON" -c "import sys; from huggingface_hub import snapshot_download; snapshot_download('valuesimplex-ai-lab/Fin-Retriever-base', local_dir=sys.argv[1])" "$FIN_RETRIEVER_DIR"; then
+        echo "Fin-Retriever-base 已安装: $FIN_RETRIEVER_DIR"
+    else
+        echo "注意：Fin-Retriever-base 下载失败，涨停原因/概念文本嵌入相关功能暂不可用（可稍后重跑本脚本）" >&2
+        echo "      国内网络可加镜像重跑：HF_ENDPOINT=https://hf-mirror.com ./setup.sh" >&2
+    fi
 fi
 
 echo

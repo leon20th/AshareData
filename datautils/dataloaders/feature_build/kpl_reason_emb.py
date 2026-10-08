@@ -22,7 +22,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from AshareData.paths import BUILT_DATA_DIR
+from AshareData.paths import BUILT_DATA_DIR, FIN_RETRIEVER_DIR
 from AshareData.datautils.dataloaders.feature_build.feature_utils import (
     get_code_idx,
     get_trade_date_idx,
@@ -33,7 +33,7 @@ EMB = f'{BUILT_DATA_DIR}/kpl_reason_emb.parquet'
 PCA_NPZ = f'{BUILT_DATA_DIR}/kpl_reason_pca16.npz'
 EMB16 = f'{BUILT_DATA_DIR}/kpl_reason_emb16.parquet'
 EVENT_FEAT_PARQUET = f'{BUILT_DATA_DIR}/event_feat.parquet'
-MODEL_DIR = 'business_models/external_models/Fin-Retriever-base'
+MODEL_DIR = FIN_RETRIEVER_DIR
 N_PCA = 16
 KPE_COLUMNS = [f'kpe_{i}' for i in range(N_PCA)]
 
