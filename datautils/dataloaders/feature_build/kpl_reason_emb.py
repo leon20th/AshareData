@@ -1,7 +1,7 @@
 """KPL 涨停原因 Fin-Retriever 嵌入 + 冻结 PCA16（2026-09-25 生产化）。
 
 每日链增量（无新事件秒退）：
-  kpl_events.reason_txt → 增量嵌入（GPU 空闲用 GPU / 忙或无卡自动退 CPU）
+  kpl_events.reason_txt → 增量嵌入（CUDA 空闲用 CUDA / 忙则退 CPU；macOS 用 MPS；都无则 CPU）
   → built_data/kpl_reason_emb.parquet    事件级嵌入（date, code, emb[768]，L2 归一化）
   → 冻结 PCA16（kpl_reason_pca16.npz）  → built_data/kpl_reason_emb16.parquet（kpe_0..15）
   → 并入 event_feat.parquet（outer merge，与 kp_* 同法；无事件行补 0）
@@ -44,10 +44,12 @@ def _clean(s: pd.Series) -> pd.Series:
 
 def _device() -> str:
     import torch
-    if not torch.cuda.is_available():
-        return 'cpu'
-    free, _ = torch.cuda.mem_get_info()
-    return 'cuda' if free > 2.5e9 else 'cpu'
+    if torch.cuda.is_available():
+        free, _ = torch.cuda.mem_get_info()
+        return 'cuda' if free > 2.5e9 else 'cpu'
+    if torch.backends.mps.is_available():      # macOS 无 CUDA：走 MPS（真实长文本实测 ~2~3x）
+        return 'mps'
+    return 'cpu'
 
 
 def build_reason_emb(force_rebuild: bool = False, batch: int = 256) -> int:
