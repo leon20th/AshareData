@@ -9,7 +9,7 @@ AshareData/
 ├── dataloader.py                  # 训练/推理数据出口（parquet → numpy 样本）
 ├── paths.py                       # 路径寻址（以本包位置为基准自动定位）
 ├── datautils/
-│   ├── dataloaders/feature_build/ # 特征构建（base_feature / 涨跌停 / 市场统计 / 龙虎榜 / 横截面排名 / 股性 traits / 开盘啦事件结构）
+│   ├── dataloaders/feature_build/ # 特征构建（base_feature / 涨跌停 / 市场统计 / 龙虎榜 / 横截面排名 / 股性 traits / 开盘啦事件结构 / 新闻快讯计数）
 │   ├── kline_scripts/             # 行情构建（v2=quick_kline / tushare 版=tushare_kline）/ 15分钟线 / 停牌名单 / update_all 统一入口
 │   └── regime_scripts/            # 爬虫（涨停板 / 跌停板 / 龙虎榜 / 开盘啦题材榜）
 └── utils/
@@ -33,7 +33,7 @@ AshareData/
 | `scrap_data/longhu/` | 龙虎榜抓取产物（json） |
 | `scrap_data/kaipanla/` | 开盘啦题材榜抓取产物（json） |
 | `built_data/base_feature/` | 特征产物 `<code>.parquet` + `meta.json` |
-| `built_data/*.parquet` | 涨跌停 / 市场统计 / 龙虎榜 / 横截面排名 / 股性 traits（t_*）/ 事件结构（ev_*、kp_*）特征 |
+| `built_data/*.parquet` | 涨跌停 / 市场统计 / 龙虎榜 / 横截面排名 / 股性 traits（t_*）/ 事件结构（ev_*、kp_*）/ 新闻快讯计数（nw_*）特征 |
 
 ## 快速使用
 
@@ -61,8 +61,9 @@ from AshareData.dataloader import KlineDataConfig, build_train_and_val_dataloade
 
 ## 依赖与外部文件
 
-- Python 3.9+（依赖只设下限，`pip` 自动选择与当前解释器兼容的版本，不要求固定 Python 版本；仅 `pandas` 带 `<3` 上限，以保证各机器写出的数据 dtype 一致）；依赖清单见 `requirements.txt`（`setup.sh` 自动安装）：`pandas`、`pyarrow`、`polars`、`numpy`、`tqdm`、`selenium`、`baostock`、`openpyxl`、`pypinyin`（可选）、`tushare`、`torch`/`torchvision`（滑块定位模型）。
+- Python 3.9+（依赖只设下限，`pip` 自动选择与当前解释器兼容的版本，不要求固定 Python 版本；仅 `pandas` 带 `<3` 上限，以保证各机器写出的数据 dtype 一致）；依赖清单见 `requirements.txt`（`setup.sh` 自动安装）：`pandas`、`pyarrow`、`polars`、`numpy`、`tqdm`、`selenium`、`baostock`、`openpyxl`、`pypinyin`（可选）、`tushare`、`torch`/`torchvision`（滑块定位模型）、`huggingface-hub`（外部模型下载）。
 - **chromedriver**：爬虫用；`setup.sh` 安装到 `~/.asharedata_deps/`，按 环境变量 `CHROME_DRIVER_PATH` → 该目录 → 系统路径 → `PATH` 依次探测。
+- **外部模型**：`Fin-Retriever-base`（中文金融检索 BERT，sentence-transformers 格式，768 维，用于涨停原因 / 概念文本嵌入）由 `setup.sh` 自动下载到 `models/Fin-Retriever-base`（不入库）；运行期经 `AshareData.paths.FIN_RETRIEVER_DIR` 寻址。
 - **子模块**：首次克隆后执行 `git submodule update --init`。
 
 ## 说明

@@ -122,3 +122,11 @@ if __name__ == '__main__':
         kpl_reason_emb_update()
     except Exception as exc:
         print(f'[kpl] 原因嵌入更新跳过: {exc}')
+    # 新闻快讯标签计数特征 → news_features.parquet（东财 7x24 + 财联社；全量重建 ~8s；
+    # 原始快讯缺失则跳过，不阻断）
+    try:
+        from AshareData.datautils.dataloaders.feature_build.news_features import (
+            build_news_features)
+        build_news_features(force_rebuild=True)
+    except Exception as exc:
+        print(f'[news] 新闻特征更新跳过: {exc}')
