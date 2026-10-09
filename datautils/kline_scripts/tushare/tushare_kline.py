@@ -17,7 +17,9 @@
      交易日历/目标日                ——              沿用本地 a_open（baostock 维护），与全站一致
 
   3. 抓取策略（最小请求）：
-     - daily：按票缺口贪心分批（多代码一次调用，6000 行/次上限）；只请求缺失区间（冷建多取库起点前一段）。
+     - daily：按票缺口同窗口分组分批（一次调用 ts_code ≤ 1000、行数 ≤ 6000）；只请求缺失区间
+             （冷建多取库起点前一段）。稳态增量（库尾已规范化、缺口全在库尾之后 —— 绝大多数只补
+             最新交易日）只把新行**追加**到文件尾，不重读重写全史；其余走"合并 + 占位 + 重写整表"。
              turn（daily_basic）与 isST（stock_st）都是"当日全市场"接口，故先按本轮要新增的交易日
              各抓一次（多线程 + 全局限速），落盘时与 OHLCV 一并写好 —— 每只票每轮**只写一次**。
      - adj  ：按交易日缺口全市场各取一次；已抓日期记 _aux/adj_fetch_log.json。
@@ -34,7 +36,7 @@
   python AshareData/datautils/kline_scripts/tushare/tushare_kline.py --latest   # 只问库状态，不抓数据
   python AshareData/datautils/kline_scripts/tushare/tushare_kline.py --probe    # 连通性/权限自检（不写数据）
 token: 环境变量 TUSHARE_TOKEN 优先，其次 AshareData/.keys/.tushare_token（单行纯文本；配置见 setup.sh）
-参考耗时（全市场 2020 起冷建）：日线部分 ≈5.1k 次调用、约 15 分钟；turn/isST 各 1636 次当日接口调用（多线程 ≈10 分钟）。此后增量只补新交易日，且每票每轮只写一次。
+参考耗时（全市场 2020 起冷建）：日线部分 ≈5.1k 次调用、约 15 分钟；turn/isST 各 1636 次当日接口调用（多线程 ≈10 分钟）。此后增量只补新交易日，且每票每轮只写一次；稳态增量（1 个交易日 / 5224 只）实测 14s，其中扫全库库尾 ≈7s、6 次 daily 调用 + 追加 ≈6s。
 """
 import argparse
 import bisect
@@ -69,7 +71,7 @@ COLS = ['date', 'code', 'open', 'high', 'low', 'close', 'preclose',
 FLOOR = '2020-01-02'            # 库起点（与全站消费链对齐）
 PRE_FLOOR = '2019-10-01'        # 冷建时多取一段：供"首行前收基准"（库起点前末收盘）
 BATCH_ROWS = 5500               # daily 单次调用行数上限（接口 6000，留余量）
-BATCH_CODES = 50                # daily 单次调用代码数上限
+BATCH_CODES = 1000              # daily 单次调用代码数上限（接口硬限制：ts_code 列表 ≤ 1000）
 FLUSH_N = 300                   # adj 抓取过程每 N 个交易日落一次盘（控内存）
 WORKERS = 6                     # 并发抓取线程数（总频率由 _pace 统一限速）
 PACE_GAP = 0.15                 # 全局最小请求间隔（秒）≈ 400 次/分，留出 500/分限频余量
@@ -299,6 +301,37 @@ def write_ts(code, df):
     df.to_csv(os.path.join(TS_DIR, f'{code}.csv'), index=False)
 
 
+def read_scan(code):
+    """扫描用轻读（缺口/库尾判定只要粗略数值，省掉 round_trip 的精确往返开销）。"""
+    p = os.path.join(TS_DIR, f'{code}.csv')
+    return pd.read_csv(p, dtype={'date': str}) if os.path.exists(p) else pd.DataFrame(columns=COLS)
+
+
+def _tail_ok(df):
+    """库尾是否已规范化——是则新行可直接追加到文件尾，不必重读重写全史。
+
+    等价于「旧行再走一遍 _materialize + write_ts 也不会有任何变化」：真成交行价格/前收/涨跌幅/
+    量额/换手齐全（首行无前收 = 新股，豁免），停牌行已归零留空，tradestatus 与 volume 一致，
+    isST 无空，日期升序无重复。
+    """
+    a = df[['volume', 'close', 'preclose', 'amount', 'turn', 'pctChg', 'tradestatus', 'isST']].to_numpy(dtype='float64')
+    v, c, pre, amt, turn, pct, ts, st = a.T
+    real, off = v > 0, ~(v > 0)
+    if not df['date'].is_monotonic_increasing or df['date'].duplicated().any() or (ts != real).any():
+        return False
+    if not (np.isfinite(st).all() and np.isfinite(c[real]).all() and (c[real] > 0).all()
+            and np.isfinite(amt[real]).all() and np.isfinite(turn[real]).all()):
+        return False
+    if off.any() and not ((v[off] == 0) & (amt[off] == 0)
+                          & ~np.isfinite(turn[off]) & ~np.isfinite(pct[off])).all():
+        return False
+    for arr in (pre[real], pct[real]):                  # 首行（新股）无前收/涨跌幅 → 豁免
+        blank = ~np.isfinite(arr)
+        if blank.any() and not (blank[0] and blank.sum() == 1):
+            return False
+    return True
+
+
 # ==================== 构建器 ====================
 
 class TushareKline:
@@ -362,13 +395,17 @@ class TushareKline:
         logger.info(f'[meta] {len(df)} 只（' + '，'.join(f'{k}={v}' for k, v in sorted(n.items())) + '）')
 
     def update_daily(self, codes=None):
-        """OHLCV+前收/涨跌幅（含停牌占位行）：按票缺口贪心分批，多代码一次调用。"""
+        """OHLCV+前收/涨跌幅（含停牌占位行）：按票缺口同窗口合批，多代码一次调用。
+
+        库尾已规范化、缺口全在库尾之后的票（稳态增量：绝大多数）只把新行追加到文件尾，
+        不重读重写全史；其余（冷建/补洞/停牌占位/待回填 turn·isST）走全量路径：合并 + 归位 + 重写。
+        """
         codes = self._codes(codes)
         tgt = self._target_date()
         cal = _cal()
-        plan, cold = {}, {}
+        plan, cold, tail = {}, {}, {}
         for code in codes:
-            df = read_ts(code)
+            df = read_scan(code)
             s, e = self._start_of(code), self._end_of(code)
             if s is None:
                 if df.empty:
@@ -390,6 +427,8 @@ class TushareKline:
             if df.empty and s == FLOOR:
                 fs = PRE_FLOOR                   # 冷建多取一段 → 首行前收基准
             plan[code] = (fs, e)
+            if not df.empty and str(fs) > str(df['date'].iloc[-1]) and _tail_ok(df):
+                tail[code] = str(df['date'].iloc[-1])       # 新行可直接追加，无需重读全史
         if not plan:
             logger.info('[daily] 各票均无缺口 → 跳过')
             return
@@ -400,14 +439,22 @@ class TushareKline:
         n_cold = sum(cold.values())
         batches = self._batch_daily(plan, cal, tgt)
         logger.info(f'[daily] 需补 {len(plan)} 只' + (f'（其中冷建 {n_cold} 只）' if n_cold else '')
-                    + f'，分 {len(batches)} 批（{WORKERS} 线程并发）')
+                    + f'，分 {len(batches)} 批（{WORKERS} 线程并发）'
+                    + (f'，其中 {len(tail)} 只只追加尾行' if tail else ''))
 
         def work(batch):
             fs = min(plan[c][0] for c in batch)
             resp = _ts_daily([_ts_code(c) for c in batch], _ymd(fs), _ymd(tgt))
             pub_today = len(resp) > 0 and str(resp['trade_date'].max()) == _ymd(tgt)
             by = {ts: g for ts, g in resp.groupby('ts_code', observed=True)} if len(resp) else {}
-            return sum(1 for c in batch if self._apply_daily(c, by.get(_ts_code(c)), pub_today))
+            n = 0
+            for c in batch:
+                sub, ld = by.get(_ts_code(c)), tail.get(c)
+                got = self._append_daily(c, sub, ld, pub_today) if ld is not None else None
+                if got is None:                            # 不能只追加 → 全量合并 + 归位 + 重写
+                    got = self._apply_daily(c, sub, pub_today)
+                n += got
+            return n
 
         n, t0 = 0, time.time()
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
@@ -582,53 +629,59 @@ class TushareKline:
             self._tgt = pd.to_datetime(t).strftime('%Y-%m-%d') if t else pd.Timestamp.now().strftime('%Y-%m-%d')
         return self._tgt
 
-    # ==================== 内部：daily 分批 / 合并 / 占位 ====================
+    # ==================== 内部：daily 分批 / 合并 / 追加 / 占位 ====================
+
+    def _source_rows(self, code, sub):
+        """tushare daily 响应 → 13 列源行（手→股 / 千元→元；turn/tradestatus/isST 待填）。"""
+        if sub is None or not len(sub):
+            return None
+        d = pd.DataFrame({
+            'date': [_iso(str(x)) for x in sub['trade_date']],
+            'code': code,
+            'open': pd.to_numeric(sub['open'], errors='coerce'),
+            'high': pd.to_numeric(sub['high'], errors='coerce'),
+            'low': pd.to_numeric(sub['low'], errors='coerce'),
+            'close': pd.to_numeric(sub['close'], errors='coerce'),
+            'preclose': pd.to_numeric(sub['pre_close'], errors='coerce'),
+            # 手→股 / 千元→元；取整消除 float 乘法的 1ulp 噪声（成交量本身即整数股）
+            'volume': np.round(pd.to_numeric(sub['vol'], errors='coerce') * 100, 0),
+            'amount': np.round(pd.to_numeric(sub['amount'], errors='coerce') * 1000, 4),
+            'turn': np.nan, 'tradestatus': 0,
+            'pctChg': pd.to_numeric(sub['pct_chg'], errors='coerce'),
+            'isST': np.nan})
+        return d.sort_values('date').drop_duplicates('date', keep='last')
 
     def _batch_daily(self, plan, cal, tgt):
-        """按单次 6000 行上限贪心分批（行数 ≈ 区间交易日数；PRE_FLOOR 段计入）。"""
-        batches, cur, rows = [], [], 0
-        for code in sorted(plan):
-            fs, e = plan[code]
-            d = max(1, bisect.bisect_right(cal, min(e, tgt)) - bisect.bisect_left(cal, fs))
-            if cur and (rows + d > BATCH_ROWS or len(cur) >= BATCH_CODES):
-                batches.append(cur)
-                cur, rows = [], 0
-            cur.append(code)
-            rows += d
-        if cur:
-            batches.append(cur)
+        """按 (起点, 终点) 同窗口分组分批：单次调用行数 ≈ 组内票数 × 窗口交易日数（接口 6000）。
+
+        同窗口才合批——一次调用内所有代码共用同一个 [start, end]，长短窗口混批时，长窗口的票会把
+        短窗口的票挤出 6000 行上限（静默丢行）；另受 ts_code 列表 ≤ 1000 的硬限制。
+        """
+        groups = {}
+        for code, se in plan.items():                       # plan 按代码序建，组序即代码序
+            groups.setdefault(se, []).append(code)
+        batches = []
+        for (fs, e), cs in groups.items():
+            days = max(1, bisect.bisect_right(cal, min(e, tgt)) - bisect.bisect_left(cal, fs))
+            per = max(1, min(BATCH_CODES, BATCH_ROWS // days))
+            batches += [cs[i:i + per] for i in range(0, len(cs), per)]
         return batches
 
     def _apply_daily(self, code, sub, pub_today):
-        """合并一批抓取行 → 归位（补占位）→ 写盘。返回是否写盘。"""
-        rows = None
-        if sub is not None and len(sub):
-            d = pd.DataFrame({
-                'date': [_iso(str(x)) for x in sub['trade_date']],
-                'code': code,
-                'open': pd.to_numeric(sub['open'], errors='coerce'),
-                'high': pd.to_numeric(sub['high'], errors='coerce'),
-                'low': pd.to_numeric(sub['low'], errors='coerce'),
-                'close': pd.to_numeric(sub['close'], errors='coerce'),
-                'preclose': pd.to_numeric(sub['pre_close'], errors='coerce'),
-                # 手→股 / 千元→元；取整消除 float 乘法的 1ulp 噪声（成交量本身即整数股）
-                'volume': np.round(pd.to_numeric(sub['vol'], errors='coerce') * 100, 0),
-                'amount': np.round(pd.to_numeric(sub['amount'], errors='coerce') * 1000, 4),
-                'turn': np.nan, 'tradestatus': 0,
-                'pctChg': pd.to_numeric(sub['pct_chg'], errors='coerce'),
-                'isST': np.nan})
-            d = d.sort_values('date').drop_duplicates('date', keep='last')
+        """合并一批抓取行 → 归位（补占位）→ 写盘（全量路径）。返回是否写盘。"""
+        rows = self._source_rows(code, sub)
+        if rows is not None:
             st = self._start_of(code)
             if st == FLOOR and code not in self._prev_mem:
-                pre = d[d['date'] < FLOOR]
+                pre = rows[rows['date'] < FLOOR]
                 if len(pre):
                     v = _num(pre['close'].iloc[-1])
                     if v is not None:
                         with self._lock:
                             self._prev_mem[code] = v              # 首行前收基准
             if st is not None:
-                d = d[d['date'] >= st]
-            rows = d.reset_index(drop=True)
+                rows = rows[rows['date'] >= st]
+            rows = rows.reset_index(drop=True)
         old = read_ts(code)
         if rows is None or not len(rows):
             if old.empty:
@@ -661,6 +714,52 @@ class TushareKline:
                 return False
         out['isST'] = out['isST'].astype(int)
         write_ts(code, out)
+        return True
+
+    def _tail_window(self, code, ld, pub_today):
+        """库尾之后「本该铺满」的交易日列表 = ld 之后到 min(目标日/退市日, 当天是否有源数据)。
+
+        pub_today=False（当日源未入库）时右端收到目标日前一交易日，与 _materialize 同规矩。
+        """
+        cal = _cal()
+        lo = bisect.bisect_right(cal, ld)
+        hi = bisect.bisect_right(cal, self._end_of(code))
+        if not pub_today:
+            hi = min(hi, bisect.bisect_left(cal, self._target_date()))
+        return cal[lo:hi]
+
+    def _append_daily(self, code, sub, ld, pub_today):
+        """库尾已规范化时只追加新行（不重读重写全史）；无法保证与全量路径等价 → None 走全量。
+
+        返回 True=已追加 / False=无可写（文件未动）/ None=交给调用方走全量路径。
+        只有「新行恰好铺满 _tail_window 且全是真成交行」才追加——差一个交易日就得插停牌占位行
+        （那是 _materialize 的活）。isST 源缺该日时全量路径本就会丢掉这些行、旧行不变：
+        全缺就等效地什么都不写，部分缺则交回全量路径。
+        """
+        want = self._tail_window(code, ld, pub_today)
+        rows = self._source_rows(code, sub)
+        if rows is not None:
+            rows = rows[rows['date'] > ld].reset_index(drop=True)
+        if rows is None or not len(rows):
+            return False if not want else None          # 源无该票行，且本就不该铺行 → 不写
+        if list(rows['date']) != want:
+            return None                                  # 差交易日（含停牌占位）→ 全量路径
+        if not (bool((pd.to_numeric(rows['volume'], errors='coerce') > 0).all())
+                and bool((pd.to_numeric(rows['close'], errors='coerce') > 0).all())):
+            return None                                  # 含非真成交行 → 需归位成占位行
+        dates = sorted(set(rows['date']))
+        self._fetch_turn(dates)
+        self._fetch_st(dates)
+        miss = [d for d in dates if d not in self._st_mem]
+        if miss:
+            return False if len(miss) == len(dates) else None
+        rows['turn'] = [self._turn_mem[d].get(code, np.nan) if d in self._turn_mem else np.nan
+                        for d in rows['date']]
+        rows['isST'] = [1 if code in self._st_mem[d] else 0 for d in rows['date']]
+        rows['tradestatus'] = 1
+        os.makedirs(TS_DIR, exist_ok=True)
+        rows.reindex(columns=COLS).to_csv(os.path.join(TS_DIR, f'{code}.csv'),
+                                          index=False, mode='a', header=False)
         return True
 
     def _materialize(self, df, code, pub_today):
