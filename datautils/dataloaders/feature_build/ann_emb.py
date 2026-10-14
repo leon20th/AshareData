@@ -57,8 +57,6 @@ TITLE_INDEX = f'{BUILT_DATA_DIR}/ann_title_index.txt'
 TITLE_MAT = f'{BUILT_DATA_DIR}/ann_title_emb.f16.npy'
 
 # ---- 临时文件 ----
-MEAN_TMP = f'{BUILT_DATA_DIR}/_ann_cell_mean.f16.npy'
-ANN_EMB_TMP = f'{BUILT_DATA_DIR}/_ann_emb.tmp.npy'
 TITLE_MAT_TMP = f'{BUILT_DATA_DIR}/_ann_title_emb.tmp.npy'
 
 MODEL_DIR = FIN_RETRIEVER_DIR
@@ -170,8 +168,14 @@ def build_title_emb(titles: np.ndarray, batch: int = 512) -> dict:
 # --------------------------------------------------------------------------- #
 # 3) 格子均值 + 按列标准化 → ann_index.npy + ann_emb.f16.npy
 # --------------------------------------------------------------------------- #
-def build_cell_table(t2i: dict, keys: np.ndarray, titles: np.ndarray) -> int:
-    """格子均值 + 按列标准化，写出 (index, npy) 两个文件。返回格子数。"""
+def build_cell_table(t2i: dict, keys: np.ndarray, titles: np.ndarray,
+                     dst_index: str = ANN_INDEX, dst_emb: str = ANN_EMB) -> int:
+    """格子均值 + 按列除以 std，写出 (index, npy) 两个文件。返回格子数。
+
+    dst_* 可覆盖：`--limit-files` 冒烟会写到 `.smoke.npy`，**绝不覆盖正式表**。
+    """
+    tmp_emb = f'{dst_emb}.tmp.npy'
+    mean_tmp = f'{dst_emb}.mean.tmp.npy'
     t0 = time.time()
     E = np.load(TITLE_MAT, mmap_mode='r')          # 2.8GB 在盘上，按页随机读
     uk, inv = np.unique(keys, return_inverse=True)
@@ -184,7 +188,7 @@ def build_cell_table(t2i: dict, keys: np.ndarray, titles: np.ndarray) -> int:
     log(f'格子 {n_cell:,d}  条目 {len(keys):,d}（{len(keys) / n_cell:.2f} 条/格）')
     del inv, order
 
-    W = np.lib.format.open_memmap(MEAN_TMP, mode='w+', dtype=np.float16,
+    W = np.lib.format.open_memmap(mean_tmp, mode='w+', dtype=np.float16,
                                   shape=(n_cell, DIM))
     colsum = np.zeros(DIM, np.float64)
     colsq = np.zeros(DIM, np.float64)
@@ -211,25 +215,29 @@ def build_cell_table(t2i: dict, keys: np.ndarray, titles: np.ndarray) -> int:
     log(f'按列 std：中位 {np.median(sd):.4f} 范围 [{sd.min():.4f}, {sd.max():.4f}]'
         f'（输出 = 均值 / std，不中心化 ⇒ 与实验线逐位一致）')
 
-    Wr = np.load(MEAN_TMP, mmap_mode='r')
-    out = np.lib.format.open_memmap(ANN_EMB_TMP, mode='w+', dtype=np.float16,
+    Wr = np.load(mean_tmp, mmap_mode='r')
+    out = np.lib.format.open_memmap(tmp_emb, mode='w+', dtype=np.float16,
                                     shape=(n_cell, DIM))
     for a in range(0, n_cell, CHUNK):
         b = min(a + CHUNK, n_cell)
         out[a:b] = (Wr[a:b].astype(np.float32) / sd).astype(np.float16)
     out.flush()
     del out, Wr, W
-    os.replace(ANN_EMB_TMP, ANN_EMB)                # 原子替换
-    np.save(ANN_INDEX + '.tmp.npy', uk)             # 键升序（searchsorted 前提）
-    os.replace(ANN_INDEX + '.tmp.npy', ANN_INDEX)
-    os.remove(MEAN_TMP)
-    log(f'写出 {ANN_INDEX}（{len(uk):,d} 键）+ {ANN_EMB}'
-        f'（{os.path.getsize(ANN_EMB) / 1e9:.2f}GB，{time.time() - t0:.0f}s）')
+    os.replace(tmp_emb, dst_emb)                    # 原子替换
+    np.save(dst_index + '.tmp.npy', uk)             # 键升序（searchsorted 前提）
+    os.replace(dst_index + '.tmp.npy', dst_index)
+    os.remove(mean_tmp)
+    log(f'写出 {dst_index}（{len(uk):,d} 键）+ {dst_emb}'
+        f'（{os.path.getsize(dst_emb) / 1e9:.2f}GB，{time.time() - t0:.0f}s）')
     return n_cell
 
 
 def update(limit_files: int = 0, force: bool = False) -> int:
-    """入口：扫条目 → 增量编码标题 → 格子均值+除 std → (index, npy)。返回新编码标题数。"""
+    """入口：扫条目 → 增量编码标题（只编码缓存里没有的）→ 格子均值+除 std → (index, npy)。
+
+    增量语义：标题级嵌入缓存命中则不重编码 ⇒ 日常只编码新增标题（分钟级）；
+    `n_new == 0` 且产物不旧于缓存时直接跳过，秒退。返回新编码标题数。
+    """
     keys, titles = scan_zero_anchors(limit_files)
     if not len(keys):
         log('无归零条目')
@@ -237,12 +245,19 @@ def update(limit_files: int = 0, force: bool = False) -> int:
     n0 = len(_title_index())
     t2i = build_title_emb(titles)
     n_new = len(t2i) - n0
+    if limit_files > 0:
+        # 冒烟：产物写 .smoke 后缀，绝不覆盖正式表
+        build_cell_table(t2i, keys, titles,
+                         dst_index=ANN_INDEX.replace('.npy', '.smoke.npy'),
+                         dst_emb=ANN_EMB.replace('.npy', '.smoke.npy'))
+        return n_new
     stale = ((not os.path.exists(ANN_EMB))
              or os.path.getmtime(ANN_EMB) < os.path.getmtime(TITLE_MAT))
     if force or n_new or stale:
         build_cell_table(t2i, keys, titles)
     else:
-        log('格子表已是最新（缓存无新增、产物不旧于缓存），跳过；改了口径请加 --force')
+        log(f'无新增标题（缓存 {n0:,d} 条）且产物不旧于缓存 ⇒ 跳过重建'
+            f'；改了口径/要重算请加 --force')
     return n_new
 
 
@@ -250,7 +265,8 @@ if __name__ == '__main__':
     import argparse
 
     ap = argparse.ArgumentParser(description='巨潮公告标题嵌入 → 格子 768 维表（index + npy）')
-    ap.add_argument('--limit-files', type=int, default=0, help='只扫前 N 个公告 JSON（冒烟）')
+    ap.add_argument('--limit-files', type=int, default=0,
+                    help='只扫前 N 个公告 JSON（冒烟；产物写 .smoke.npy，不动正式表）')
     ap.add_argument('--force', action='store_true', help='无视新鲜度判断，强制重建格子表')
     a = ap.parse_args()
     update(limit_files=a.limit_files, force=a.force)
