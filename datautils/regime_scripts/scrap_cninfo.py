@@ -23,6 +23,11 @@
 #   python AshareData/datautils/regime_scripts/scrap_cninfo.py --build-orgids   # 只建/补 orgId 表
 #   python AshareData/datautils/regime_scripts/scrap_cninfo.py --start 2020-01-01   # 全量回扫
 #   python AshareData/datautils/regime_scripts/scrap_cninfo.py --incremental       # 每日增量
+#       增量下界 = 上次已见最新日 − N 天（--overlap-days，默认 7）：**往回覆盖一段**。
+#       announcementId 去重 ⇒ 重复抓幂等，只多花请求。这是防「迟到公告」的唯一可行手段：
+#       秒级下界不可用 —— 97% 的 announcementTime 被归零到 00:00:00，而它们正是训练主群，
+#       用时间戳当下界会让这批再也不会被查到（制造缺口）。
+#       要报「整库无缺口」需定期全量重扫审计（同样幂等）：--start 2020-01-01
 #   python AshareData/datautils/regime_scripts/scrap_cninfo.py --limit 20          # 冒烟
 #   python AshareData/datautils/regime_scripts/scrap_cninfo.py --latest            # 只问答状态
 import argparse
@@ -162,6 +167,23 @@ def _slim(a):
 
 def _day_of(ms):
     return datetime.fromtimestamp(int(ms) / 1000, TZ).strftime('%Y-%m-%d')
+
+
+def _incr_lo(prev, overlap_days, start):
+    """增量下界 = 上次已见最新日的**前 overlap_days 天**（迟到公告的回填窗口）。
+
+    为何不做到秒：`announcementTime` 有 97% 被归零到 00:00:00，而这些**正是训练主群**
+    （归零识别出 89.91%）。若拿「上次最大时间戳」当下界，所有时间戳 ≤ 它的归零公告
+    就再也不会被查到 ⇒ 秒级下界会**制造**缺口，而不是消除它。
+    真正能防漏的是「往回覆盖一段」+ `announcementId` 去重（幂等，只多花请求）。
+
+    prev 为 None（无断点/新挂票）⇒ 返回 start（全量下界）；不会退到 start 之前。
+    """
+    if not prev:
+        return start
+    lo = (date.fromisoformat(prev)
+          - timedelta(days=max(int(overlap_days), 0))).strftime('%Y-%m-%d')
+    return max(lo, start)
 
 
 # ---------- orgId 表 ----------
@@ -349,7 +371,11 @@ def main():
     ap.add_argument('--start', default='2020-01-01', help='全量回扫下界')
     ap.add_argument('--since', default=None, help='只取该日之后的公告（体检/定点补漏）')
     ap.add_argument('--incremental', action='store_true',
-                    help='增量模式：每票只从上次已见的最新日期起抓（每日链用）')
+                    help='增量模式：每票从上次已见的最新日期起抓（每日链用）')
+    ap.add_argument('--overlap-days', type=int, default=7,
+                    help='增量回溯天数：下界 = 上次已见最新日 − N 天（默认 7）。'
+                         '防迟到/延迟可见的公告；announcementId 去重 ⇒ 幂等，只多花请求。'
+                         '无法靠秒级下界代替：97%% 的 announcementTime 被归零到 00:00:00')
     ap.add_argument('--workers', type=int, default=5, help='并发票数（默认 5）')
     ap.add_argument('--sleep', type=float, default=0.7, help='每请求间隔秒（默认 0.7）')
     ap.add_argument('--max-req', type=int, default=0, help='最多请求数（冒烟）')
@@ -418,9 +444,8 @@ def main():
         if args.since:
             lo = args.since
         elif args.incremental:
-            prev = st['stocks'].get(code, {}).get('newest')
-            lo = (date.fromisoformat(prev) - timedelta(days=1)).strftime('%Y-%m-%d') \
-                if prev else args.start
+            lo = _incr_lo(st['stocks'].get(code, {}).get('newest'),
+                          args.overlap_days, args.start)
         else:
             lo = args.start
         rows, nreq = fetch_stock(code, org[code], lo, args.sleep)
