@@ -21,13 +21,13 @@
 #
 # 用法:
 #   python AshareData/datautils/regime_scripts/scrap_cninfo.py --build-orgids   # 只建/补 orgId 表
-#   python AshareData/datautils/regime_scripts/scrap_cninfo.py --start 2020-01-01   # 全量回扫
-#   python AshareData/datautils/regime_scripts/scrap_cninfo.py --incremental       # 每日增量
+#   python AshareData/datautils/regime_scripts/scrap_cninfo.py                  # 默认自动：空库冷库重建（自 --start 全量）；有库自动追新（增量）
+#   python AshareData/datautils/regime_scripts/scrap_cninfo.py --since 2026-10-01   # 定点补漏：全部票从该日重抓（整库重扫传 2020-01-01）
 #       增量下界 = 上次已见最新日 − N 天（--overlap-days，默认 7）：**往回覆盖一段**。
 #       announcementId 去重 ⇒ 重复抓幂等，只多花请求。这是防「迟到公告」的唯一可行手段：
 #       秒级下界不可用 —— 97% 的 announcementTime 被归零到 00:00:00，而它们正是训练主群，
 #       用时间戳当下界会让这批再也不会被查到（制造缺口）。
-#       --incremental 走**双通道**：
+#       有库增量走**双通道**：
 #         ① 按日全市场查（快速路径，≈12× 省请求）：逐日 1 个探测拿 totalAnnouncement，
 #            再跨日并发翻页抓完并分发回各票。实测 8 天窗口 = 227 请求 / 1.2 min；
 #            同期按票需 5,448 请求 / 13~16 min。（按日查单请求更重：延迟 ~0.76s vs 按票
@@ -39,7 +39,7 @@
 #            窗口 > DAY_MODE_MAX_DAYS(60) 天时也整体回退按票；而「有票无断点」（新上市/
 #            冷库需全史）**不阻塞**按日路径 —— 那几只单独交按票跑即可。
 #            **宁可慢也不能不完备**：闸门不满足即整体回退。
-#       要报「整库无缺口」需定期全量重扫审计（同样幂等）：--start 2020-01-01
+#       要报「整库无缺口」需定期全量重扫审计（同样幂等）：--since 2020-01-01
 #   python AshareData/datautils/regime_scripts/scrap_cninfo.py --limit 20          # 冒烟
 #   python AshareData/datautils/regime_scripts/scrap_cninfo.py --latest            # 只问答状态
 import argparse
@@ -421,14 +421,19 @@ def run_day_mode(codes, st, meta, args):
 
     # 所有 (日, 页>1) 一次性并发（跨日并发 ⇒ 消除“每天等批尾”的停顿；频控在 _post 内每线程生效）。
     # 收到就 _slim（丢掉 announcementContent 等大字段）⇒ 窗口拉到几十天也不爆内存。
+    # 每 50 页打一次进度（此前整段无日志 ⇒ 长窗口静默易被误判卡死）。
     tasks = [(d, p) for d in days
              for p in range(2, -(-totals[d] // PAGE_SIZE) + 1)]
     extra = {d: [] for d in days}
+    if tasks:
+        logger.info(f'  按日抓取 {len(tasks)} 页（{args.workers} 线程并发）…')
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             futs = {ex.submit(_probe_day, d, p, args.sleep): d for d, p in tasks}
-            for f in as_completed(futs):
+            for i, f in enumerate(as_completed(futs), 1):
                 extra[futs[f]] += [_slim(r) for r in (f.result().get('announcements') or [])]
+                if i % 50 == 0 or i == len(tasks):
+                    logger.info(f'  按日抓取进度 {i}/{len(tasks)} 页')
     except Exception as e:
         logger.error(f'按日抓取失败({type(e).__name__}: {e}) → 回退按票')
         return False, list(codes)
@@ -531,10 +536,9 @@ def is_latest():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--start', default='2020-01-01', help='全量回扫下界')
-    ap.add_argument('--since', default=None, help='只取该日之后的公告（体检/定点补漏）')
-    ap.add_argument('--incremental', action='store_true',
-                    help='增量模式：每票从上次已见的最新日期起抓（每日链用）')
+    ap.add_argument('--start', default='2020-01-01', help='全量自举下界（默认 2020-01-01）')
+    ap.add_argument('--since', default=None,
+                    help='只取该日之后的公告（定点补漏；整库重扫传 2020-01-01）')
     ap.add_argument('--overlap-days', type=int, default=7,
                     help='增量回溯天数：下界 = 上次已见最新日 − N 天（默认 7）。'
                          '防迟到/延迟可见的公告；announcementId 去重 ⇒ 幂等，只多花请求。'
@@ -560,6 +564,8 @@ def main():
     threading.Thread(target=heartbeat_loop, args=(meta,), daemon=True).start()
     st = load_json(STATE_F, {}) or {}
     st.setdefault('stocks', {})
+    cold = not st['stocks']            # 断点表空 ⇒ 冷库重建（全量）；否则 ⇒ 自动追新（增量）
+    mode = '冷库重建' if cold else '自动追新'
     org = load_json(ORG_F, {}) or {}
 
     codes = universe()
@@ -585,12 +591,10 @@ def main():
         logger.info(f'--build-orgids 完成：共 {len(org)} 个 → {ORG_F}')
         sys.exit(0)
 
-    todo = [c for c in codes if c in org and (args.incremental or c not in st['stocks'])]
-    if args.since:
-        todo = [c for c in codes if c in org]
+    todo = [c for c in codes if c in org]
 
     # ---- 增量快速路径：按日全市场查（~18× 省请求）；闸门不满足就整体回退按票 ----
-    if args.incremental and not args.since and not args.limit:
+    if not cold and not args.since and not args.limit:
         try:
             ok, left = run_day_mode(codes, st, meta, args)
         except Exception as e:
@@ -606,7 +610,7 @@ def main():
         else:
             logger.info('回退按票模式（完备但慢）')
 
-    logger.info(f'待抓 {len(todo)} 只（增量={args.incremental}）')
+    logger.info(f'待抓 {len(todo)} 只（模式={mode}）')
     if not todo:
         logger.info('无待抓，退出')
         dump_json(HEART_F, {'state': 'partial' if (args.limit or args.since) else 'done',
@@ -622,13 +626,9 @@ def main():
     consecutive_fail = [0]
 
     def job(code):
-        if args.since:
-            lo = args.since
-        elif args.incremental:
-            lo = _incr_lo(st['stocks'].get(code, {}).get('newest'),
-                          args.overlap_days, args.start)
-        else:
-            lo = args.start
+        # 下界：--since 定点 → 该日；无断点/冷库 → --start；否则 → 断点最新日 − overlap_days
+        lo = args.since or _incr_lo(
+            st['stocks'].get(code, {}).get('newest'), args.overlap_days, args.start)
         rows, nreq = fetch_stock(code, org[code], lo, args.sleep)
         n_new, n_all = save_stock(code, rows)
         newest = max((_day_of(x['announcementTime']) for x in rows), default=None)

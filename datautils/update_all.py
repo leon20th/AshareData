@@ -13,9 +13,9 @@ m15 两管线共用一套（m15_kline_ts；新浪+baostock；kline_scripts/m15/u
   3) 停牌名单    随管线选轨（tushare suspend_d / fuyao dump）
   4) 新闻        财联社 / 东财7x24（增量；空目录自动从 2020-01-01 回填）
   5) 榜单        开盘啦 / 涨跌停（问财）/ 龙虎榜（增量补齐缺失日期）
-  6) 公告        巨潮资讯（增量：下界 = 上次已见最新日 − 7 天，往回覆盖一段防迟到公告；
-                 重复抓靠 announcementId 去重 ⇒ 幂等。服务端限流约 9 req/s，默认
-                 5 并发 × 0.7s ≈ 6 req/s ⇒ 全市场一轮约 15 min；空库自举从 2020-01-01）
+  6) 公告        巨潮资讯（自动：空库自举从 2020-01-01；有库增量，下界 = 上次已见最新日
+                 − 7 天，往回覆盖一段防迟到公告；重复抓靠 announcementId 去重 ⇒ 幂等。
+                 服务端限流约 9 req/s，默认 5 并发 × 0.7s ≈ 6 req/s ⇒ 全市场一轮约 15 min）
   7) 特征构建    base_feature（自增量；读口随 --daily）
 
 约定：
@@ -78,7 +78,7 @@ def plan_steps(daily='tushare'):
         ('dietingban', '榜单·跌停板（问财）', [PY, '-u', f'{D}/regime_scripts/scrap_dietingban.py']),
         ('zhangtingban', '榜单·涨停板（问财）', [PY, '-u', f'{D}/regime_scripts/scrap_zhangtingban.py']),
         ('longhu', '榜单·龙虎榜（同花顺）', [PY, '-u', f'{D}/regime_scripts/scrap_longhu.py']),
-        ('cninfo', '公告·巨潮资讯（增量）', [PY, '-u', f'{D}/regime_scripts/scrap_cninfo.py', '--incremental']),
+        ('cninfo', '公告·巨潮资讯（自动）', [PY, '-u', f'{D}/regime_scripts/scrap_cninfo.py']),
         ('feature', '特征构建 base_feature', [PY, '-u', f'{D}/dataloaders/feature_build/build_all_feature.py', '--daily-source', daily]),
     ]
     info = f'管线={daily} | 库状态: ts={ts_n} 只, m15={m15_n} 只'
