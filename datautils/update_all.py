@@ -13,7 +13,9 @@ m15 两管线共用一套（m15_kline_ts；新浪+baostock；kline_scripts/m15/u
   3) 停牌名单    随管线选轨（tushare suspend_d / fuyao dump）
   4) 新闻        财联社 / 东财7x24（增量；空目录自动从 2020-01-01 回填）
   5) 榜单        开盘啦 / 涨跌停（问财）/ 龙虎榜（增量补齐缺失日期）
-  6) 特征构建    base_feature（自增量；读口随 --daily）
+  6) 公告        巨潮资讯（增量：每票只追上次已见日期之后；服务端限流约 9 req/s，
+                 默认 5 并发 × 0.7s ≈ 6 req/s ⇒ 全市场一轮约 15 min；空库自举从 2020-01-01）
+  7) 特征构建    base_feature（自增量；读口随 --daily）
 
 约定：
   - 空库一律从 2020-01-01 起；各步幂等，可随时中断重跑（缺口/断点驱动）
@@ -75,6 +77,7 @@ def plan_steps(daily='tushare'):
         ('dietingban', '榜单·跌停板（问财）', [PY, '-u', f'{D}/regime_scripts/scrap_dietingban.py']),
         ('zhangtingban', '榜单·涨停板（问财）', [PY, '-u', f'{D}/regime_scripts/scrap_zhangtingban.py']),
         ('longhu', '榜单·龙虎榜（同花顺）', [PY, '-u', f'{D}/regime_scripts/scrap_longhu.py']),
+        ('cninfo', '公告·巨潮资讯（增量）', [PY, '-u', f'{D}/regime_scripts/scrap_cninfo.py', '--incremental']),
         ('feature', '特征构建 base_feature', [PY, '-u', f'{D}/dataloaders/feature_build/build_all_feature.py', '--daily-source', daily]),
     ]
     info = f'管线={daily} | 库状态: ts={ts_n} 只, m15={m15_n} 只'
@@ -113,7 +116,7 @@ def _log_status(line):
 def main():
     ap = argparse.ArgumentParser(description='依次更新所有依赖数据（空库自动从 2020-01-01 起步）')
     ap.add_argument('--skip', default='',
-                    help='跳过步骤，逗号分隔: v2,m15,notrade,cls,em724,kaipanla,dietingban,zhangtingban,longhu,feature')
+                    help='跳过步骤，逗号分隔: v2,m15,notrade,cls,em724,kaipanla,dietingban,zhangtingban,longhu,cninfo,feature')
     ap.add_argument('--retry', type=int, default=2, help='每步失败重试次数（默认 2，即最多 3 次尝试）')
     ap.add_argument('--daily', default='tushare', choices=['tushare', 'mix'],
                     help='日K 来源管线：tushare（默认，收费源）/ mix（fuyao+baostock 免费源）')

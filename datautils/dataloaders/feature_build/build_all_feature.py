@@ -122,6 +122,14 @@ if __name__ == '__main__':
         kpl_reason_emb_update()
     except Exception as exc:
         print(f'[kpl] 原因嵌入更新跳过: {exc}')
+    # 巨潮公告标题嵌入 → 格子级 768 维表（ann_index.npy + ann_emb.f16.npy）：
+    # 增量（标题级嵌入缓存命中则不重编码）；失败不阻断
+    try:
+        from AshareData.datautils.dataloaders.feature_build.ann_emb import (
+            update as ann_emb_update)
+        ann_emb_update()
+    except Exception as exc:
+        print(f'[ann] 公告嵌入更新跳过: {exc}')
     # 新闻快讯标签计数特征 → news_features.parquet（东财 7x24 + 财联社；全量重建 ~8s；
     # 原始快讯缺失则跳过，不阻断）
     try:
