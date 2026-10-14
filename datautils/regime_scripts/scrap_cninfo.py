@@ -27,6 +27,18 @@
 #       announcementId 去重 ⇒ 重复抓幂等，只多花请求。这是防「迟到公告」的唯一可行手段：
 #       秒级下界不可用 —— 97% 的 announcementTime 被归零到 00:00:00，而它们正是训练主群，
 #       用时间戳当下界会让这批再也不会被查到（制造缺口）。
+#       --incremental 走**双通道**：
+#         ① 按日全市场查（快速路径，≈12× 省请求）：逐日 1 个探测拿 totalAnnouncement，
+#            再跨日并发翻页抓完并分发回各票。实测 8 天窗口 = 227 请求 / 1.2 min；
+#            同期按票需 5,448 请求 / 13~16 min。（按日查单请求更重：延迟 ~0.76s vs 按票
+#            ~0.14s ⇒ 5 线程 ×0.7s 节流下只能到 3.2 req/s，但请求数少两个量级仍赢。）
+#            探测到的 total 顺带就是**缺口审计基准**（该日全市场条数 vs 库内条数）。
+#         ② 按票（完备但慢）：**超限日回退**用。按日查被硬顶 3,000 条（30×100，超出静默
+#            回落第 1 页），实测 11.2% 的自然日 > 3,000（最忙 28,390 条/天），且日粒度上
+#            无可靠二次切分维度（column/plate/category 实测无效）⇒ 那些天按日查不完备。
+#            窗口 > DAY_MODE_MAX_DAYS(60) 天时也整体回退按票；而「有票无断点」（新上市/
+#            冷库需全史）**不阻塞**按日路径 —— 那几只单独交按票跑即可。
+#            **宁可慢也不能不完备**：闸门不满足即整体回退。
 #       要报「整库无缺口」需定期全量重扫审计（同样幂等）：--start 2020-01-01
 #   python AshareData/datautils/regime_scripts/scrap_cninfo.py --limit 20          # 冒烟
 #   python AshareData/datautils/regime_scripts/scrap_cninfo.py --latest            # 只问答状态
@@ -62,6 +74,8 @@ STATE_F = f'{OUT_DIR}/_state_stock.json'
 HEART_F = f'{OUT_DIR}/_heartbeat.json'
 TZ = timezone(timedelta(hours=8))
 PAGE_SIZE = 30            # 服务端硬上限
+DAY_CAP = PAGE_SIZE * 100  # 3000：按日全市场查的硬顶（pageNum>100 静默回落第 1 页）
+DAY_MODE_MAX_DAYS = 60     # 追更窗口超过这么多天就不走按日模式（逐日探测+回退代价失控）
 # 日K库候选目录（双管线：tushare → daily_kline_ts；mix → daily_kline_v2；另留 daily_kline 老库）。
 # 默认取并集：哪条管线有库就用哪个。多抓的只是冗余、成本可忽略；只认一条会在换管线时
 # **静默失效**（universe 变空 → “无待抓”退出）。
@@ -308,6 +322,154 @@ def fetch_stock(code, orgid, lo, sleep):
     return fetch_range(code, orgid, lo, date.today().strftime('%Y-%m-%d'), sleep)
 
 
+# ---------- 按日全市场通道（增量快速路径）----------
+# 为何存在：按票增量即使「零新增」也要 5,448 个请求（≈13 min @7.1 req/s）；
+# 而按日全市场只需 Σ ceil(当日条数/30) + 每日 1 探测 ⇒ 最近 7 天约 301 请求 ≈ 42 s（~18×）。
+# 为何只是「快速路径」而不能取代按票：按日查被硬顶 3,000 条（30×100，超出静默回落第 1 页），
+# 而实测 11.2% 的自然日 > 3,000（最忙 28,390 条/天），且日粒度上无可靠二次切分维度
+# （column/plate/category 实测无效、pageSize 硬顶 30、97% 时间戳归零）⇒ 那些天**不完备**。
+# 故：超限日一律回退按票（按票的窗口是那一天，每票约 1 请求）。
+def _probe_day(day, page, sleep):
+    """按日**全市场**查（不带 stock 过滤）。seDate 同样只用到日粒度。"""
+    j, ok = _post(API, {'pageNum': page, 'pageSize': PAGE_SIZE, 'column': 'szse',
+                        'tabName': 'fulltext', 'plate': '', 'stock': '',
+                        'searchkey': '', 'secid': '', 'category': '', 'trade': '',
+                        'seDate': f'{day}~{day}', 'sortName': '', 'sortType': '',
+                        'isHLtitle': 'false'}, sleep)
+    if not ok:
+        raise RuntimeError(f'day {day} p{page} 重试耗尽')
+    return j
+
+
+def probe_day(day, sleep):
+    """1 个请求：该日全市场条数 + 首页行。
+
+    total 顺便就是**缺口审计的基准**：与库内该日条数一比即知有没有丢。
+    """
+    j = _probe_day(day, 1, sleep)
+    return int(j.get('totalAnnouncement') or 0), list(j.get('announcements') or [])
+
+
+def code_of(a):
+    """行 → 6 位代码（按日查返回 secCode='002475'，与 universe() 口径一致）。"""
+    c = str(a.get('secCode') or '').strip()
+    return c.zfill(6) if c else ''
+
+
+def save_day_rows(rows, cset):
+    """按日行 → 按 secCode 分发回各票文件（announcementId 去重）。
+
+    返回 ({code: (n_new, n_all)}, 网格外行数)。网格外 = 北交/退市等不在「有日K」全集里的票。
+    """
+    by, off = {}, 0
+    for r in rows:
+        c = code_of(r)
+        if c and c in cset:
+            by.setdefault(c, []).append(r)
+        else:
+            off += 1
+    return {c: save_stock(c, rs) for c, rs in by.items()}, off
+
+
+def run_day_mode(codes, st, meta, args):
+    """按日抓增量窗口。返回 (ok, leftover)：
+
+      ok=True  ⇒ 已按日覆盖（leftover = 仍需交按票的票，通常是缺断点的新票/冷库）
+      ok=False ⇒ 必须**整体**回退按票
+
+    两道闸门，任一不满足即整体回退（宁可慢也不能不完备）：
+      1) 窗口天数 ≤ DAY_MODE_MAX_DAYS
+      2) 窗口内**每一天**全市场条数 ≤ DAY_CAP（超限日无法完备切分）
+    缺断点的票（新上市/冷库）**不阻塞**按日路径：它们需要全史，单独交按票跑。
+    本模式不需要 orgId（不带 stock 过滤）。
+    """
+    leftover = [c for c in codes if c not in st['stocks']]      # 需全史 ⇒ 交按票
+    known = [c for c in codes if c in st['stocks']]
+    if not known:
+        return False, list(codes)
+    prev_days = [st['stocks'][c].get('newest') for c in known
+                 if st['stocks'][c].get('newest')]
+    if not prev_days and not st.get('covered_through'):
+        logger.info('按日模式跳过：无历史断点')
+        return False, list(codes)
+    # 窗口基准：按日全市场查覆盖到哪天（covered_through）；没有就退回「全局最新公告日」
+    basis = st.get('covered_through') or max(prev_days)
+    lo = _incr_lo(basis, args.overlap_days, args.start)
+    d0, d1 = date.fromisoformat(lo), date.today()
+    days = [(d0 + timedelta(days=i)).isoformat() for i in range((d1 - d0).days + 1)]
+    if len(days) > DAY_MODE_MAX_DAYS:
+        logger.info(f'按日模式跳过：窗口 {len(days)} 天 > {DAY_MODE_MAX_DAYS}')
+        return False, list(codes)
+
+    t0, req0 = time.time(), _req_n[0]
+    totals, first = {}, {}
+    try:                                     # 逐日探测（并发）：1 请求/天，拿 total + 首页
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futs = {ex.submit(probe_day, d, args.sleep): d for d in days}
+            for f in as_completed(futs):
+                totals[futs[f]], first[futs[f]] = f.result()
+    except Exception as e:
+        logger.error(f'按日探测失败({type(e).__name__}: {e}) → 回退按票')
+        return False, list(codes)
+    over = [d for d in days if totals[d] > DAY_CAP]
+    logger.info(f'按日模式：窗口 {days[0]}~{days[-1]}（{len(days)} 天）；'
+                f'每日条数 {[totals[d] for d in days]}')
+    if over:
+        logger.info(f'按日模式放弃：{len(over)} 天超 {DAY_CAP} 条硬顶（无法完备切分）→ 回退按票')
+        return False, list(codes)
+
+    # 所有 (日, 页>1) 一次性并发（跨日并发 ⇒ 消除“每天等批尾”的停顿；频控在 _post 内每线程生效）。
+    # 收到就 _slim（丢掉 announcementContent 等大字段）⇒ 窗口拉到几十天也不爆内存。
+    tasks = [(d, p) for d in days
+             for p in range(2, -(-totals[d] // PAGE_SIZE) + 1)]
+    extra = {d: [] for d in days}
+    try:
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futs = {ex.submit(_probe_day, d, p, args.sleep): d for d, p in tasks}
+            for f in as_completed(futs):
+                extra[futs[f]] += [_slim(r) for r in (f.result().get('announcements') or [])]
+    except Exception as e:
+        logger.error(f'按日抓取失败({type(e).__name__}: {e}) → 回退按票')
+        return False, list(codes)
+
+    cset, n_new, n_off = set(codes), 0, 0
+    nall, seen = {}, {}
+    for d in days:
+        rows = [_slim(r) for r in first[d]] + extra[d]
+        nreq = 1 + len(range(2, -(-totals[d] // PAGE_SIZE) + 1))
+        info, off = save_day_rows(rows, cset)
+        got = sum(v[0] for v in info.values())
+        n_new, n_off = n_new + got, n_off + off
+        for r in rows:                        # 该票「已见最新公告日」（不存行、不占内存）
+            c = code_of(r)
+            if c in cset and r.get('announcementTime'):
+                dd = _day_of(r['announcementTime'])
+                if dd > seen.get(c, ''):
+                    seen[c] = dd
+        for c, (_nn, na) in info.items():
+            nall[c] = na          # 该票最新总条数（供断点记录）
+        logger.info(f'  按日 {d}：{totals[d]:,d} 条 / {nreq} 请求 → 新增 {got}'
+                    f'（{len(info)} 只；网格外 {off}）')
+    last = days[-1]
+    # 断点语义与按票一致：newest = 该票**已见最新公告日**（数据驱动，供 is_latest/看门狗用）；
+    # 「全市场覆盖到哪天」另记 covered_through（下轮窗口据此算），不拿它顶替 newest
+    # （否则 is_latest 永远为真、看门狗误判）。
+    for c in known:                          # leftover 的票不动状态（由按票路径写）
+        prev = st['stocks'].get(c, {})
+        st['stocks'][c] = {'n': nall.get(c, prev.get('n', 0)),
+                           'newest': seen.get(c) or prev.get('newest')}
+    st['covered_through'] = last
+    st['newest'] = max((v.get('newest') or '' for v in st['stocks'].values()), default=None)
+    dump_json(STATE_F, st)
+    dr, el = _req_n[0] - req0, time.time() - t0
+    logger.info(f'按日模式完成：新增 {n_new:,d} 行（网格外 {n_off:,d}）；'
+                f'{dr:,d} 请求 / {el / 60:.1f} min（{dr / max(el, 1e-9):.1f} req/s）')
+    dump_json(HEART_F, {'state': 'done', 't': time.time(), 'stocks_done': len(st['stocks']),
+                        'stocks_total': len(codes), 'paused_until': 0, 'req': _req_n[0],
+                        'pid': os.getpid(), 'updated': time.time()})
+    return True, leftover
+
+
 def save_stock(code, rows):
     """合并写入单票文件（按 announcementId 去重，原子发布）；返回新增条数。"""
     f = f'{STOCK_DIR}/{code}.json'
@@ -425,6 +587,24 @@ def main():
     todo = [c for c in codes if c in org and (args.incremental or c not in st['stocks'])]
     if args.since:
         todo = [c for c in codes if c in org]
+
+    # ---- 增量快速路径：按日全市场查（~18× 省请求）；闸门不满足就整体回退按票 ----
+    if args.incremental and not args.since and not args.limit:
+        try:
+            ok, left = run_day_mode(codes, st, meta, args)
+        except Exception as e:
+            ok, left = False, list(codes)
+            logger.error(f'按日模式异常({type(e).__name__}: {e})')
+        if ok:
+            if not left:
+                return
+            logger.info(f'按日已覆盖增量窗口；剩 {len(left)} 只缺断点/冷票交按票（需全史）')
+            todo = [c for c in left if c in org]
+            if not todo:
+                return
+        else:
+            logger.info('回退按票模式（完备但慢）')
+
     logger.info(f'待抓 {len(todo)} 只（增量={args.incremental}）')
     if not todo:
         logger.info('无待抓，退出')
