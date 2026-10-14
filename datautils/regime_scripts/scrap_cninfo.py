@@ -51,7 +51,8 @@ import re
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (ThreadPoolExecutor, as_completed, wait,
+                                FIRST_COMPLETED)
 from datetime import date, datetime, timedelta, timezone
 
 import requests
@@ -635,37 +636,58 @@ def main():
 
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futs = {ex.submit(job, c): c for c in todo}
-            for fut in as_completed(futs):
-                code = futs[fut]
-                try:
-                    code, n_new, n_all, newest, nreq = fut.result()
-                except _Stop:
-                    meta['state'] = 'maxreq'
-                    continue
-                except Exception as e:
-                    n_fail += 1
-                    consecutive_fail[0] += 1
-                    logger.error(f'{code} 失败: {type(e).__name__}: {e}')
-                    if consecutive_fail[0] >= 20:
-                        raise RuntimeError(f'连续失败 {consecutive_fail[0]} 只，主动退出交给看门狗')
-                    continue
-                consecutive_fail[0] = 0
-                prev = st['stocks'].get(code, {})
-                st['stocks'][code] = {'n': n_all, 'newest': newest or prev.get('newest')}
-                n_ok += 1
-                n_rows += n_new
-                meta['done'] = len(st['stocks'])
-                if n_ok % 25 == 0 or n_ok == 1:
-                    el = time.time() - t0
-                    dr = _req_n[0] - req0
-                    eta = (len(todo) - n_ok) * el / n_ok
-                    logger.info(f'[{n_ok}/{len(todo)}] {code} 新增{n_new} 累计{n_all} | '
-                                f'总计 {n_rows:,} 行 req={dr:,} {dr / el:.1f} req/s '
-                                f'已用 {el / 60:.0f}min ETA {eta / 60:.0f}min')
-                    dump_json(STATE_F, st)
+            # **有界投递**：始终只挂 ~2×workers 个在飞任务。
+            # 旧写法一次性 submit 全部（如 5,449 个）⇒ KeyboardInterrupt 后 `with` 退出时的
+            # `shutdown(wait=True)` 仍要等**整个队列**跑完，Ctrl-C 实际上停不下来（实测
+            # SIGINT 后继续跑几分钟，只能 kill -9）。有界后最多只等在飞的 ~2×workers 个请求。
+            it = iter(todo)
+            futs, draining = {}, [False]
+
+            def _fill():
+                while not draining[0] and len(futs) < args.workers * 2:
+                    c = next(it, None)
+                    if c is None:
+                        return
+                    futs[ex.submit(job, c)] = c
+
+            _fill()
+            while futs:
+                done, _ = wait(list(futs), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    code = futs.pop(fut)
+                    try:
+                        code, n_new, n_all, newest, nreq = fut.result()
+                    except _Stop:
+                        meta['state'] = 'maxreq'
+                        draining[0] = True      # 达 --max-req：不再补投，排空在飞
+                        continue
+                    except Exception as e:
+                        n_fail += 1
+                        consecutive_fail[0] += 1
+                        logger.error(f'{code} 失败: {type(e).__name__}: {e}')
+                        if consecutive_fail[0] >= 20:
+                            raise RuntimeError(f'连续失败 {consecutive_fail[0]} 只，主动退出交给看门狗')
+                        continue
+                    consecutive_fail[0] = 0
+                    prev = st['stocks'].get(code, {})
+                    st['stocks'][code] = {'n': n_all, 'newest': newest or prev.get('newest')}
+                    n_ok += 1
+                    n_rows += n_new
+                    meta['done'] = len(st['stocks'])
+                    if n_ok % 25 == 0 or n_ok == 1:
+                        el = time.time() - t0
+                        dr = _req_n[0] - req0
+                        eta = (len(todo) - n_ok) * el / n_ok
+                        logger.info(f'[{n_ok}/{len(todo)}] {code} 新增{n_new} 累计{n_all} | '
+                                    f'总计 {n_rows:,} 行 req={dr:,} {dr / el:.1f} req/s '
+                                    f'已用 {el / 60:.0f}min ETA {eta / 60:.0f}min')
+                        dump_json(STATE_F, st)
+                _fill()
     except KeyboardInterrupt:
+        # 本轮**没跑完**：不能让收尾把它误标成 done（done 的判据是「全集都有断点」，
+        # 首轮跑完后恒为真 ⇒ 旧行为会把中断报成 done + exit 0，看门狗就不再续爬）。
         logger.warning('中断 → 保存断点（重跑即续传）')
+        meta['state'] = 'interrupted'
     except Exception as e:
         logger.error(f'异常中止: {type(e).__name__}: {e}')
         dump_json(STATE_F, st)
@@ -682,6 +704,8 @@ def main():
     meta['stop'] = True
     if meta['state'] == 'maxreq':
         pass
+    elif meta['state'] == 'interrupted':
+        pass                              # 中断：保持 interrupted，不得落回 done
     elif done and not (args.limit or args.since):
         meta['state'] = 'done'
     else:
@@ -696,6 +720,8 @@ def main():
                 f'覆盖 {len(st["stocks"])}/{len(codes)} 只，state={meta["state"]}')
     if meta['state'] == 'maxreq':
         sys.exit(0)
+    if meta['state'] == 'interrupted':
+        sys.exit(130)                     # 惯例：SIGINT 中断。与 done(0)/失败(1) 区分开
     # 未覆盖全部 → 非 0 退出，交给看门狗重启续爬
     sys.exit(0 if done else 1)
 
