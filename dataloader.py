@@ -93,6 +93,9 @@ EVENT_SUB_COLUMNS = [
     'ev_n_known', 'ev_n_base', 'ev_n_drv', 'ev_n_both',
     'ev_share', 'ev_mix', 'ev_base_pure', 'ev_age_min_frac', 'ev_is_new',
     'kp_sz', 'kp_rk', 'kp_fb', 'kp_age', 'kp_new', 'kp_gap', 'kp_rev', 'kp_nf',
+    # 巨潮公告标题嵌入的冻结 PCA16（feature_build/ann_emb.py 产物，同一张 event_feat.parquet；
+    # 列序 = ane_0..ane_15，与 transform 侧 ANNEMB_COLS 一一对应；无公告的 (date,code) 行为 0）
+    *[f'ane_{i}' for i in range(16)],
 ]
 
 # 股性长历史统计表列（stock_traits.parquet，14 列逐日横截面 rank01，契约后追加进 price 塔）
