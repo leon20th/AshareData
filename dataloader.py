@@ -1,5 +1,11 @@
 """极简 dataloader —— parquet → numpy，不做列计算/特征工程。
 
+【存储层 = SSD 寻址】行情数据先落 per-code float32 `.npy` 缓存，storage 以 mmap
+只读映射（页面按需从 SSD 换入，不进进程私有内存）：
+- 进程常驻内存 ≈ 0（页面由 OS page cache 共享，多进程训练不再 ×N 复制）；
+- 缓存增量维护：npy 缺失或 mtime 早于 parquet → 只重建该票（列集变化全量兜底）；
+- 逐位等价旧实现：同列序、同排序、同日期过滤，样本窗口内容不变。
+
 【数据唯一出口】
 - 所有数据必须经 `build_train_and_val_dataloaders` 获取：训练/eval 直接消费返回的
 train/val DataLoader；预测/分析等只需 storage 的场景走 `storage_only=True` 轻量模式
@@ -23,41 +29,24 @@ import random
 
 import numpy as np
 import pandas as pd
-import polars as pl
 import torch
 import tqdm
-from tqdm.contrib import logging as tqdm_logging
 from torch.utils.data import DataLoader, Dataset, default_collate
 
 from AshareData.paths import BASE_FEATURE_DIR, BUILT_DATA_DIR
+from AshareData.datautils.dataloaders.feature_build.model_ready import (
+    CORE_REQUIRED_COLUMNS,
+    Daily_tech_COLUMNS,
+    M15_tech_COLUMNS,
+    MODEL_READY_COLS,
+    KLINE_NPY_DIR,
+    part_glob,
+    full_cols,
+)
 from AshareData.utils.exchanges_utils.a_open import get_trade_date_list
 from AshareData.utils.log_util import get_logger
 
 logger = get_logger("kline_dataset_build.dataloader_np")
-
-CORE_REQUIRED_COLUMNS = [
-    "trade_date_idx", "code_idx",
-    "open", "high", "low", "close", "preclose", "volume", "amount",
-    "turn", "pctChg", "isNew", "isST", "price_limit"
-]
-
-Daily_tech_COLUMNS = [
-    "ma5","ma10","ma20","ma30","ma60",
-    "macd","macd_signal","macd_hist",
-    "rsi14",
-    "boll_upper","boll_mid","boll_lower",
-    "kdj_k","kdj_d","kdj_j",
-]
-
-_M15_TIME_SLOTS = [
-    "0945", "1000", "1015", "1030", "1045", "1100", "1115", "1130",
-    "1315", "1330", "1345", "1400", "1415", "1430", "1445", "1500",
-]
-M15_tech_COLUMNS = [
-    f"m15_{t}_{feat}"
-    for t in _M15_TIME_SLOTS
-    for feat in ("rsi14", "kdj_k")
-]
 
 UPDOWN_SUB_COLUMNS = [
     'trade_date_idx',    # 交易日索引
@@ -102,9 +91,102 @@ TRAIT_SUB_COLUMNS = [
     't_dsl', 't_hi', 't_lo', 't_yz', 't_zb', 't_turn', 't_beta',
 ]
 
-def _chunk_files(files, size):
-    for i in range(0, len(files), size):
-        yield files[i : i + size]
+class _PagedCodeArray:
+    """只读分页矩阵视图：对外 (n_total, n_model)，底层 = 若干 (≤PAGE_SIZE, n_full) 页。
+
+    页文件以 mmap 打开，访问只物化命中的行；行切片返回共享页的惰性视图；
+    __array__ 支持 np.concatenate / np.asarray（物化）。列仅支持单个整数索引
+    （覆盖现有消费方的全部用法）。
+    """
+
+    def __init__(self, pages: List[np.ndarray], col_idx: List[int],
+                 row0: int = 0, offs: Optional[np.ndarray] = None,
+                 row_end: Optional[int] = None) -> None:
+        self._pages = pages
+        self._col_idx = np.asarray(col_idx, dtype=np.int64)
+        self._row0 = int(row0)
+        if offs is None:
+            offs = np.empty(len(pages) + 1, dtype=np.int64)
+            offs[0] = 0
+            for i, p in enumerate(pages):
+                offs[i + 1] = offs[i] + p.shape[0]
+        self._offs = offs
+        self._row_end = int(offs[-1]) if row_end is None else int(row_end)
+        self._full_ncols = int(pages[0].shape[1])
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return (self._row_end - self._row0, len(self._col_idx))
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __array__(self, dtype=None) -> np.ndarray:
+        out = self._global_rows(np.arange(self.shape[0], dtype=np.int64))[:, self._col_idx]
+        return out.astype(dtype) if dtype is not None else out
+
+    def _global_rows(self, idxs: np.ndarray) -> np.ndarray:
+        g = idxs + self._row0
+        p = np.searchsorted(self._offs, g, side="right") - 1
+        out = np.empty((len(g), self._full_ncols), dtype=np.float32)
+        for k in range(len(self._pages)):
+            m = p == k
+            if m.any():
+                out[m] = self._pages[k][g[m] - self._offs[k]]
+        return out
+
+    def _rows(self, rows) -> np.ndarray:
+        n = self.shape[0]
+        if isinstance(rows, (int, np.integer)):
+            i = int(rows)
+            return self._global_rows(np.array([i + n if i < 0 else i], dtype=np.int64))[0]
+        if isinstance(rows, slice):
+            lo, hi, st = rows.indices(n)
+            return self._global_rows(np.arange(lo, hi, st, dtype=np.int64))
+        if isinstance(rows, np.ndarray) and rows.dtype == bool:
+            rows = np.nonzero(rows)[0]
+        idxs = np.asarray(rows, dtype=np.int64)
+        idxs = np.where(idxs < 0, idxs + n, idxs)
+        return self._global_rows(idxs)
+
+    def _row_view(self, i0: int, i1: int) -> "_PagedCodeArray":
+        offs = self._offs
+        k0 = int(np.searchsorted(offs, i0 + self._row0, side="right")) - 1
+        k1 = int(np.searchsorted(offs, i1 - 1 + self._row0, side="right"))
+        v = _PagedCodeArray.__new__(_PagedCodeArray)
+        v._pages = self._pages[k0 : k1 + 1]
+        v._col_idx = self._col_idx
+        v._row0 = i0 + self._row0
+        v._offs = offs[k0 : k1 + 2].copy()   # 页边界保持全局值（gather 按页内偏移定位）
+        v._row_end = v._row0 + (i1 - i0)     # 视图逻辑终点 clamp 到切片右端
+        v._full_ncols = self._full_ncols
+        return v
+
+    def __getitem__(self, item):
+        if not isinstance(item, tuple):
+            if isinstance(item, slice) and item.step in (None, 1):
+                lo, hi, _ = item.indices(self.shape[0])
+                return self._row_view(lo, hi) if lo < hi else self._rows(item)[:, self._col_idx]
+            if isinstance(item, (int, np.integer)):
+                return self._rows(item)[self._col_idx]   # 单行 → 列映射
+            return self._rows(item)[:, self._col_idx]
+        rows, col = item
+        if not isinstance(col, (int, np.integer)):
+            raise NotImplementedError("列仅支持单个整数索引")
+        base = self._rows(rows)
+        j = int(self._col_idx[int(col)])
+        return base[j] if isinstance(rows, (int, np.integer)) else base[:, j]
+
+
+def _load_paged_code(code: str, model_cols: List[str]) -> Optional[_PagedCodeArray]:
+    """打开某票全部分页（mmap），按 manifest 列名映射为模型列视图。"""
+    parts = sorted(glob.glob(part_glob(code)))
+    if not parts:
+        return None
+    full = full_cols()
+    col_idx = [full.index(c) for c in model_cols if c in full]
+    pages = [np.load(p, mmap_mode="r", allow_pickle=False) for p in parts]
+    return _PagedCodeArray(pages, col_idx)
 
 
 @dataclass
@@ -147,23 +229,20 @@ class _KlineDataStorage:
         with open(f'{self.config.data_dir}/meta.json', "r", encoding="utf-8") as f:
             self.data_meta = json.load(f)
 
-        files = sorted(glob.glob(os.path.join(self.config.data_dir, "*.parquet")))
+        files = sorted(
+            d for d in os.listdir(KLINE_NPY_DIR)
+            if os.path.isdir(os.path.join(KLINE_NPY_DIR, d))
+        )
         if self.special_codes:
-            files = [
-                path
-                for path in files
-                if os.path.splitext(os.path.basename(path))[0] in self.special_codes
-            ]
+            files = [d for d in files if d in self.special_codes]
         if self.config.max_codes is not None:
             files = files[: self.config.max_codes]
 
         self.code_arrays: Dict[str, np.ndarray] = {}       # code → (n, n_cols) float32
         self.code_columns: List[str] = []                   # 列名顺序
 
-        skipped_short = 0
-
         logger.info(
-            "start building kline storage: files=%s seq_len=%s begin_date=%s end_date=%s special_codes=%s data_dir=%s",
+            "start building kline storage: codes=%s seq_len=%s begin_date=%s end_date=%s special_codes=%s data_dir=%s",
             len(files),
             self.feature_len,
             self.begin_date,
@@ -172,54 +251,46 @@ class _KlineDataStorage:
             self.config.data_dir,
         )
 
-        pl_date_filter = self._build_date_filter()
-        need_cols = self.config.need_cols or (CORE_REQUIRED_COLUMNS + Daily_tech_COLUMNS + M15_tech_COLUMNS)
-        chunk_size = self.config.read_chunk_size
+        need_cols = self.config.need_cols or MODEL_READY_COLS
 
-        # 校验 need_cols 不含字符串列，并过滤不存在的列
-        schema = None
-        if files:
-            schema = pl.scan_parquet(files[0]).collect_schema()
-            available = set(schema.keys()) | {"__source_path"}
-            # 不允许 Utf8 列进入数值计算
-            bad_str = [c for c in need_cols if c in schema and schema[c] == pl.Utf8]
-            if bad_str:
-                raise ValueError(f"need_cols contains string columns: {bad_str}")
-            missing = [c for c in need_cols if c not in available]
-            if missing:
-                logger.warning("need_cols 中以下列在 parquet 中不存在，已忽略: %s", missing)
-            need_cols = [c for c in need_cols if c in available]
-
+        # manifest（构建侧维护的全字段列序）→ 模型列按名映射；缺列剔除同旧语义
+        _full_cols = full_cols()
+        missing = [c for c in need_cols if c not in _full_cols]
+        if missing:
+            logger.warning("need_cols 中以下列不在 npy manifest 中，已忽略: %s", missing)
+        need_cols = [c for c in need_cols if c in _full_cols]
         self._effective_need_cols = need_cols
-        read_cols = [*need_cols, "__source_path"]
 
-        with tqdm.tqdm(files, desc="Building Kline Storage") as pbar, tqdm_logging.logging_redirect_tqdm():
-            for chunk in _chunk_files(files, chunk_size):
-                try:
-                    lazy = pl.scan_parquet(chunk, include_file_paths="__source_path")
-                    if pl_date_filter is not None:
-                        lazy = lazy.filter(pl_date_filter)
-                    lazy = lazy.select(read_cols)
-                    lazy = lazy.fill_null(0)
-                    chunk_pl = lazy.collect()
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"failed to batch-read kline parquet (chunk of {len(chunk)} files): {exc}"
-                    ) from exc
+        if not files:
+            logger.info("storage built: codes=0 skipped(short=0)")
+            self.load_extra_data()
+            return
 
-                for part in chunk_pl.partition_by("__source_path", maintain_order=True):
-                    source_path = str(part["__source_path"][0])
-                    code = os.path.splitext(os.path.basename(source_path))[0]
-                    result = self._process_code(code, part)
-                    if result is None:
-                        skipped_short += 1
-                        continue
-                    stacked, cols = result
-                    self.code_arrays[code] = stacked
-                    if not self.code_columns:
-                        self.code_columns = cols
-                    pbar.set_postfix(codes=len(self.code_arrays))
-                pbar.update(len(chunk))
+        # SSD 寻址：build 产物 = 分页 npy（封存页不可变），mmap 只读打开、页面按需换入；
+        # begin/end 行过滤在分页视图上惰性切片（共享页 mmap，不物化）。
+        self.code_columns = need_cols
+        date_col = (
+            need_cols.index("trade_date_idx") if "trade_date_idx" in need_cols
+            else need_cols.index("date") if "date" in need_cols
+            else 0
+        )
+        lo, hi = self._date_row_range()
+
+        skipped_short = 0
+        for code in files:
+            arr = _load_paged_code(code, need_cols)
+            if arr is None:
+                skipped_short += 1
+                continue
+            if self.begin_date is None and self.end_date is None:
+                view = arr
+            else:
+                tdi = arr[:, date_col].astype(np.int64)
+                view = arr[int(np.searchsorted(tdi, lo, "left")) : int(np.searchsorted(tdi, hi, "right"))]
+            if view.shape[0] < self.feature_len + 1:
+                skipped_short += 1
+                continue
+            self.code_arrays[code] = view
 
         logger.info(
             "storage built: codes=%s skipped(short=%s)",
@@ -350,6 +421,16 @@ class _KlineDataStorage:
         self._market_zeros = np.zeros(len(_market_cols), dtype=np.float32)
         logger.info("extra data loaded: updown=%d, market=%d, pct_rank=%d, longhu=%d, event=%d, traits=%d", len(self._updown_tdis), len(self._market_tdis), len(self._rank_keys), len(self._longhu_keys), len(self._event_keys), len(self._trait_keys))
 
+        # extra DataFrame 仅取其 numpy 副本，读完即弃；pyarrow 内存池不随引用消失自动
+        # 归还 OS（实测 traits 读取后常驻 +1.3G 私有内存），故显式归还未用缓冲，
+        # 多进程场景每进程省 ~1.3G 私有内存。
+        updown_df = market_df = rank_df = longhu_df = event_df = trait_df = None
+        try:
+            import pyarrow as pa
+            pa.default_memory_pool().release_unused()
+        except Exception:
+            pass
+
     def lookup_pct_rank(self, tdis: np.ndarray, code_idx: int) -> np.ndarray:
         """按 (tdi, code_idx) 批量查找当日横截面涨幅分位，返回 (len(tdis),)，无记录（ST/新股等）→ 0。"""
         keys = tdis * 100000 + code_idx
@@ -468,43 +549,11 @@ class _KlineDataStorage:
         return idx if idx >= 0 else bisect_right(self.trade_dates, date_int)
 
 
-    def _build_date_filter(self) -> Optional[Any]:
-        """用 trade_date_idx（int 列）按日期范围过滤 parquet 行。"""
-        if self.begin_date is None and self.end_date is None:
-            return None
+    def _date_row_range(self) -> Tuple[int, int]:
+        """begin/end → 存储行过滤的 [lo, hi] trade_date_idx 值域（含 feature_len+5 预热行）。"""
         lo = self._date_to_idx_or_bisect(self.begin_date) if self.begin_date else 0
         hi = self._date_to_idx_or_bisect(self.end_date) if self.end_date else len(self.trade_dates) - 1
-        lo = max(0, lo - self.feature_len - 5)
-        conds = []
-        if self.begin_date is not None:
-            conds.append(pl.col("trade_date_idx") >= lo)
-        if self.end_date is not None:
-            conds.append(pl.col("trade_date_idx") <= hi)
-        if not conds:
-            return None
-        expr = conds[0]
-        for cond in conds[1:]:
-            expr = expr & cond
-        return expr
-
-    def _process_code(
-        self,
-        code: str,
-        df: pl.DataFrame,
-    ) -> Optional[Tuple[np.ndarray, List[str]]]:
-        df = df.drop("__source_path")
-        if len(df) < self.feature_len + 1:
-            return None
-
-        df = df.sort("trade_date_idx", maintain_order=True)
-
-        # 按 need_cols 顺序排列
-        need_cols = [col for col in self._effective_need_cols if col in df.columns]
-        df = df.select(need_cols)
-
-        cols = list(df.columns)
-        stacked = df.to_numpy().astype(np.float32)
-        return stacked, cols
+        return max(0, lo - self.feature_len - 5), hi
 
 
 class _KlineDataset(Dataset):
@@ -1031,36 +1080,41 @@ def load_single_stock_kline(
     last_date: Optional[str] = None,
     data_dir: Optional[str] = None,
 ) -> Optional[pd.DataFrame]:
-    """纯看K线：单股行情快照（展示专用快速读，直读单只 parquet，不做窗口/质量过滤）。
+    """纯看K线：单股行情快照（展示专用快速读，读分页 npy，不做窗口/质量过滤）。
 
     返回末 seq_len 行（末行日期 ≤ last_date）的 12 列 OHLCVT 展示表；不构建
     storage/样本池，涨跌停标记只查 updown_limit 表（不加载其余 extra 特征）。
     模型输入严禁走此函数，一切样本仍必须经 build_train_and_val_dataloaders。
     """
     code = str(code).strip()
-    path = os.path.join(data_dir or KlineDataConfig().data_dir, f"{code}.parquet")
-    if not code or not os.path.exists(path):
+    if not code:
         return None
-    df = pl.read_parquet(path, columns=[
-        "date", "trade_date_idx", "code_idx", "open", "high", "low", "close",
-        "preclose", "volume", "turn", "pctChg", "isST",
-    ])
+    arr = _load_paged_code(code, list(full_cols()))
+    if arr is None:
+        return None
+    full = full_cols()
+    j = [full.index(c) for c in ("trade_date_idx", "code_idx", "open", "high",
+                                 "low", "close", "preclose", "volume", "turn",
+                                 "pctChg", "isST")]
+    cal = np.asarray([int(d) for d in get_trade_date_list()], dtype=np.int64)
+    tdis = arr[:, j[0]].astype(np.int64)
     sel = str(last_date).strip().replace("-", "").replace("/", "")[:8] if last_date else ""
     if len(sel) == 8 and sel.isdigit():
-        df = df.filter(pl.col("date") <= sel)
-    if df.is_empty():
-        return None
-    df = df.tail(max(1, int(seq_len)))
-    tdis = df["trade_date_idx"].to_numpy().astype(np.int64)
-    is_up, is_dn = _limit_flags(tdis, int(df["code_idx"][0]))
+        keep = tdis < int(np.searchsorted(cal, int(sel), side="right"))
+    else:
+        keep = np.ones(len(tdis), dtype=bool)
+    rows = np.nonzero(keep)[0]
+    rows = rows[max(0, len(rows) - max(1, int(seq_len))):]
+    tdis = tdis[rows]
+    is_up, is_dn = _limit_flags(tdis, int(arr[0, j[1]]))
     return pd.DataFrame({
-        "date": pd.to_datetime(df["date"].to_numpy(), format="%Y%m%d", errors="coerce"),
-        "open": df["open"].to_numpy(), "high": df["high"].to_numpy(),
-        "low": df["low"].to_numpy(), "close": df["close"].to_numpy(),
-        "volume": df["volume"].to_numpy(), "turnoverRate": df["turn"].to_numpy(),
-        "preclose": df["preclose"].to_numpy(), "pctChg": df["pctChg"].to_numpy(),
+        "date": pd.to_datetime(cal[tdis].astype(str), format="%Y%m%d", errors="coerce"),
+        "open": arr[rows, j[2]].astype(np.float64), "high": arr[rows, j[3]].astype(np.float64),
+        "low": arr[rows, j[4]].astype(np.float64), "close": arr[rows, j[5]].astype(np.float64),
+        "volume": arr[rows, j[7]].astype(np.float64), "turnoverRate": arr[rows, j[8]].astype(np.float64),
+        "preclose": arr[rows, j[6]].astype(np.float64), "pctChg": arr[rows, j[9]].astype(np.float64),
         "is_uplimit": is_up, "is_downlimit": is_dn,
-        "isST": df["isST"].to_numpy(),
+        "isST": arr[rows, j[10]].astype(np.float64),
     }).reset_index(drop=True)
 
 

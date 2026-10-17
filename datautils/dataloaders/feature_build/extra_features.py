@@ -5,7 +5,7 @@ import os, re, json
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from AshareData.paths import BASE_FEATURE_DIR, BUILT_DATA_DIR, SCRAP_DATA_DIR
+from AshareData.paths import BUILT_DATA_DIR, SCRAP_DATA_DIR
 
 from AshareData.datautils.dataloaders.feature_build.feature_utils import get_code_idx, get_trade_date_idx
 
@@ -198,16 +198,31 @@ def build_pct_cross_rank(update: bool = False, force_rebuild: bool = False) -> p
     latest = int(existing['trade_date_idx'].max()) if existing is not None and len(existing) else -1
 
     import glob as _g
-    import polars as pl
-    files = sorted(_g.glob(f'{BASE_FEATURE_DIR}/*.parquet'))
+    from AshareData.datautils.dataloaders.feature_build.model_ready import (
+        KLINE_NPY_DIR, part_glob, full_cols as npy_full_cols)
     cols = ['trade_date_idx', 'code_idx', 'pctChg', 'price_limit', 'isST', 'isNew']
-    lazy = pl.scan_parquet(files).select(cols).filter(
-        (pl.col('isST') == 0) & (pl.col('isNew') == 0)
-        & (pl.col('price_limit') > 0) & pl.col('pctChg').is_not_nan()
-    )
+    fc = npy_full_cols()
+    jj = [fc.index(c) for c in cols]
+    codes = sorted(d for d in os.listdir(KLINE_NPY_DIR)
+                   if os.path.isdir(os.path.join(KLINE_NPY_DIR, d)))
+    mats = []
+    for code in codes:
+        parts = sorted(_g.glob(part_glob(code)))
+        if not parts:
+            continue
+        for p in (parts if force_rebuild else parts[-1:]):   # 增量只读尾页（新行必在尾页）
+            m = np.load(p, mmap_mode="r", allow_pickle=False)
+            mats.append(m[:, jj])
+    d = (pd.DataFrame(np.concatenate(mats, axis=0), columns=cols)
+         if mats else pd.DataFrame(columns=cols))
+    d = d[(d.isST == 0) & (d.isNew == 0) & (d.price_limit > 0) & d.pctChg.notna()]
     if latest >= 0:
-        lazy = lazy.filter(pl.col('trade_date_idx') > latest)
-    d = lazy.with_columns(rel=(pl.col('pctChg') / pl.col('price_limit'))).collect().to_pandas()
+        d = d[d.trade_date_idx > latest]
+    # 与旧 parquet(float64) 同口径：rank 前转回 float64（页存 float32）
+    d = d.copy()
+    d['pctChg'] = d['pctChg'].astype('float64')
+    d['price_limit'] = d['price_limit'].astype('float64')
+    d['rel'] = d['pctChg'] / d['price_limit']
     if d.empty:
         return existing
 

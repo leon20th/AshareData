@@ -1,7 +1,9 @@
 # stock_traits —— 个股"股性"长历史统计（B/C 族）→ built_data/stock_traits.parquet
-# 数据源：base_feature 日线（全历史）+ updown_limit.parquet（涨停质量）+ market_daily_stats.parquet（beta 基准）
-# 口径：涨停/跌停 = close 触板（round(preclose*(1±price_limit),2)）；rel=(pctChg/100)/price_limit；
-#       长统计 shift(1) 防泄漏；输出 = 逐日横截面升序 rank01（0=最小，1=最大），空值→0.5（中性）。
+# 数据源：base_feature 日线（全历史）+ updown_limit.parquet（涨跌停权威旗标 + 涨停质量）+ market_daily_stats.parquet（beta 基准）
+# 口径：涨停/跌停 = updown_limit 表 is_limit_up（±1）——复权价上数值判定不可靠
+#   （除权日因子跳变使 |close−round(preclose×(1±板),2)|<0.001 漏检过半，实测 11.4 万仅判出 5.5 万）；
+#       rel=(pctChg/100)/price_limit；长统计 shift(1) 防泄漏；输出 = 逐日横截面升序 rank01
+#       （0=最小，1=最大），空值→0.5（中性）。
 # 列（14）：
 #   t_mv   流通市值（=100*amount/turn，用户恒等式已核验 ~1bp）
 #   t_lu120/t_ld120/t_bu120/t_bd120  120 日涨停/跌停/大涨/大跌次数（大涨: rel≥0.7）
@@ -11,11 +13,13 @@
 #   t_turn 120 日均换手 / t_beta 对市场 avg_pctChg 的 120 日 beta（≥60 天）
 # 重建式（全量重算，实测 ~10s）；无跳过逻辑——调用即重建。
 import glob
+import os
 import time
 
+import numpy as np
 import polars as pl
 
-from AshareData.paths import BASE_FEATURE_DIR, BUILT_DATA_DIR
+from AshareData.paths import BUILT_DATA_DIR
 
 TRAIT_PARQUET = f"{BUILT_DATA_DIR}/stock_traits.parquet"
 TRAIT_COLS = ["t_mv", "t_lu120", "t_ld120", "t_bu120", "t_bd120", "t_sru", "t_srd",
@@ -30,19 +34,35 @@ def build():
     """全量重建 stock_traits.parquet（重建式；调用即重建，不设跳过）。"""
     t0 = time.time()
     i8 = pl.Int8
-    files = sorted(glob.glob(f"{BASE_FEATURE_DIR}/*.parquet"))
-    d = pl.scan_parquet(files).select([
-        "date", "trade_date_idx", "code_idx", "close", "preclose",
-        "price_limit", "pctChg", "turn", "amount",
-    ]).collect()
+    need = ["trade_date_idx", "code_idx", "close", "preclose",
+            "price_limit", "pctChg", "turn", "amount"]
+    from AshareData.datautils.dataloaders.feature_build.model_ready import (
+        KLINE_NPY_DIR, part_glob, full_cols as npy_full_cols)
+    fc = npy_full_cols()
+    jj = [fc.index(c) for c in need]
+    mats = []
+    for code in sorted(os.listdir(KLINE_NPY_DIR)):
+        if not os.path.isdir(os.path.join(KLINE_NPY_DIR, code)):
+            continue
+        for p in sorted(glob.glob(part_glob(code))):
+            m = np.load(p, mmap_mode="r", allow_pickle=False)
+            mats.append(m[:, jj])
+    arr = np.concatenate(mats, axis=0)
+    d = pl.DataFrame({c: arr[:, i] for i, c in enumerate(need)})
     d = (d.with_columns(trade_date_idx=pl.col("trade_date_idx").cast(pl.Int64),
                         code_idx=pl.col("code_idx").cast(pl.Int64))
          .sort(["code_idx", "trade_date_idx"]))
+    # 涨跌停旗标取权威表（去重 keep=last；无事件日填 False）
+    up_full = (pl.read_parquet(f"{BUILT_DATA_DIR}/updown_limit.parquet")
+               .with_columns(trade_date_idx=pl.col("trade_date_idx").cast(pl.Int64),
+                             code_idx=pl.col("code_idx").cast(pl.Int64))
+               .sort(["code_idx", "trade_date_idx"])
+               .unique(["code_idx", "trade_date_idx"], keep="last"))
+    d = d.join(up_full.select(["trade_date_idx", "code_idx", "is_limit_up"]),
+               on=["code_idx", "trade_date_idx"], how="left")
     d = d.with_columns(
-        is_lu=((pl.col("close") - (pl.col("preclose") * (1 + pl.col("price_limit"))).round(2))
-               .abs() < 0.001) & (pl.col("price_limit") >= 0.04),
-        is_ld=((pl.col("close") - (pl.col("preclose") * (1 - pl.col("price_limit"))).round(2))
-               .abs() < 0.001) & (pl.col("price_limit") >= 0.04),
+        is_lu=(pl.col("is_limit_up") == 1).fill_null(False),
+        is_ld=(pl.col("is_limit_up") == -1).fill_null(False),
         rel=pl.col("pctChg") / 100 / pl.col("price_limit"),
     )
     d = d.with_columns(
@@ -84,12 +104,8 @@ def build():
                            .rolling_mean(window_size=120, min_samples=60).over("code_idx")})
     d = d.with_columns(beta120=(pl.col("mxy") - pl.col("mx") * pl.col("my"))
                        / (pl.col("my2") - pl.col("my") ** 2))
-    up = (pl.read_parquet(f"{BUILT_DATA_DIR}/updown_limit.parquet")
-          .filter(pl.col("is_limit_up") == 1)
-          .select(["trade_date_idx", "code_idx", "open_count", "first_limit_min"])
-          .with_columns(trade_date_idx=pl.col("trade_date_idx").cast(pl.Int64),
-                        code_idx=pl.col("code_idx").cast(pl.Int64))
-          .sort(["code_idx", "trade_date_idx"]))
+    up = (up_full.filter(pl.col("is_limit_up") == 1)
+          .select(["trade_date_idx", "code_idx", "open_count", "first_limit_min"]))
     up = up.with_columns(
         zb=(pl.col("open_count") > 0).cast(i8),
         yz=((pl.col("first_limit_min") < 1) & (pl.col("open_count") == 0)).cast(i8),

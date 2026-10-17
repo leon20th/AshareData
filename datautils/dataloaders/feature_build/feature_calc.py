@@ -1,9 +1,14 @@
 import functools
+import glob
 import os
+import numpy as np
 import pandas as pd
 from AshareData.paths import (BASE_FEATURE_DIR, DAILY_KLINE_TS_DIR,
                               DAILY_KLINE_V2_DIR, M15_KLINE_TS_DIR)
 from AshareData.datautils.dataloaders.feature_build.feature_utils import *
+from AshareData.utils.exchanges_utils.a_open import get_trade_date_list
+from AshareData.datautils.dataloaders.feature_build.model_ready import (
+    part_glob, full_cols)
 
 # daily 读口随管线（环境变量 ASHARE_DAILY_SOURCE：tushare 默认 / mix；update_all --daily 或
 # build_all_feature --daily-source 设置）：tushare→daily_kline_ts+kline_ts_reader；
@@ -151,21 +156,51 @@ def build_m15_kline_feature(code, data, latest_date=None):
     return window
 
 
+def _load_anchor(code):
+    """分页 npy → (old_df, pq_max_date)：全字段历史 + date/code 派生列（date 由日历还原）。"""
+    parts = sorted(glob.glob(part_glob(code)))
+    if not parts:
+        return None, None
+    cols = full_cols()
+    x = np.concatenate([np.load(p, mmap_mode="r", allow_pickle=False) for p in parts])
+    old_df = pd.DataFrame(x, columns=cols)
+    if len(old_df):
+        cal = np.asarray([int(d) for d in get_trade_date_list()], dtype=np.int64)
+        old_df["date"] = cal[old_df["trade_date_idx"].to_numpy(np.int64)].astype(str)
+        old_df["code"] = str(code)
+        return old_df, old_df["date"].max()
+    return old_df, None
+
+
 def build_merged_feature(code, rebuild=False):
-    """合并 daily + m15 为单个 DataFrame，每天一行，m15 flatten 到列。支持增量更新。"""
-    # 读已有 parquet，取 pq_max_date 作为增量起点
-    pq_path = f'{FeatDIR}/{code}.parquet'
-    old_df = None
-    pq_max_date = None
-    if os.path.exists(pq_path) and not rebuild:
-        old_df = pd.read_parquet(pq_path)
-        pq_max_date = old_df['date'].max()
+    """合并 daily + m15 为单个 DataFrame，每天一行，m15 flatten 到列。支持增量更新。
+
+    返回 (df, force_full)：df=None 无数据；force_full=True 表示该票历史需全页重写
+    （复权锚点漂移：除权/口径修订使旧历史整体缩放，只重写尾页会在新旧锚点之间留
+    假涨跌接缝——除权日实测 −1.7% 假跳变）。
+    """
+    # 读分页历史，取 pq_max_date 作为增量起点（历史行不可变，新行纯追加）
+    old_df, pq_max_date = (None, None) if rebuild else _load_anchor(code)
 
     # 读取全量 kline，feature 函数根据 pq_max_date 内部算窗口
-    daily = read_kline('daily', code)
-    if daily.empty:
-        return old_df
-    daily = build_daily_kline_feature(code, daily, latest_date=pq_max_date)
+    daily_raw = read_kline('daily', code)
+    if daily_raw.empty:
+        return old_df, bool(rebuild)
+    force = bool(rebuild)
+    # 复权锚点漂移检测：当前 qfq 与锚点历史在重叠日期按常数比例缩放 ⇒ 全量重算。
+    if old_df is not None and len(old_df):
+        chk = daily_raw.merge(
+            old_df[["date", "close"]].rename(columns={"close": "close_old"}),
+            on="date", how="inner")
+        if len(chk) and not np.allclose(
+                chk["close"].to_numpy(np.float64).astype(np.float32),
+                chk["close_old"].to_numpy(np.float64),
+                rtol=0, atol=1e-9, equal_nan=True):
+            print(f"[feature] {code} 复权锚点漂移 → 全量重算")
+            old_df, pq_max_date = None, None
+            force = True
+
+    daily = build_daily_kline_feature(code, daily_raw, latest_date=pq_max_date)
 
     m15 = read_kline('m15', code)
     if not m15.empty:
@@ -177,9 +212,9 @@ def build_merged_feature(code, rebuild=False):
 
     # 无新数据直接返回老数据
     if daily.empty:
-        return old_df
+        return old_df, force
     # 增量追加：去掉全 NA 列避免 FutureWarning
     if old_df is not None:
-        return pd.concat([old_df, daily.dropna(axis=1, how='all')], ignore_index=True)
-    return daily
+        return pd.concat([old_df, daily.dropna(axis=1, how='all')], ignore_index=True), force
+    return daily, force
     

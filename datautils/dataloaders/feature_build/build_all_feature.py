@@ -1,8 +1,12 @@
 from AshareData.paths import BASE_FEATURE_DIR
 from AshareData.utils.exchanges_utils.stock_utils import get_code_list
+from AshareData.datautils.dataloaders.feature_build.model_ready import (
+    PAGE_SIZE, part_path, part_glob, code_dir, full_cols, save_manifest)
 
+import glob
 import json
 import os
+import numpy as np
 import tqdm
 from datetime import datetime
 
@@ -30,15 +34,49 @@ from AshareData.datautils.dataloaders.feature_build.stock_traits import (
 FeatDIR = BASE_FEATURE_DIR
 os.makedirs(FeatDIR, exist_ok=True)
 
+
+def _write_pages(code, df, rebuild=False):
+    """df → 分页 npy（全字段数值列、按交易日升序、float32，NaN 原样保留）。
+
+    封存页只读不动（rebuild 或缺失才写）；尾页恒写（每日增量/回卷都在尾页内）；
+    多余尾页删除。返回本票全字段列序。
+    """
+    full_cols_now = [c for c in sorted(df.columns) if c not in ("date", "code")]
+    x = df.sort_values("trade_date_idx", kind="stable")[full_cols_now].to_numpy(dtype=np.float32)
+    n = x.shape[0]
+    n_pages = (n + PAGE_SIZE - 1) // PAGE_SIZE if n else 0
+    os.makedirs(code_dir(code), exist_ok=True)
+    for k in range(max(0, n_pages - 1)):
+        target = part_path(code, k)
+        if rebuild or not os.path.exists(target):
+            tmp = f"{target}.tmp{os.getpid()}.npy"
+            np.save(tmp, x[k * PAGE_SIZE:(k + 1) * PAGE_SIZE])
+            os.replace(tmp, target)
+    if n_pages:
+        target = part_path(code, n_pages - 1)
+        tmp = f"{target}.tmp{os.getpid()}.npy"
+        np.save(tmp, x[(n_pages - 1) * PAGE_SIZE:])
+        os.replace(tmp, target)
+    for p in glob.glob(part_glob(code)):
+        try:
+            k = int(os.path.splitext(os.path.basename(p))[0].split("_")[1])
+        except (ValueError, IndexError):
+            continue
+        if k >= n_pages:
+            os.remove(p)
+    return full_cols_now
+
+
 def process_feature(codes, rebuild=False):
     """构建特征。codes 可以是单个 code 字符串或列表。"""
     if isinstance(codes, str):
         codes = [codes]
-    latest_date, built = '00000000', 0
+    latest_date, built, first_full_cols = '00000000', 0, None
+    drift_n = 0
     for code in codes:
         if not os.path.exists(f'{KLINE_DIRS["daily"]}/{code}.csv'):
             continue
-        df = build_merged_feature(code, rebuild)
+        df, force = build_merged_feature(code, rebuild)
         if df is None:
             continue
         # 按固定 schema 统一数值类型，避免 NaN 导致 int/float 不一致
@@ -49,14 +87,21 @@ def process_feature(codes, rebuild=False):
         for col in df.columns:
             if col not in PARQUET_NUM_SCHEMA and df[col].dtype in ('int64', 'Int64'):
                 df[col] = df[col].astype('float64')
-        df.to_parquet(f'{FeatDIR}/{code}.parquet', index=False)
+        # 分页写 npy（封存页跳过、尾页重写、多余页删除；漂移票全页重写）
+        fc = _write_pages(code, df, rebuild or force)
+        if force:
+            drift_n += 1
+        if first_full_cols is None:
+            first_full_cols = fc
         d = df['date'].max()
         if d > latest_date:
             latest_date = d
         built += 1
     return dict(
         stock_count=built,
-        latest_date=latest_date
+        latest_date=latest_date,
+        full_cols=first_full_cols,
+        drift=drift_n,
     )
 
 
@@ -64,7 +109,7 @@ def build_base_feature(codes=None, workers=16, rebuild=False):
     if codes is None:
         codes = get_code_list()
     from concurrent.futures import ProcessPoolExecutor, as_completed
-    latest_date, built = '00000000', 0
+    latest_date, built, full_cols_built, drift_total = '00000000', 0, None, 0
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futs = {pool.submit(process_feature, c, rebuild): c for c in codes}
         for fut in tqdm.tqdm(as_completed(futs), total=len(futs), desc='build_all'):
@@ -72,14 +117,22 @@ def build_base_feature(codes=None, workers=16, rebuild=False):
             built += r['stock_count']
             if r['latest_date'] > latest_date:
                 latest_date = r['latest_date']
-    # 写meta（含 schema）
-    schema = {}
-    import pyarrow.parquet as pq
-    for f in os.listdir(FeatDIR):
-        if f.endswith('.parquet'):
-            pf = pq.read_schema(f'{FeatDIR}/{f}')
-            schema = {field.name: str(field.type) for field in pf}
-            break
+            if full_cols_built is None and r['full_cols']:
+                full_cols_built = r['full_cols']
+            drift_total += r['drift']
+    print(f'[build_all] 复权锚点漂移重算: {drift_total} 票')
+    # manifest：全字段列序（列集变化自动覆盖，dataloader 按名映射）
+    if full_cols_built:
+        try:
+            _old = full_cols()
+            if _old != full_cols_built:
+                print(f'[build_all] 全字段列集变化: {len(_old)} → {len(full_cols_built)} 列')
+        except FileNotFoundError:
+            pass
+        save_manifest(full_cols_built)
+    schema = {c: 'float32' for c in (full_cols_built or [])}
+    schema['date'] = 'string'
+    schema['code'] = 'string'
     meta = {'build_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'stock_count': built, 'latest_date': latest_date,
             'schema': schema}
