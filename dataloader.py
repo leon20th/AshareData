@@ -42,54 +42,19 @@ from AshareData.datautils.dataloaders.feature_build.model_ready import (
     KLINE_NPY_DIR,
     part_glob,
     full_cols,
+    UPDOWN_SUB_COLUMNS,
+    MARKET_SUB_COLUMNS,
+    LONGHU_SUB_COLUMNS,
+    EVENT_SUB_COLUMNS,
+    TRAIT_SUB_COLUMNS,
+)
+from AshareData.datautils.dataloaders.feature_build.loader_tables import (
+    load_key_table,
 )
 from AshareData.utils.exchanges_utils.a_open import get_trade_date_list
 from AshareData.utils.log_util import get_logger
 
 logger = get_logger("kline_dataset_build.dataloader_np")
-
-UPDOWN_SUB_COLUMNS = [
-    'trade_date_idx',    # 交易日索引
-    'code_idx',          # 代码索引
-    'is_limit_up',       # 1=涨停 -1=跌停
-    'first_limit_min',   # 首次涨/跌停 开盘后分钟(不含午休)
-    'last_limit_min',    # 最终涨/跌停 开盘后分钟(不含午休)
-    'consecutive_days',  # 连续涨/跌停天数
-    'seal_volume_wan',   # 封单量(万手)
-    'seal_value_wan',    # 封单额(万元)
-    'seal_pct',          # 封成比(%)
-    'seal_flow_pct',     # 封流比(%)
-    'open_count',        # 开板次数
-    'days',              # 几天几板 天数 (跌停板填 0)
-    'boards',            # 几天几板 板数 (跌停板填 0)
-]
-
-MARKET_SUB_COLUMNS = [
-    'trade_date_idx', 'avg_pctChg', 'amount_sum', 'zhangting_count', 'dieting_count',
-    'up_count', 'down_count', 'flat_count', 'stock_count'
-]
-
-# 龙虎榜事件表列（extra_features.build_longhu_feature 产物，值域全 O(1)，原样入塔）
-LONGHU_SUB_COLUMNS = [
-    'trade_date_idx', 'code_idx',
-    'is_longhu', 'net_buy_ratio', 'buy_hhi', 'sell_hhi',
-    'buy_lhasa_ratio', 'famous_net_bias', 'reason_turnover', 'reason_amplitude',
-]
-
-# 事件结构表列（ev_* 同花顺原因词 base/driver/词龄 11 列；kp_* 看盘啦结构 co/chain 8 列；值域全 O(1)，原样入塔）
-EVENT_SUB_COLUMNS = [
-    'trade_date_idx', 'code_idx',
-    'ev_n_known', 'ev_n_base', 'ev_n_drv', 'ev_n_both',
-    'ev_share', 'ev_mix', 'ev_base_pure', 'ev_age_min_frac', 'ev_is_new',
-    'kp_sz', 'kp_rk', 'kp_fb', 'kp_age', 'kp_new', 'kp_gap', 'kp_rev', 'kp_nf',
-]
-
-# 股性长历史统计表列（stock_traits.parquet，14 列逐日横截面 rank01，契约后追加进 price 塔）
-TRAIT_SUB_COLUMNS = [
-    'trade_date_idx', 'code_idx',
-    't_mv', 't_lu120', 't_ld120', 't_bu120', 't_bd120', 't_sru', 't_srd',
-    't_dsl', 't_hi', 't_lo', 't_yz', 't_zb', 't_turn', 't_beta',
-]
 
 class _PagedCodeArray:
     """只读分页矩阵视图：对外 (n_total, n_model)，底层 = 若干 (≤PAGE_SIZE, n_full) 页。
@@ -300,136 +265,40 @@ class _KlineDataStorage:
         self.load_extra_data()
 
     def load_extra_data(self):
-        from AshareData.datautils.dataloaders.feature_build.extra_features import (
-            build_updown_limit_feature,
-            build_market_features,
-            build_pct_cross_rank,
-            build_longhu_feature,
-        )
+        """副表统一从 loader_npy 键表 mmap 直读（keys int64 升序 + vals float32）。
+
+        key = tdi * 100000 + code_idx（market 无 code 轴：key = tdi）；lookup 用
+        searchsorted 定位，未命中返回各表默认值（0 / traits 0.5）。
+        """
+        self._updown_keys, self._updown_values = load_key_table("updown")
+        _market_keys, self._market_values = load_key_table("market")
+        # market 无 code 轴：旧链 key 为裸 trade_date_idx（键表统一存 tdi*100000+code）
+        self._market_tdis = _market_keys // 100000
+        self._rank_keys, _rank_vals = load_key_table("pct_rank")
+        self._rank_values = _rank_vals[:, 0]
+        self._longhu_keys, self._longhu_values = load_key_table("longhu")
+        self._event_keys, event_vals = load_key_table("event")
+        self._trait_keys, self._trait_values = load_key_table("traits")
+
         _updown_cols = [c for c in UPDOWN_SUB_COLUMNS if c not in ('trade_date_idx', 'code_idx')]
         _market_cols = [c for c in MARKET_SUB_COLUMNS if c != 'trade_date_idx']
-
-        # 涨跌停 → numpy: tdis, code_idxs, values 分开存
-        updown_df = build_updown_limit_feature()[UPDOWN_SUB_COLUMNS]
-        if len(updown_df):
-            self._updown_tdis = updown_df['trade_date_idx'].to_numpy().astype(np.int64)
-            self._updown_code_idxs = updown_df['code_idx'].to_numpy().astype(np.int64)
-            self._updown_values = updown_df[_updown_cols].to_numpy().astype(np.float32)
-        else:
-            self._updown_tdis = np.empty(0, dtype=np.int64)
-            self._updown_code_idxs = np.empty(0, dtype=np.int64)
-            self._updown_values = np.empty((0, len(_updown_cols)), dtype=np.float32)
-
-        # 组合 key = tdi * 100000 + code_idx，用于 searchsorted 一次性定位
-        self._updown_keys = self._updown_tdis * 100000 + self._updown_code_idxs
-        order = np.argsort(self._updown_keys)
-        self._updown_keys = self._updown_keys[order]
-        self._updown_values = self._updown_values[order]
-
-        # 全市场 → numpy: tdis, values 分开存
-        market_df = build_market_features()[MARKET_SUB_COLUMNS]
-        if len(market_df):
-            self._market_tdis = market_df['trade_date_idx'].to_numpy().astype(np.int64)
-            self._market_values = market_df[_market_cols].to_numpy().astype(np.float32)
-        else:
-            self._market_tdis = np.empty(0, dtype=np.int64)
-            self._market_values = np.empty((0, len(_market_cols)), dtype=np.float32)
-
-        order = np.argsort(self._market_tdis)
-        self._market_tdis = self._market_tdis[order]
-        self._market_values = self._market_values[order]
-
-        # 横截面涨幅分位排名 → numpy: 组合 key 同 updown，单列 value
-        rank_df = build_pct_cross_rank()
-        if len(rank_df):
-            self._rank_keys = (rank_df['trade_date_idx'].to_numpy().astype(np.int64) * 100000
-                               + rank_df['code_idx'].to_numpy().astype(np.int64))
-            self._rank_values = rank_df['pct_rank'].to_numpy().astype(np.float32)
-            order = np.argsort(self._rank_keys)
-            self._rank_keys = self._rank_keys[order]
-            self._rank_values = self._rank_values[order]
-        else:
-            self._rank_keys = np.empty(0, dtype=np.int64)
-            self._rank_values = np.empty(0, dtype=np.float32)
-
-        # 龙虎榜 → numpy: 组合 key 同 updown
-        longhu_df = build_longhu_feature()[LONGHU_SUB_COLUMNS]
-        if len(longhu_df):
-            _lh_cols = [c for c in LONGHU_SUB_COLUMNS if c not in ('trade_date_idx', 'code_idx')]
-            self._longhu_keys = (longhu_df['trade_date_idx'].to_numpy().astype(np.int64) * 100000
-                                 + longhu_df['code_idx'].to_numpy().astype(np.int64))
-            self._longhu_values = longhu_df[_lh_cols].to_numpy().astype(np.float32)
-            order = np.argsort(self._longhu_keys)
-            self._longhu_keys = self._longhu_keys[order]
-            self._longhu_values = self._longhu_values[order]
-        else:
-            _lh_cols = []
-            self._longhu_keys = np.empty(0, dtype=np.int64)
-            self._longhu_values = np.empty((0, 0), dtype=np.float32)
-        self._longhu_sub_cols = _lh_cols
-        self._longhu_zeros = np.zeros(len(_lh_cols), dtype=np.float32)
-
-        # 事件结构特征（reason 词表 base/driver/词龄；文件缺失则全 0）
+        _lh_cols = [c for c in LONGHU_SUB_COLUMNS if c not in ('trade_date_idx', 'code_idx')]
         _ev_cols = [c for c in EVENT_SUB_COLUMNS if c not in ('trade_date_idx', 'code_idx')]
-        try:
-            # EVENT_PARQUET_OVERRIDE：实验替代表（如 placebo 对照）；未设置时行为不变
-            _ev_path = os.environ.get("EVENT_PARQUET_OVERRIDE") or f'{BUILT_DATA_DIR}/event_feat.parquet'
-            event_df = pd.read_parquet(_ev_path)
-            logger.info("event source: %s", _ev_path)
-            for c in _ev_cols:  # 向前兼容：老表缺列视为全 0
-                if c not in event_df.columns:
-                    event_df[c] = np.float32(0.0)
-            self._event_keys = (event_df['trade_date_idx'].to_numpy().astype(np.int64) * 100000
-                                + event_df['code_idx'].to_numpy().astype(np.int64))
-            self._event_values = event_df[_ev_cols].to_numpy().astype(np.float32)
-            order = np.argsort(self._event_keys)
-            self._event_keys = self._event_keys[order]
-            self._event_values = self._event_values[order]
-        except Exception as exc:
-            logger.warning("event_feat.parquet 不可用(%s)，事件列将全 0", exc)
-            self._event_keys = np.empty(0, dtype=np.int64)
-            self._event_values = np.empty((0, len(_ev_cols)), dtype=np.float32)
-        self._event_sub_cols = _ev_cols
-        self._event_zeros = np.zeros(len(_ev_cols), dtype=np.float32)
-
-        # 股性 traits（stock_traits.parquet；文件缺失则全 0.5 中性）
-        # TRAITS_PARQUET_OVERRIDE：实验替代表（如 placebo 对照）；未设置时行为不变
         _tr_cols = [c for c in TRAIT_SUB_COLUMNS if c not in ('trade_date_idx', 'code_idx')]
-        try:
-            _tr_path = os.environ.get("TRAITS_PARQUET_OVERRIDE") or f'{BUILT_DATA_DIR}/stock_traits.parquet'
-            trait_df = pd.read_parquet(_tr_path)
-            logger.info("traits source: %s", _tr_path)
-            for c in _tr_cols:  # 向前兼容：老表缺列视为中性
-                if c not in trait_df.columns:
-                    trait_df[c] = np.float32(0.5)
-            self._trait_keys = (trait_df['trade_date_idx'].to_numpy().astype(np.int64) * 100000
-                                + trait_df['code_idx'].to_numpy().astype(np.int64))
-            self._trait_values = trait_df[_tr_cols].to_numpy().astype(np.float32)
-            order = np.argsort(self._trait_keys)
-            self._trait_keys = self._trait_keys[order]
-            self._trait_values = self._trait_values[order]
-        except Exception as exc:
-            logger.warning("stock_traits.parquet 不可用(%s)，traits 列将全 0.5", exc)
-            self._trait_keys = np.empty(0, dtype=np.int64)
-            self._trait_values = np.empty((0, len(_tr_cols)), dtype=np.float32)
-        self._trait_sub_cols = _tr_cols
-        self._trait_default = np.full(len(_tr_cols), np.float32(0.5), dtype=np.float32)
+        # event 键表可能携带 kpe_* 附加列（kpl 原因嵌入，供其他实验），截取契约前段
+        self._event_values = event_vals[:, :len(_ev_cols)]
 
         self._updown_sub_cols = _updown_cols
         self._market_sub_cols = _market_cols
+        self._longhu_sub_cols = _lh_cols
+        self._event_sub_cols = _ev_cols
+        self._trait_sub_cols = _tr_cols
         self._updown_zeros = np.zeros(len(_updown_cols), dtype=np.float32)
         self._market_zeros = np.zeros(len(_market_cols), dtype=np.float32)
-        logger.info("extra data loaded: updown=%d, market=%d, pct_rank=%d, longhu=%d, event=%d, traits=%d", len(self._updown_tdis), len(self._market_tdis), len(self._rank_keys), len(self._longhu_keys), len(self._event_keys), len(self._trait_keys))
-
-        # extra DataFrame 仅取其 numpy 副本，读完即弃；pyarrow 内存池不随引用消失自动
-        # 归还 OS（实测 traits 读取后常驻 +1.3G 私有内存），故显式归还未用缓冲，
-        # 多进程场景每进程省 ~1.3G 私有内存。
-        updown_df = market_df = rank_df = longhu_df = event_df = trait_df = None
-        try:
-            import pyarrow as pa
-            pa.default_memory_pool().release_unused()
-        except Exception:
-            pass
+        self._longhu_zeros = np.zeros(len(_lh_cols), dtype=np.float32)
+        self._event_zeros = np.zeros(len(_ev_cols), dtype=np.float32)
+        self._trait_default = np.full(len(_tr_cols), np.float32(0.5), dtype=np.float32)
+        logger.info("extra data loaded: updown=%d, market=%d, pct_rank=%d, longhu=%d, event=%d, traits=%d", len(self._updown_keys), len(self._market_tdis), len(self._rank_keys), len(self._longhu_keys), len(self._event_keys), len(self._trait_keys))
 
     def lookup_pct_rank(self, tdis: np.ndarray, code_idx: int) -> np.ndarray:
         """按 (tdi, code_idx) 批量查找当日横截面涨幅分位，返回 (len(tdis),)，无记录（ST/新股等）→ 0。"""

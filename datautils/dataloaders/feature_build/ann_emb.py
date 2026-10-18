@@ -37,9 +37,10 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
-from AshareData.paths import BUILT_DATA_DIR, FIN_RETRIEVER_DIR, SCRAP_DATA_DIR
+from AshareData.paths import FIN_RETRIEVER_DIR, SCRAP_DATA_DIR
 from AshareData.utils.exchanges_utils.a_open import get_trade_date_list
 from AshareData.utils.exchanges_utils.stock_utils import get_code_list
+from AshareData.datautils.dataloaders.feature_build.model_ready import ANN_DIR
 
 DIM = 768
 KEY_MUL = 100000
@@ -49,15 +50,15 @@ TZ = timezone(timedelta(hours=8))
 STOCK_DIR = f'{SCRAP_DATA_DIR}/cninfo/stock'
 
 # ---- 产物（模型读这两个）----
-ANN_INDEX = f'{BUILT_DATA_DIR}/ann_index.npy'
-ANN_EMB = f'{BUILT_DATA_DIR}/ann_emb.f16.npy'
+ANN_INDEX = f'{ANN_DIR}/ann_index.npy'
+ANN_EMB = f'{ANN_DIR}/ann_emb.f16.npy'
 
 # ---- 增量缓存（构建用）----
-TITLE_INDEX = f'{BUILT_DATA_DIR}/ann_title_index.txt'
-TITLE_MAT = f'{BUILT_DATA_DIR}/ann_title_emb.f16.npy'
+TITLE_INDEX = f'{ANN_DIR}/ann_title_index.txt'
+TITLE_MAT = f'{ANN_DIR}/ann_title_emb.f16.npy'
 
 # ---- 临时文件 ----
-TITLE_MAT_TMP = f'{BUILT_DATA_DIR}/_ann_title_emb.tmp.npy'
+TITLE_MAT_TMP = f'{ANN_DIR}/_ann_title_emb.tmp.npy'
 
 MODEL_DIR = FIN_RETRIEVER_DIR
 

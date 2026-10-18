@@ -1,7 +1,7 @@
 # kpl_features —— 开盘啦事件结构特征（co 日内共现 / chain 跨日连边）→ built_data
 # 流程: scrap_data/kaipanla/*.json → kpl_events.parquet（原始事件，增量）
 #        → kp_* 8 列（co: 组规模/组内板数分位/首板占比；chain: 轮龄/轮首日/间隔/5日再现/新面孔）
-#        → kpl_edges.parquet（题材-个股边表，供图模型）+ 合并进 event_feat.parquet（ev_* 列原样保留）
+#        → kpl_edges.parquet（题材-个股边表，供图模型）+ 合并进 event 键表（ev_* 列原样保留）
 # 口径: 2019+ 涨停复盘事件; 剔除 zscode=0("其他"); 遗留码段(885/881/880/882)按题材名归一到 801 主码;
 #        episode = 同题材相邻出演间隔 ≤3 交易日为同一轮
 import json
@@ -14,11 +14,14 @@ import pandas as pd
 from AshareData.paths import BUILT_DATA_DIR, SCRAP_DATA_DIR
 from AshareData.datautils.dataloaders.feature_build.feature_utils import (
     get_code_idx, get_trade_date_idx)
+from AshareData.datautils.dataloaders.feature_build.loader_tables import (
+    save_key_table, read_key_table_df)
+from AshareData.datautils.dataloaders.feature_build.model_ready import (
+    EVENT_SUB_COLUMNS)
 
 KPL_RAW_DIR = f'{SCRAP_DATA_DIR}/kaipanla'
-KPL_EVENTS_PARQUET = f'{BUILT_DATA_DIR}/kpl_events.parquet'
-KPL_EDGES_PARQUET = f'{BUILT_DATA_DIR}/kpl_edges.parquet'
-EVENT_FEAT_PARQUET = f'{BUILT_DATA_DIR}/event_feat.parquet'
+KPL_EVENTS_PARQUET = f'{BUILT_DATA_DIR}/misc/kpl_events.parquet'
+KPL_EDGES_PARQUET = f'{BUILT_DATA_DIR}/misc/kpl_edges.parquet'
 
 EVENT_COLUMNS = ['date', 'code', 'zscode', 'zs_name', 'segment', 'industry', 'board_txt', 'boards', 'reason_txt']
 KP_COLUMNS = ['kp_sz', 'kp_rk', 'kp_fb', 'kp_age', 'kp_new', 'kp_gap', 'kp_rev', 'kp_nf']
@@ -167,21 +170,22 @@ def _compute_kp(E: pd.DataFrame):
 
 
 def _merge_event_feat(K: pd.DataFrame) -> pd.DataFrame:
-    """kp 列并入 event_feat.parquet：ev_* 列原样保留，kp 列整体替换；无事件日补 0。"""
-    feat = pd.read_parquet(EVENT_FEAT_PARQUET) if os.path.exists(EVENT_FEAT_PARQUET) else None
-    ev_cols = [c for c in feat.columns if c.startswith('ev_')] if feat is not None else []
+    """kp 列并入 event 键表：ev_*/kpe_* 列原样保留，kp 列整体替换；无事件日补 0。"""
+    feat = read_key_table_df('event')
+    ev_cols = [c for c in EVENT_SUB_COLUMNS if c.startswith('ev_') and (feat is None or c in feat.columns)]
+    kp_cols = [c for c in EVENT_SUB_COLUMNS if c.startswith('kp_')]
+    kpe_cols = [c for c in (feat.columns if feat is not None else []) if c.startswith('kpe_')]
     if feat is None:
         out = K.copy()
     else:
-        base = feat.drop(columns=[c for c in KP_COLUMNS if c in feat.columns]).copy()
-        base['trade_date_idx'] = base.trade_date_idx.astype('int64')
-        base['code_idx'] = base.code_idx.astype('int64')
+        base = feat.drop(columns=[c for c in kp_cols if c in feat.columns]).copy()
         out = base.merge(K, on=['trade_date_idx', 'code_idx'], how='outer')
-    for c in ev_cols + KP_COLUMNS:
+    for c in ev_cols + kp_cols + kpe_cols:
         out[c] = pd.to_numeric(out[c], errors='coerce').fillna(0).astype(np.float32)
-    out = out[['trade_date_idx', 'code_idx'] + ev_cols + KP_COLUMNS]
+    keep = ['trade_date_idx', 'code_idx'] + ev_cols + kp_cols + kpe_cols
+    out = out[keep]
     out = out.sort_values(['trade_date_idx', 'code_idx']).reset_index(drop=True)
-    out.to_parquet(EVENT_FEAT_PARQUET, index=False)
+    save_key_table('event', out, keep, 0.0, source='build_kpl_features')
     return out
 
 
@@ -190,7 +194,7 @@ def build_kpl_features(update: bool = False, force_rebuild: bool = False):
     events, added = build_kpl_events(update=update, force_rebuild=force_rebuild)
     if events is None:
         return None
-    feat = pd.read_parquet(EVENT_FEAT_PARQUET) if os.path.exists(EVENT_FEAT_PARQUET) else None
+    feat = read_key_table_df('event')
     has_kp = feat is not None and all(c in feat.columns for c in KP_COLUMNS)
     if added == 0 and not force_rebuild and has_kp:
         print('[kpl] 无新数据')
@@ -198,7 +202,7 @@ def build_kpl_features(update: bool = False, force_rebuild: bool = False):
     K, edges = _compute_kp(events)
     edges.to_parquet(KPL_EDGES_PARQUET, index=False)
     merged = _merge_event_feat(K)
-    print(f'[kpl] edges {len(edges)}行 → kpl_edges.parquet | event_feat {merged.shape} | ' +
+    print(f'[kpl] edges {len(edges)}行 → kpl_edges.parquet | event 键表 {merged.shape} | ' +
           f'kp 非零率 ' + str({c: round(float((merged[c] > 0).mean()), 3) for c in KP_COLUMNS}))
     return merged
 

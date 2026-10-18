@@ -8,6 +8,10 @@ from datetime import datetime
 from AshareData.paths import BUILT_DATA_DIR, SCRAP_DATA_DIR
 
 from AshareData.datautils.dataloaders.feature_build.feature_utils import get_code_idx, get_trade_date_idx
+from AshareData.datautils.dataloaders.feature_build.loader_tables import (
+    save_key_table, read_key_table_df, read_meta)
+from AshareData.datautils.dataloaders.feature_build.model_ready import (
+    MARKET_SUB_COLUMNS, LONGHU_SUB_COLUMNS, UPDOWN_SUB_COLUMNS)
 
 UPDOWN_COLUMNS = [
     'date',              # 交易日 YYYYMMDD
@@ -31,7 +35,7 @@ UPDOWN_COLUMNS = [
 UPLIMIT_DIR = f'{SCRAP_DATA_DIR}/zhangtingban'
 DOWNLIMIT_DIR = f'{SCRAP_DATA_DIR}/dietingban'
 
-UPDOWN_PARQUET = f'{BUILT_DATA_DIR}/updown_limit.parquet'
+UPDOWN_PARQUET = f'{BUILT_DATA_DIR}/misc/updown_limit.parquet'
 os.makedirs(os.path.dirname(UPDOWN_PARQUET), exist_ok=True)
 
 
@@ -129,18 +133,24 @@ def build_updown_limit_feature(update: bool = False, force_rebuild: bool = False
     return combined
 
 
-MARKET_PARQUET = f'{BUILT_DATA_DIR}/market_daily_stats.parquet'
-MARKET_COLUMNS = ['date', 'trade_date_idx', 'avg_pctChg', 'amount_sum', 'zhangting_count', 'dieting_count',
-                  'up_count', 'down_count', 'flat_count', 'stock_count']
-os.makedirs(os.path.dirname(MARKET_PARQUET), exist_ok=True)
+def publish_updown_npy() -> int:
+    """updown_limit.parquet（UI/决策共享源）→ loader_npy/updown 键表。"""
+    ud = build_updown_limit_feature()
+    if ud is None:
+        return 0
+    return save_key_table('updown', ud, UPDOWN_SUB_COLUMNS, 0.0,
+                          source='updown_limit.parquet')
 
 
 def build_market_features(update: bool = False, force_rebuild: bool = False) -> pd.DataFrame:
-    """每天全市场统计: 平均涨幅、成交额、涨跌平家数、涨跌停家数、股票总数。"""
-    existing = pd.read_parquet(MARKET_PARQUET) if not force_rebuild and os.path.exists(MARKET_PARQUET) else None
+    """每天全市场统计: 平均涨幅、成交额、涨跌平家数、涨跌停家数、股票总数。
+
+    状态与产物 = loader_npy/market 键表（key = tdi，无 code 轴）；meta.latest_date 记录增量水位。
+    """
+    existing = read_key_table_df('market') if not force_rebuild else None
     if not update and not force_rebuild:
         return existing
-    latest = existing['date'].max() if existing is not None and len(existing) else '00000000'
+    latest = read_meta('market').get('latest_date', '00000000') if existing is not None else '00000000'
 
     from AshareData.datautils.dataloaders.feature_build.feature_calc import read_kline
     all_kline = read_kline('daily', usecols=['date', 'code', 'pctChg', 'amount'])
@@ -167,18 +177,18 @@ def build_market_features(update: bool = False, force_rebuild: bool = False) -> 
         daily = daily.join(zt, on='date').join(dt, on='date')
         daily[['zhangting_count', 'dieting_count']] = daily[['zhangting_count', 'dieting_count']].fillna(0).astype(int)
 
+    daily['trade_date_idx'] = get_trade_date_idx(daily['date'].astype(str))
     combined = pd.concat([existing, daily], ignore_index=True) if existing is not None else daily
-    combined = (combined.sort_values('date').drop_duplicates('date', keep='last')
+    combined = (combined.sort_values('trade_date_idx').drop_duplicates('trade_date_idx', keep='last')
                 .reset_index(drop=True))
-    if 'trade_date_idx' not in combined.columns or combined['trade_date_idx'].isna().any():
-        combined['trade_date_idx'] = get_trade_date_idx(combined['date'].astype(str))
-    combined = combined[MARKET_COLUMNS]
-    combined.to_parquet(MARKET_PARQUET, index=False)
-    print(f'[market] +{len(daily)}天, {len(combined)}行, 最新{combined.date.max()}')
+    combined = combined[MARKET_SUB_COLUMNS]
+    save_key_table('market', combined, MARKET_SUB_COLUMNS, 0.0,
+                   source='build_market_features',
+                   extra={'latest_date': str(daily.date.max())})
+    print(f'[market] +{len(daily)}天, {len(combined)}行, 最新{daily.date.max()}')
     return combined
 
 
-PCT_RANK_PARQUET = f'{BUILT_DATA_DIR}/pct_cross_rank.parquet'
 PCT_RANK_COLUMNS = ['trade_date_idx', 'code_idx', 'pct_rank']
 
 
@@ -192,7 +202,7 @@ def build_pct_cross_rank(update: bool = False, force_rebuild: bool = False) -> p
 
     横截面 rank 按天独立，可增量（只算新 trade_date_idx）。
     """
-    existing = pd.read_parquet(PCT_RANK_PARQUET) if not force_rebuild and os.path.exists(PCT_RANK_PARQUET) else None
+    existing = read_key_table_df('pct_rank') if not force_rebuild else None
     if not update and not force_rebuild:
         return existing
     latest = int(existing['trade_date_idx'].max()) if existing is not None and len(existing) else -1
@@ -234,7 +244,8 @@ def build_pct_cross_rank(update: bool = False, force_rebuild: bool = False) -> p
     combined['trade_date_idx'] = combined['trade_date_idx'].astype('int64')
     combined['code_idx'] = combined['code_idx'].astype('int64')
     combined = combined[PCT_RANK_COLUMNS]
-    combined.to_parquet(PCT_RANK_PARQUET, index=False)
+    save_key_table('pct_rank', combined, PCT_RANK_COLUMNS, 0.0,
+                   source='build_pct_cross_rank')
     print(f'[pct_rank] +{int(d.trade_date_idx.nunique())}天, {len(combined)}行, 最新tdi{int(combined.trade_date_idx.max())}')
     return combined
 
@@ -248,8 +259,6 @@ def build_pct_cross_rank(update: bool = False, force_rebuild: bool = False) -> p
 # 同 (code,date) 多条 reason 记录 → 保留文件序最后一条。
 
 LONGHU_DIR = f'{SCRAP_DATA_DIR}/longhu'
-LONGHU_PARQUET = f'{BUILT_DATA_DIR}/longhu_features.parquet'
-os.makedirs(os.path.dirname(LONGHU_PARQUET), exist_ok=True)
 
 LONGHU_COLUMNS = ['date', 'trade_date_idx', 'code', 'code_idx', 'is_longhu',
                   'net_buy_ratio', 'buy_hhi', 'sell_hhi', 'buy_lhasa_ratio',
@@ -323,30 +332,33 @@ def _read_longhu_file(filepath: str) -> pd.DataFrame:
 
 
 def build_longhu_feature(update: bool = False, force_rebuild: bool = False) -> pd.DataFrame:
-    """构建龙虎榜历史特征(增量)。已有 parquet 只处理新文件，force_rebuild 全量重建。"""
-    existing = pd.read_parquet(LONGHU_PARQUET) if not force_rebuild and os.path.exists(LONGHU_PARQUET) else None
+    """构建龙虎榜历史特征(增量)。状态与产物 = loader_npy/longhu 键表；meta.latest_date 增量水位。"""
+    existing = read_key_table_df('longhu') if not force_rebuild else None
     if not update:
         return existing
-    latest = existing['date'].max() if existing is not None and len(existing) else '00000000'
+    latest = read_meta('longhu').get('latest_date', '00000000') if existing is not None else '00000000'
     new_files = [f for f in sorted(os.listdir(LONGHU_DIR)) if f.endswith('.json') and f[:10].replace('-', '') > latest]
     if not new_files:
         return existing
 
     new_frames = [_read_longhu_file(f'{LONGHU_DIR}/{f}') for f in new_files]
-    combined = pd.concat([existing, *new_frames], ignore_index=True) if existing is not None else pd.concat(new_frames, ignore_index=True)
-    combined = (combined.drop_duplicates(['date', 'code'], keep='last')
-                .sort_values(['date', 'code']).reset_index(drop=True))
-    if 'trade_date_idx' not in combined.columns or combined['trade_date_idx'].isna().any():
-        combined['trade_date_idx'] = get_trade_date_idx(combined['date'].astype(str))
-    if 'code_idx' not in combined.columns or combined['code_idx'].isna().any():
-        combined['code_idx'] = get_code_idx(combined['code'].astype(str))
+    newd = pd.concat(new_frames, ignore_index=True).drop_duplicates(['date', 'code'], keep='last')
+    newd['trade_date_idx'] = get_trade_date_idx(newd['date'].astype(str))
+    newd['code_idx'] = get_code_idx(newd['code'].astype(str))
+    combined = pd.concat([existing, newd], ignore_index=True) if existing is not None else newd
+    combined = (combined.sort_values('trade_date_idx')
+                .drop_duplicates(['trade_date_idx', 'code_idx'], keep='last')
+                .reset_index(drop=True))
     bad = int((combined['code_idx'] < 0).sum())
     if bad:
         print(f'[longhu] 丢弃无法定位 code_idx 的 {bad} 行（B股/退市等）')
         combined = combined[combined['code_idx'] >= 0]
-    combined = combined[LONGHU_COLUMNS]
-    combined.to_parquet(LONGHU_PARQUET, index=False)
-    print(f'[longhu] +{len(new_files)}天, {len(combined)}行, 最新{combined.date.max()}')
+    combined['trade_date_idx'] = combined['trade_date_idx'].astype('int64')
+    combined['code_idx'] = combined['code_idx'].astype('int64')
+    save_key_table('longhu', combined, LONGHU_SUB_COLUMNS, 0.0,
+                   source='build_longhu_feature',
+                   extra={'latest_date': max(f[:10].replace('-', '') for f in new_files)})
+    print(f'[longhu] +{len(new_files)}天, {len(combined)}行, 最新{newd.date.max()}')
     return combined
 
 

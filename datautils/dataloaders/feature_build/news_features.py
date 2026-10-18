@@ -29,7 +29,7 @@ from AshareData.datautils.dataloaders.feature_build.feature_utils import get_cod
 
 EM_DIR = f'{SCRAP_DATA_DIR}/news_em724'
 CLS_DIR = f'{SCRAP_DATA_DIR}/news_cls'
-NEWS_PARQUET = f'{BUILT_DATA_DIR}/news_features.parquet'
+NEWS_PARQUET = f'{BUILT_DATA_DIR}/misc/news_features.parquet'
 
 NW_COLUMNS = ['nw_em', 'nw_cls', 'nw_cnt', 'nw_rec', 'nw_late', 'nw_3d', 'nw_nov', 'nw_subj']
 
@@ -116,7 +116,7 @@ def _kpl_theme_names() -> set:
         for f, col in (('kpl_theme_entities.parquet', 'name_cur'),
                        ('kpl_theme_aliases.parquet', 'zs_name')):
             try:
-                names |= set(pd.read_parquet(f'{BUILT_DATA_DIR}/{f}', columns=[col])[col].astype(str))
+                names |= set(pd.read_parquet(f'{BUILT_DATA_DIR}/misc/{f}', columns=[col])[col].astype(str))
             except (OSError, KeyError):
                 pass
         _THEME_NAMES = {n for n in names if len(n) >= 2 and n not in ('其他', '其他概念')}
@@ -139,9 +139,9 @@ def _subj_heat_table(subj_heat) -> pd.DataFrame:
     if not subj_heat:
         return empty
     try:
-        m = pd.read_parquet(f'{BUILT_DATA_DIR}/kpl_theme_members.parquet',
+        m = pd.read_parquet(f'{BUILT_DATA_DIR}/misc/kpl_theme_members.parquet',
                             columns=['date', 'code', 'entity_id'])
-        ent = pd.read_parquet(f'{BUILT_DATA_DIR}/kpl_theme_entities.parquet',
+        ent = pd.read_parquet(f'{BUILT_DATA_DIR}/misc/kpl_theme_entities.parquet',
                               columns=['entity_id', 'name_cur'])
     except (OSError, KeyError):
         return empty

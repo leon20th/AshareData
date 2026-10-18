@@ -4,7 +4,7 @@
   kpl_events.reason_txt → 增量嵌入（CUDA 空闲用 CUDA / 忙则退 CPU；macOS 用 MPS；都无则 CPU）
   → built_data/kpl_reason_emb.parquet    事件级嵌入（date, code, emb[768]，L2 归一化）
   → 冻结 PCA16（kpl_reason_pca16.npz）  → built_data/kpl_reason_emb16.parquet（kpe_0..15）
-  → 并入 event_feat.parquet（outer merge，与 kp_* 同法；无事件行补 0）
+  → 并入 event 键表（outer merge，与 kp_* 同法；无事件行补 0）
 
 规则：
 - PCA 冻结：新增事件只 transform 不 refit（保证特征跨期一致）；重拟合需显式
@@ -27,12 +27,13 @@ from AshareData.datautils.dataloaders.feature_build.feature_utils import (
     get_code_idx,
     get_trade_date_idx,
 )
+from AshareData.datautils.dataloaders.feature_build.loader_tables import (
+    save_key_table, read_key_table_df)
 
-EVENTS = f'{BUILT_DATA_DIR}/kpl_events.parquet'
-EMB = f'{BUILT_DATA_DIR}/kpl_reason_emb.parquet'
-PCA_NPZ = f'{BUILT_DATA_DIR}/kpl_reason_pca16.npz'
-EMB16 = f'{BUILT_DATA_DIR}/kpl_reason_emb16.parquet'
-EVENT_FEAT_PARQUET = f'{BUILT_DATA_DIR}/event_feat.parquet'
+EVENTS = f'{BUILT_DATA_DIR}/misc/kpl_events.parquet'
+EMB = f'{BUILT_DATA_DIR}/misc/kpl_reason_emb.parquet'
+PCA_NPZ = f'{BUILT_DATA_DIR}/misc/kpl_reason_pca16.npz'
+EMB16 = f'{BUILT_DATA_DIR}/misc/kpl_reason_emb16.parquet'
 MODEL_DIR = FIN_RETRIEVER_DIR
 N_PCA = 16
 KPE_COLUMNS = [f'kpe_{i}' for i in range(N_PCA)]
@@ -117,25 +118,21 @@ def build_pca16(refit: bool = False) -> pd.DataFrame:
 
 
 def merge_event_feat(force: bool = False) -> int:
-    """kpe_* 并入 event_feat.parquet（outer merge，ev_*/kp_* 原样保留）。返回行数。"""
-    if not os.path.exists(EVENT_FEAT_PARQUET) or not os.path.exists(EMB16):
+    """kpe_* 并入 event 键表（outer merge，ev_*/kp_* 原样保留）。返回行数。"""
+    feat = read_key_table_df('event')
+    if feat is None or not os.path.exists(EMB16):
         return 0
-    feat = pd.read_parquet(EVENT_FEAT_PARQUET)
     if all(c in feat.columns for c in KPE_COLUMNS) and not force:
         return 0
     b16 = pd.read_parquet(EMB16, columns=['trade_date_idx', 'code_idx'] + KPE_COLUMNS)
     base = feat.drop(columns=[c for c in KPE_COLUMNS if c in feat.columns]).copy()
-    base['trade_date_idx'] = base.trade_date_idx.astype('int64')
-    base['code_idx'] = base.code_idx.astype('int64')
     out = base.merge(b16, on=['trade_date_idx', 'code_idx'], how='outer')
-    ev_cols = [c for c in out.columns if c.startswith('ev_')]
-    kp_cols = [c for c in out.columns if c.startswith('kp_')]
-    for c in ev_cols + kp_cols + KPE_COLUMNS:
+    for c in [c for c in out.columns if c.startswith(('ev_', 'kp_', 'kpe_'))]:
         out[c] = pd.to_numeric(out[c], errors='coerce').fillna(0).astype(np.float32)
-    out = out[['trade_date_idx', 'code_idx'] + ev_cols + kp_cols + KPE_COLUMNS]
-    out = out.sort_values(['trade_date_idx', 'code_idx']).reset_index(drop=True)
-    out.to_parquet(EVENT_FEAT_PARQUET, index=False)
-    print(f'[kpl-emb] event_feat {feat.shape} → {out.shape}（+{len(KPE_COLUMNS)} 列 kpe_*）')
+    keep = ([c for c in out.columns if c in ('trade_date_idx', 'code_idx') or c.startswith(('ev_', 'kp_', 'kpe_'))])
+    out = out[keep].sort_values(['trade_date_idx', 'code_idx']).reset_index(drop=True)
+    save_key_table('event', out, keep, 0.0, source='build_kpl_reason_emb')
+    print(f'[kpl-emb] event 键表 {feat.shape} → {out.shape}（+{len(KPE_COLUMNS)} 列 kpe_*）')
     return len(out)
 
 

@@ -17,6 +17,7 @@ from AshareData.datautils.dataloaders.feature_build.feature_calc import (
 )
 from AshareData.datautils.dataloaders.feature_build.extra_features import (
     build_updown_limit_feature,
+    publish_updown_npy,
     build_market_features,
     build_pct_cross_rank,
     build_longhu_feature
@@ -152,6 +153,7 @@ if __name__ == '__main__':
         os.environ['ASHARE_DAILY_SOURCE'] = a.daily_source
     build_base_feature(rebuild=a.rebuild)
     build_updown_limit_feature(update=True)
+    publish_updown_npy()                # 涨跌停 → loader_npy/updown 键表（parquet 仍是 UI/决策源）
     build_market_features(update=True)
     build_pct_cross_rank(update=True)  # 依赖 base_feature，须在其后
     build_longhu_feature(update=True)

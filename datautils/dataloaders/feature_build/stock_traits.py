@@ -1,5 +1,5 @@
-# stock_traits —— 个股"股性"长历史统计（B/C 族）→ built_data/stock_traits.parquet
-# 数据源：base_feature 日线（全历史）+ updown_limit.parquet（涨跌停权威旗标 + 涨停质量）+ market_daily_stats.parquet（beta 基准）
+# stock_traits —— 个股"股性"长历史统计（B/C 族）→ loader_npy/traits 键表
+# 数据源：base_feature 日线（全历史）+ updown_limit.parquet（涨跌停权威旗标 + 涨停质量）+ market 键表（beta 基准）
 # 口径：涨停/跌停 = updown_limit 表 is_limit_up（±1）——复权价上数值判定不可靠
 #   （除权日因子跳变使 |close−round(preclose×(1±板),2)|<0.001 漏检过半，实测 11.4 万仅判出 5.5 万）；
 #       rel=(pctChg/100)/price_limit；长统计 shift(1) 防泄漏；输出 = 逐日横截面升序 rank01
@@ -20,8 +20,11 @@ import numpy as np
 import polars as pl
 
 from AshareData.paths import BUILT_DATA_DIR
+from AshareData.datautils.dataloaders.feature_build.loader_tables import (
+    save_key_table, read_key_table_df)
+from AshareData.datautils.dataloaders.feature_build.model_ready import (
+    TRAIT_SUB_COLUMNS)
 
-TRAIT_PARQUET = f"{BUILT_DATA_DIR}/stock_traits.parquet"
 TRAIT_COLS = ["t_mv", "t_lu120", "t_ld120", "t_bu120", "t_bd120", "t_sru", "t_srd",
               "t_dsl", "t_hi", "t_lo", "t_yz", "t_zb", "t_turn", "t_beta"]
 _RAW = {"t_mv": "fv", "t_lu120": "lu120", "t_ld120": "ld120", "t_bu120": "bu120",
@@ -31,7 +34,7 @@ _RAW = {"t_mv": "fv", "t_lu120": "lu120", "t_ld120": "ld120", "t_bu120": "bu120"
 
 
 def build():
-    """全量重建 stock_traits.parquet（重建式；调用即重建，不设跳过）。"""
+    """全量重建 traits 键表（重建式；调用即重建，不设跳过）。"""
     t0 = time.time()
     i8 = pl.Int8
     need = ["trade_date_idx", "code_idx", "close", "preclose",
@@ -53,7 +56,7 @@ def build():
                         code_idx=pl.col("code_idx").cast(pl.Int64))
          .sort(["code_idx", "trade_date_idx"]))
     # 涨跌停旗标取权威表（去重 keep=last；无事件日填 False）
-    up_full = (pl.read_parquet(f"{BUILT_DATA_DIR}/updown_limit.parquet")
+    up_full = (pl.read_parquet(f"{BUILT_DATA_DIR}/misc/updown_limit.parquet")
                .with_columns(trade_date_idx=pl.col("trade_date_idx").cast(pl.Int64),
                              code_idx=pl.col("code_idx").cast(pl.Int64))
                .sort(["code_idx", "trade_date_idx"])
@@ -93,7 +96,7 @@ def build():
         sru=pl.when(pl.col("bu120") >= 5).then(pl.col("lu120") / pl.col("bu120")).otherwise(None),
         srd=pl.when(pl.col("bd120") >= 5).then(pl.col("ld120") / pl.col("bd120")).otherwise(None),
     )
-    mkt = (pl.read_parquet(f"{BUILT_DATA_DIR}/market_daily_stats.parquet")
+    mkt = (pl.from_pandas(read_key_table_df('market'))
            .select(["trade_date_idx", "avg_pctChg"])
            .with_columns(trade_date_idx=pl.col("trade_date_idx").cast(pl.Int64)))
     d = d.join(mkt, on="trade_date_idx", how="left")
@@ -128,8 +131,9 @@ def build():
              / pl.max_horizontal(n - 1, pl.lit(1.0))).alias(k))
     out = out.with_columns([pl.col(c).fill_null(0.5).cast(pl.Float32) for c in TRAIT_COLS])
     out = out.sort(["trade_date_idx", "code_idx"])
-    out.write_parquet(TRAIT_PARQUET)
-    print(f"[traits] {out.shape} → {TRAIT_PARQUET} ({time.time()-t0:.0f}s) "
+    rows = save_key_table('traits', out.to_pandas(), TRAIT_SUB_COLUMNS, 0.5,
+                          source='stock_traits.build')
+    print(f"[traits] {out.shape} → loader_npy/traits 键表 {rows} 行 ({time.time()-t0:.0f}s) "
           f"tdi {int(out['trade_date_idx'].min())}-{int(out['trade_date_idx'].max())}")
     return out
 

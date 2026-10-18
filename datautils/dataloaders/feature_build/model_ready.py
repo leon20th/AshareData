@@ -38,8 +38,49 @@ M15_tech_COLUMNS = [
 # 模型直载列序 = dataloader 默认 need_cols
 MODEL_READY_COLS = CORE_REQUIRED_COLUMNS + Daily_tech_COLUMNS + M15_tech_COLUMNS
 
-# npy 缓存目录（SSD 寻址层）
-KLINE_NPY_DIR = os.path.join(BUILT_DATA_DIR, "base_feature_npy")
+# 直喂 dataloader/模型的构建结果统一管理目录（SSD mmap 直读层）：
+#   kline/   per-code 分页全字段（唯一行情存储）
+#   updown|market|pct_rank|longhu|event|traits/   排序键表 keys.npy + vals.npy + meta.json
+#   ann/     公告嵌入（直喂模型）
+LOADER_NPY_DIR = os.path.join(BUILT_DATA_DIR, "loader_npy")
+
+# npy 缓存目录（SSD 寻址层）：kline 分页在统一目录内
+KLINE_NPY_DIR = os.path.join(LOADER_NPY_DIR, "kline")
+
+# 公告嵌入目录（ann_index.npy / ann_emb.f16.npy / ann_title_*）
+ANN_DIR = os.path.join(LOADER_NPY_DIR, "ann")
+
+# —— 各副表子列契约（dataloader 按此序物化 lookup；构建器/发布器共用）——
+UPDOWN_SUB_COLUMNS = [
+    'trade_date_idx', 'code_idx',
+    'is_limit_up', 'first_limit_min', 'last_limit_min', 'consecutive_days',
+    'seal_volume_wan', 'seal_value_wan', 'seal_pct', 'seal_flow_pct',
+    'open_count', 'days', 'boards',
+]
+
+MARKET_SUB_COLUMNS = [
+    'trade_date_idx', 'avg_pctChg', 'amount_sum', 'zhangting_count', 'dieting_count',
+    'up_count', 'down_count', 'flat_count', 'stock_count'
+]
+
+LONGHU_SUB_COLUMNS = [
+    'trade_date_idx', 'code_idx',
+    'is_longhu', 'net_buy_ratio', 'buy_hhi', 'sell_hhi',
+    'buy_lhasa_ratio', 'famous_net_bias', 'reason_turnover', 'reason_amplitude',
+]
+
+EVENT_SUB_COLUMNS = [
+    'trade_date_idx', 'code_idx',
+    'ev_n_known', 'ev_n_base', 'ev_n_drv', 'ev_n_both',
+    'ev_share', 'ev_mix', 'ev_base_pure', 'ev_age_min_frac', 'ev_is_new',
+    'kp_sz', 'kp_rk', 'kp_fb', 'kp_age', 'kp_new', 'kp_gap', 'kp_rev', 'kp_nf',
+]
+
+TRAIT_SUB_COLUMNS = [
+    'trade_date_idx', 'code_idx',
+    't_mv', 't_lu120', 't_ld120', 't_bu120', 't_bd120', 't_sru', 't_srd',
+    't_dsl', 't_hi', 't_lo', 't_yz', 't_zb', 't_turn', 't_beta',
+]
 
 PAGE_SIZE = 256          # 每页最大行数（> 特征重算回卷窗 ~100 行：封存页永不被回卷波及）
 

@@ -38,17 +38,17 @@ from AshareData.datautils.dataloaders.feature_build.feature_utils import (
     get_trade_date_idx,
 )
 
-EVENTS = f'{BUILT_DATA_DIR}/kpl_events.parquet'
-OUT_E = f'{BUILT_DATA_DIR}/kpl_theme_entities.parquet'
-OUT_A = f'{BUILT_DATA_DIR}/kpl_theme_aliases.parquet'
-OUT_M = f'{BUILT_DATA_DIR}/kpl_theme_members.parquet'
-OUT_R = f'{BUILT_DATA_DIR}/kpl_theme_review.csv'
+EVENTS = f'{BUILT_DATA_DIR}/misc/kpl_events.parquet'
+OUT_E = f'{BUILT_DATA_DIR}/misc/kpl_theme_entities.parquet'
+OUT_A = f'{BUILT_DATA_DIR}/misc/kpl_theme_aliases.parquet'
+OUT_M = f'{BUILT_DATA_DIR}/misc/kpl_theme_members.parquet'
+OUT_R = f'{BUILT_DATA_DIR}/misc/kpl_theme_review.csv'
 # 人工覆写（可选）：列 [code, name_a, name_b, note]；同码下强制合并 name_a~name_b
-MANUAL = f'{BUILT_DATA_DIR}/kpl_theme_manual.csv'
+MANUAL = f'{BUILT_DATA_DIR}/misc/kpl_theme_manual.csv'
 # 细分→父级 映射表（kpl_segment_map_ai 生成/可人工改）：列 [segment, parent, source, note]
-SEG_MAP = f'{BUILT_DATA_DIR}/kpl_theme_segment_map.csv'
+SEG_MAP = f'{BUILT_DATA_DIR}/misc/kpl_theme_segment_map.csv'
 # 行级映射表（原因级回退，细分分不了时用）：列 [date, code, parent, source, note]
-ROW_MAP = f'{BUILT_DATA_DIR}/kpl_theme_row_map.csv'
+ROW_MAP = f'{BUILT_DATA_DIR}/misc/kpl_theme_row_map.csv'
 
 
 def _norm(s: str) -> str:

@@ -32,8 +32,9 @@ AshareData/
 | `scrap_data/zhangtingban/`、`scrap_data/dietingban/` | 涨停板 / 跌停板抓取产物（xlsx） |
 | `scrap_data/longhu/` | 龙虎榜抓取产物（json） |
 | `scrap_data/kaipanla/` | 开盘啦题材榜抓取产物（json） |
-| `built_data/base_feature/` | 特征产物 `<code>.parquet` + `meta.json` |
-| `built_data/*.parquet` | 涨跌停 / 市场统计 / 龙虎榜 / 横截面排名 / 股性 traits（t_*）/ 事件结构（ev_*、kp_*）/ 新闻快讯计数（nw_*）特征 |
+| `built_data/base_feature/` | 构建元信息 `meta.json`（latest_date 新鲜度，Lushan 读取） |
+| `built_data/loader_npy/` | **直喂 dataloader/模型唯一目录**（全 mmap）：`kline/` 分页全字段、六张副表键表（updown/market/pct_rank/longhu/event/traits）、`ann/` 公告嵌入 |
+| `built_data/misc/` | 其他产物：涨跌停源表 / kpl 事件·实体·嵌入 / 新闻快讯 / 板块锚 / 实验表 |
 
 ## 快速使用
 
