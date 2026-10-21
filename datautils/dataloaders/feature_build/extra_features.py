@@ -54,7 +54,10 @@ def _read_single_updown_file(filepath: str, is_limit_up: int) -> pd.DataFrame:
         '涨停封流比(%)': 'seal_flow_pct','跌停封流比(%)': 'seal_flow_pct',
         '涨停开板次数(次)': 'open_count', '跌停开板次数(次)': 'open_count',
         '几天几板': 'days_boards',
+        # 站点改版后列名变了：旧「涨停原因类别」→ 新「涨停原因」；跌停同理（近期
+        # 跌停板文件甚至没有原因列，缺列时 reason 落空）。
         '涨停原因类别': 'reason', '跌停原因类型': 'reason',
+        '涨停原因': 'reason', '跌停原因': 'reason',
     }
     df = df.rename(columns=col_map)
 
@@ -98,7 +101,16 @@ def _read_single_updown_file(filepath: str, is_limit_up: int) -> pd.DataFrame:
     else:
         out['days'], out['boards'] = 0, 0
 
-    out['reason'] = df['reason'].fillna('') if 'reason' in df.columns else ''
+    def _reason_col(frame: pd.DataFrame) -> pd.Series:
+        """原因列：rename 后可能重名（新旧列名同时存在）；缺列→空串。"""
+        cols = frame.loc[:, frame.columns == 'reason']
+        if cols.shape[1] == 0:
+            return pd.Series([''] * len(frame), index=frame.index, dtype=object)
+        if cols.shape[1] == 1:
+            return cols.iloc[:, 0].fillna('')
+        return cols.bfill(axis=1).iloc[:, 0].fillna('')   # 先出现的非空值优先
+
+    out['reason'] = _reason_col(df)
     return out
 
 
