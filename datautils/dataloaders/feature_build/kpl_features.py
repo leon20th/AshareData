@@ -172,9 +172,10 @@ def _compute_kp(E: pd.DataFrame):
 def _merge_event_feat(K: pd.DataFrame) -> pd.DataFrame:
     """kp 列并入 event 键表：ev_*/kpe_* 列原样保留，kp 列整体替换；无事件日补 0。"""
     feat = read_key_table_df('event')
-    ev_cols = [c for c in EVENT_SUB_COLUMNS if c.startswith('ev_') and (feat is None or c in feat.columns)]
+    have = feat.columns if feat is not None else []
+    ev_cols = [c for c in EVENT_SUB_COLUMNS if c.startswith('ev_') and c in have]
     kp_cols = [c for c in EVENT_SUB_COLUMNS if c.startswith('kp_')]
-    kpe_cols = [c for c in (feat.columns if feat is not None else []) if c.startswith('kpe_')]
+    kpe_cols = [c for c in have if c.startswith('kpe_')]
     if feat is None:
         out = K.copy()
     else:
