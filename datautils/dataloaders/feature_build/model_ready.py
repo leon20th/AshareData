@@ -74,6 +74,10 @@ EVENT_SUB_COLUMNS = [
     'ev_n_known', 'ev_n_base', 'ev_n_drv', 'ev_n_both',
     'ev_share', 'ev_mix', 'ev_base_pure', 'ev_age_min_frac', 'ev_is_new',
     'kp_sz', 'kp_rk', 'kp_fb', 'kp_age', 'kp_new', 'kp_gap', 'kp_rev', 'kp_nf',
+    # KPL 强度（2026-10-21）：题材强度 th_* + 个股题材内强度 st_* + 距事件天数
+    'ks_days', 'st_boards', 'st_rank', 'st_gapmax', 'st_is_leader', 'st_first',
+    'st_seal', 'st_open', 'st_hist20', 'st_lastgap',
+    'th_max_b', 'th_age', 'th_seal', 'th_first', 'th_promote',
 ]
 
 TRAIT_SUB_COLUMNS = [

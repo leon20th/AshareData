@@ -176,14 +176,16 @@ def _merge_event_feat(K: pd.DataFrame) -> pd.DataFrame:
     ev_cols = [c for c in EVENT_SUB_COLUMNS if c.startswith('ev_') and c in have]
     kp_cols = [c for c in EVENT_SUB_COLUMNS if c.startswith('kp_')]
     kpe_cols = [c for c in have if c.startswith('kpe_')]
+    ks_cols = [c for c in EVENT_SUB_COLUMNS if c.startswith(('ks_', 'st_', 'th_'))
+               and c in have]          # KPL 强度（kpl_strength_features 维护，这里只保留）
     if feat is None:
         out = K.copy()
     else:
         base = feat.drop(columns=[c for c in kp_cols if c in feat.columns]).copy()
         out = base.merge(K, on=['trade_date_idx', 'code_idx'], how='outer')
-    for c in ev_cols + kp_cols + kpe_cols:
+    for c in ev_cols + kp_cols + kpe_cols + ks_cols:
         out[c] = pd.to_numeric(out[c], errors='coerce').fillna(0).astype(np.float32)
-    keep = ['trade_date_idx', 'code_idx'] + ev_cols + kp_cols + kpe_cols
+    keep = ['trade_date_idx', 'code_idx'] + ev_cols + kp_cols + ks_cols + kpe_cols
     out = out[keep]
     out = out.sort_values(['trade_date_idx', 'code_idx']).reset_index(drop=True)
     save_key_table('event', out, keep, 0.0, source='build_kpl_features')
