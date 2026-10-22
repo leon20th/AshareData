@@ -146,11 +146,13 @@ def merge_into_event_table(force: bool = False) -> int:
         EVENT_SUB_COLUMNS)
 
     feat = read_key_table_df("event")
-    have = [c for c in feat.columns if c.startswith("ks_")]
-    if have and not force:
-        print(f"[ks] event 键表已有 ks 列（{len(have)}），跳过（force 可重建）", flush=True)
+    # 已有 ks 产物 = 前缀 ks_* ∪ KS_COLUMNS（键表里列名是 st_*/th_*，没有 ks_ 前缀；
+    # 只按前缀判断会让 --force 二次运行时与新 ks 冲突成 _x/_y ⇒ KeyError）
+    old = [c for c in feat.columns if c.startswith("ks_") or c in KS_COLUMNS]
+    if old and not force:
+        print(f"[ks] event 键表已有 ks 列（{len(old)}），跳过（force 可重建）", flush=True)
         return len(feat)
-    feat = feat[[c for c in feat.columns if not c.startswith("ks_")]].copy()
+    feat = feat[[c for c in feat.columns if c not in set(old)]].copy()
     ks = build_ks()
     out = feat.merge(ks, on=["trade_date_idx", "code_idx"], how="outer")
     for c in KS_COLUMNS:

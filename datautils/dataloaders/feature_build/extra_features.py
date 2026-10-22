@@ -50,8 +50,10 @@ def _read_single_updown_file(filepath: str, is_limit_up: int) -> pd.DataFrame:
         '连续涨停天数(天)': 'consecutive_days', '连续跌停天数(天)': 'consecutive_days',
         '涨停封单量(股)': 'seal_volume', '跌停封单量(股)': 'seal_volume',
         '涨停封单额(元)': 'seal_value',  '跌停封单额(元)': 'seal_value',
-        '涨停封成比(%)': 'seal_pct',     '跌停封成比(%)': 'seal_pct',
-        '涨停封流比(%)': 'seal_flow_pct','跌停封流比(%)': 'seal_flow_pct',
+        # 站点改版（2026-09-14 起）：「涨停封成比(%)」→「封成比(%)」、
+        # 「涨停封流比(%)」→「封流比(%)」。两套名字都认（同列同时出现时按列序 bfill）。
+        '涨停封成比(%)': 'seal_pct',     '封成比(%)': 'seal_pct',
+        '涨停封流比(%)': 'seal_flow_pct','封流比(%)': 'seal_flow_pct',
         '涨停开板次数(次)': 'open_count', '跌停开板次数(次)': 'open_count',
         '几天几板': 'days_boards',
         # 站点改版后列名变了：旧「涨停原因类别」→ 新「涨停原因」；跌停同理（近期
@@ -63,11 +65,18 @@ def _read_single_updown_file(filepath: str, is_limit_up: int) -> pd.DataFrame:
 
     # HH:MM:SS → 开盘后分钟(不含午休 11:30~13:00)
     def _t2min(t):
-        try:
-            dt = datetime.strptime(str(t).strip(), '%H:%M:%S')
-        except ValueError:
+        """兼容两种口径：旧 `HH:MM:SS`；2026-09-14 起站点改版为 `YYYY-MM-DD HH:MM:SS`。
+
+        用正则取尾部时刻而不是 strptime：改版后整串带日期，strptime('%H:%M:%S') 必
+        挂 ⇒ 2026-09-14 起 first_limit_min/last_limit_min 全 NaN（已发生过一次）。
+        """
+        s = str(t).strip()
+        mm_ = re.search(r'(\d{1,2}):(\d{2})(?::(\d{2}(?:\.\d+)?))?$', s)
+        if s in ('', 'nan', 'None', '--') or mm_ is None:
             return np.nan
-        m = dt.hour * 60 + dt.minute + dt.second / 60 - 570
+        hh, mi = int(mm_.group(1)), int(mm_.group(2))
+        sec = float(mm_.group(3) or 0.0)
+        m = hh * 60 + mi + sec / 60 - 570
         if   m < 0:    return np.nan   # 9:30 前
         if   m <= 120: return m        # 早盘 9:30~11:30 → 0~120
         if   m < 210:  return np.nan   # 午休 11:30~13:00
@@ -77,6 +86,13 @@ def _read_single_updown_file(filepath: str, is_limit_up: int) -> pd.DataFrame:
     # '6,832.12万'→68321200, '3.27亿'→327000000, '218'→218
     _n = lambda s: float(s.replace(',', '').replace('亿', 'e8').replace('万', 'e4')) if isinstance(s, str) and s.strip() not in ('', '--') else np.nan
 
+    def _pick(name: str):
+        """rename 后可能重名（新旧列名并存）→ 取首个非空列；缺列→None。"""
+        cols = df.loc[:, df.columns == name]
+        if cols.shape[1] == 0:
+            return None
+        return cols.bfill(axis=1).iloc[:, 0]
+
     out = pd.DataFrame()
     out['code'] = df['code'].apply(lambda v: str(v).strip().split('.')[0].zfill(6)) if 'code' in df.columns else ''
     out['is_limit_up'] = int(is_limit_up)
@@ -85,8 +101,8 @@ def _read_single_updown_file(filepath: str, is_limit_up: int) -> pd.DataFrame:
     out['consecutive_days'] = pd.to_numeric(df['consecutive_days'], errors='coerce').fillna(0).astype(int) if 'consecutive_days' in df.columns else 0
     out['seal_volume_wan'] = df['seal_volume'].apply(lambda v: _n(v) / 1e6) if 'seal_volume' in df.columns else np.nan  # 股→万手
     out['seal_value_wan'] = df['seal_value'].apply(lambda v: _n(v) / 1e4) if 'seal_value' in df.columns else np.nan    # 元→万元
-    out['seal_pct'] = pd.to_numeric(df.get('seal_pct'), errors='coerce')
-    out['seal_flow_pct'] = pd.to_numeric(df.get('seal_flow_pct'), errors='coerce')
+    out['seal_pct'] = pd.to_numeric(_pick('seal_pct'), errors='coerce')
+    out['seal_flow_pct'] = pd.to_numeric(_pick('seal_flow_pct'), errors='coerce')
     out['open_count'] = pd.to_numeric(df['open_count'], errors='coerce').fillna(0).astype(int) if 'open_count' in df.columns else 0
 
     # 几天几板: '3天3板'→(3,3), '首板涨停'→(1,1), 缺失→(0,0)
