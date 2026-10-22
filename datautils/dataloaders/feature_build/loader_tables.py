@@ -27,6 +27,16 @@ def save_key_table(name: str, df: pd.DataFrame, cols, default: float,
     d = table_dir(name)
     os.makedirs(d, exist_ok=True)
     use = [c for c in cols if c not in ('trade_date_idx', 'code_idx')]
+    # key = tdi*100000 + code_idx：code_idx 必须落在 [0, 100000)。
+    # 负下标（代码未识别时的 -1）会编码成「前一交易日的 99999 槽位」静默串日，必须挡住。
+    if 'code_idx' in df.columns:
+        ci = df['code_idx'].to_numpy(dtype=np.int64)
+        if (ci < 0).any():
+            print(f"[{name}] 剔除 {int((ci < 0).sum())} 行 code_idx<0（代码未识别）", flush=True)
+            df = df[ci >= 0]
+            ci = df['code_idx'].to_numpy(dtype=np.int64)
+        if (ci >= 100000).any():
+            raise ValueError(f"[{name}] code_idx ≥ 100000 会与下一交易日的键冲突")
     for c in cols:
         if c not in df.columns:
             df[c] = np.float32(default)

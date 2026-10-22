@@ -45,7 +45,6 @@ def build_ks() -> pd.DataFrame:
     mem["code"] = mem.code.astype(str)
     mem = mem[(mem.entity_id > 0) & (mem.primary)].drop_duplicates(["date", "code"])
 
-    tds = a_open.trade_date_list
     up = up.assign(di=up.date.map(lambda d: a_open.get_trade_date_idx(d)))
 
     ev = (mem[["date", "code", "code_idx", "entity_id"]]
@@ -57,6 +56,9 @@ def build_ks() -> pd.DataFrame:
     ev["boards"] = ev.boards.fillna(ev.up_boards).fillna(1).astype(float)
     ev["di"] = ev.date.map(lambda d: a_open.get_trade_date_idx(d))
     ev = ev.sort_values(["di", "entity_id", "code"]).reset_index(drop=True)
+    # 携带行只能落在「数据实际存在」的日期内。交易日历是预生成到 2026-12-31 的（len(tds)=8797），
+    # 拿 len(tds) 当上界会往未来投影出空壳行（2026-10-22 审计：tdi 8747~8750 共 302 行，只有 ks_days 非零）。
+    di_max = int(ev.di.max())
 
     # ---- 题材强度（entity × day）----
     th = (ev.groupby(["date", "entity_id"], sort=False)
@@ -119,7 +121,7 @@ def build_ks() -> pd.DataFrame:
     for k in range(1, CARRY + 1):
         c = base.copy()
         c["di"] = c.di + k
-        c = c[c.di < len(tds)]
+        c = c[c.di <= di_max]
         c = c.merge(th_use, on=["entity_id", "di"], how="left")
         for col in ST_COLS:
             c[col] = 0.0
@@ -141,7 +143,7 @@ def build_ks() -> pd.DataFrame:
 def merge_into_event_table(force: bool = False) -> int:
     """ks_* 并入 event 键表并按契约列序重写 loader 键表。"""
     from AshareData.datautils.dataloaders.feature_build.loader_tables import (
-        read_key_table_df, save_key_table)
+        load_key_table, read_key_table_df, save_key_table)
     from AshareData.datautils.dataloaders.feature_build.model_ready import (
         EVENT_SUB_COLUMNS)
 
@@ -159,6 +161,24 @@ def merge_into_event_table(force: bool = False) -> int:
         out[c] = out[c].fillna(0.0)
     for c in [c for c in feat.columns if c != "trade_date_idx" and c != "code_idx"]:
         out[c] = out[c].fillna(0.0)
+
+    # 键表不得引用「数据尚不存在」的日期：交易日历是预生成到年底的，旧版 build_ks 拿
+    # len(tds) 当上界，把携带行投影到未来（tdi 8747~8750 共 302 行，只有 ks_days 非零，
+    # 2026-10-22 审计）。outer join 会把旧键表里的这些空壳行留下来，所以这里按 data
+    # horizon（market 键表最后一天）再剪一次。
+    horizon = int(load_key_table("market")[0][-1]) // 100000
+    beyond = out.trade_date_idx > horizon
+    if beyond.any():
+        print(f"[ks] 剔除 {int(beyond.sum())} 行超出数据地平线（tdi>{horizon}，空壳行）",
+              flush=True)
+        out = out[~beyond]
+    # 无效 code_idx：-1 = 代码不在股票池（退市股，250 个代码 / 1 万行成员记录）；
+    # 99999 = 历史 -1 经 key 编码回读出来的「前一天」伪下标（全零空壳）。
+    bad_code = (out.code_idx < 0) | (out.code_idx >= 99999)
+    if bad_code.any():
+        print(f"[ks] 剔除 {int(bad_code.sum())} 行无效 code_idx（-1 未识别 / 99999 伪下标）",
+              flush=True)
+        out = out[~bad_code]
 
     # 契约列序：ev_* → kp_* → ks_* → 其余（kpe_*）
     order = [c for c in EVENT_SUB_COLUMNS if c in out.columns]

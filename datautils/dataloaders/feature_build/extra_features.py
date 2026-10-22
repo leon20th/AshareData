@@ -217,6 +217,13 @@ def build_updown_limit_feature(update: bool = False, force_rebuild: bool = False
         combined['trade_date_idx'] = get_trade_date_idx(combined['date'].astype(str))
     if 'code_idx' not in combined.columns or combined['code_idx'].isna().any():
         combined['code_idx'] = get_code_idx(combined['code'].astype(str))
+    # 非交易日的数据要剔除：2026-10-22 审计发现站点曾吐出一份「周六」的涨停板 xlsx
+    # （20260124，121 行），这些行的 trade_date_idx 落成 -1/-2 混进键表，永远不会被采样到。
+    bad = combined['trade_date_idx'] < 0
+    if bad.any():
+        print(f"[updown] 剔除 {int(bad.sum())} 行非交易日数据"
+              f"（{sorted(combined.loc[bad, 'date'].unique())}，不在交易日历内）")
+        combined = combined[~bad]
     combined = combined[UPDOWN_COLUMNS]
     combined.to_parquet(UPDOWN_PARQUET, index=False)
     print(f'[updown] +{len(new_up)}涨+{len(new_dn)}跌, {len(combined)}行, 最新涨{combined.loc[combined.is_limit_up==1,"date"].max()} 跌{combined.loc[combined.is_limit_up==-1,"date"].max()}')
