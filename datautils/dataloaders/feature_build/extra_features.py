@@ -139,7 +139,8 @@ def _read_single_updown_file(filepath: str, is_limit_up: int) -> pd.DataFrame:
         hh, mi = int(mm_.group(1)), int(mm_.group(2))
         sec = float(mm_.group(3) or 0.0)
         m = hh * 60 + mi + sec / 60 - 570
-        if   m < 0:    return np.nan   # 9:30 前
+        if -15 <= m < 0: return 0.0    # 09:15~09:30 集合竞价封板 → 按最早 0
+        if   m < 0:    return np.nan   # 其它异常早时刻
         if   m <= 120: return m        # 早盘 9:30~11:30 → 0~120
         if   m < 210:  return np.nan   # 午休 11:30~13:00
         if   m <= 330: return m - 90   # 午盘 13:00~15:00 → 120~240
