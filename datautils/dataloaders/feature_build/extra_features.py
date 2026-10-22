@@ -51,9 +51,12 @@ def _read_single_updown_file(filepath: str, is_limit_up: int) -> pd.DataFrame:
         '涨停封单量(股)': 'seal_volume', '跌停封单量(股)': 'seal_volume',
         '涨停封单额(元)': 'seal_value',  '跌停封单额(元)': 'seal_value',
         # 站点改版（2026-09-14 起）：「涨停封成比(%)」→「封成比(%)」、
-        # 「涨停封流比(%)」→「封流比(%)」。两套名字都认（同列同时出现时按列序 bfill）。
-        '涨停封成比(%)': 'seal_pct',     '封成比(%)': 'seal_pct',
-        '涨停封流比(%)': 'seal_flow_pct','封流比(%)': 'seal_flow_pct',
+        # 「涨停封流比(%)」→「封流比(%)」。**三套名字都要认**（涨/跌停旧名 + 通用新名），
+        # 少认一套会让历史跌停行的 seal_pct/seal_flow_pct 静默变 NaN（已踩）。
+        '涨停封成比(%)': 'seal_pct',     '跌停封成比(%)': 'seal_pct',
+        '封成比(%)': 'seal_pct',
+        '涨停封流比(%)': 'seal_flow_pct','跌停封流比(%)': 'seal_flow_pct',
+        '封流比(%)': 'seal_flow_pct',
         '涨停开板次数(次)': 'open_count', '跌停开板次数(次)': 'open_count',
         '几天几板': 'days_boards',
         # 站点改版后列名变了：旧「涨停原因类别」→ 新「涨停原因」；跌停同理（近期
