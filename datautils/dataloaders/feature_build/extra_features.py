@@ -35,6 +35,42 @@ UPDOWN_COLUMNS = [
 UPLIMIT_DIR = f'{SCRAP_DATA_DIR}/zhangtingban'
 DOWNLIMIT_DIR = f'{SCRAP_DATA_DIR}/dietingban'
 
+# ---- 源表列名归一化（2026-10-22 起替代手工 col_map）----
+# 站点历次改版只做两类动作：改方向前缀（涨停/跌停）、改单位/说明括号（(股)(元)(%)(次)(天)）。
+# 归一化后落到**语义词**再查字段表 ⇒ 前缀/单位变化无需改表；语义词变化（罕见）会 miss，
+# 而 miss 现在由下面的必需列校验**显式报错**，不再静默产出 NaN。
+_RE_UNIT = re.compile(r'[（(][^）)]*[)）]')
+_DIR_WORDS = ('涨停', '跌停')
+
+_CANON_FIELD = {
+    '股票代码': 'code', '代码': 'code',
+    '首次时间': 'first_limit_time', '最终时间': 'last_limit_time',
+    '连续天数': 'consecutive_days',
+    '封单量': 'seal_volume', '封单额': 'seal_value',
+    '封成比': 'seal_pct', '封流比': 'seal_flow_pct',
+    '开板次数': 'open_count', '几天几板': 'days_boards',
+}
+# 已知但**不入模**的列（改版新增此类列不该触发报错）
+_CANON_IGNORE = {'', '股票简称', '简称', '名称', '现价', '最新价', '涨跌幅',
+                 '明细数据', '类型', '封耗比', '市值', 'a股流通市值'}
+
+
+def _strip_dir_units(name) -> str:
+    """'涨停封成比(%)' / '跌停封成比(%)' / '封成比(%)' → '封成比'。"""
+    s = _RE_UNIT.sub('', str(name)).strip()
+    for d in _DIR_WORDS:
+        s = s.replace(d, '')
+    return s
+
+
+def _canon_field(canon: str):
+    """归一列名 → 输出字段；'原因*' 统一走 reason（原因/原因类别/原因类型/原因说明）。"""
+    if canon in _CANON_FIELD:
+        return _CANON_FIELD[canon]
+    if canon.startswith('原因'):
+        return 'reason'
+    return None
+
 UPDOWN_PARQUET = f'{BUILT_DATA_DIR}/misc/updown_limit.parquet'
 os.makedirs(os.path.dirname(UPDOWN_PARQUET), exist_ok=True)
 
@@ -42,29 +78,49 @@ os.makedirs(os.path.dirname(UPDOWN_PARQUET), exist_ok=True)
 def _read_single_updown_file(filepath: str, is_limit_up: int) -> pd.DataFrame:
     """读取单个涨/跌停 xlsx，返回标准化 DataFrame。is_limit_up: 1=涨停, -1=跌停"""
     df = pd.read_excel(filepath, dtype=str)
+    if df.shape[1] == 0:
+        # 空表（历史上确有此类文件，如 dietingban/20200212跌停板.xlsx 无任何列）
+        # ⇒ 当天该方向无标的，返回空帧（不是改版，不该报错）
+        return pd.DataFrame({c: pd.Series(dtype="object") for c in (
+            "code", "is_limit_up", "first_limit_min", "last_limit_min",
+            "consecutive_days", "seal_volume_wan", "seal_value_wan", "seal_pct",
+            "seal_flow_pct", "open_count", "days", "boards", "reason")})
 
-    col_map = {
-        '股票代码': 'code',
-        '首次涨停时间': 'first_limit_time', '最终涨停时间': 'last_limit_time',
-        '首次跌停时间': 'first_limit_time', '最终跌停时间': 'last_limit_time',
-        '连续涨停天数(天)': 'consecutive_days', '连续跌停天数(天)': 'consecutive_days',
-        '涨停封单量(股)': 'seal_volume', '跌停封单量(股)': 'seal_volume',
-        '涨停封单额(元)': 'seal_value',  '跌停封单额(元)': 'seal_value',
-        # 站点改版（2026-09-14 起）：「涨停封成比(%)」→「封成比(%)」、
-        # 「涨停封流比(%)」→「封流比(%)」。**三套名字都要认**（涨/跌停旧名 + 通用新名），
-        # 少认一套会让历史跌停行的 seal_pct/seal_flow_pct 静默变 NaN（已踩）。
-        '涨停封成比(%)': 'seal_pct',     '跌停封成比(%)': 'seal_pct',
-        '封成比(%)': 'seal_pct',
-        '涨停封流比(%)': 'seal_flow_pct','跌停封流比(%)': 'seal_flow_pct',
-        '封流比(%)': 'seal_flow_pct',
-        '涨停开板次数(次)': 'open_count', '跌停开板次数(次)': 'open_count',
-        '几天几板': 'days_boards',
-        # 站点改版后列名变了：旧「涨停原因类别」→ 新「涨停原因」；跌停同理（近期
-        # 跌停板文件甚至没有原因列，缺列时 reason 落空）。
-        '涨停原因类别': 'reason', '跌停原因类型': 'reason',
-        '涨停原因': 'reason', '跌停原因': 'reason',
-    }
-    df = df.rename(columns=col_map)
+    # ---------- 列名归一化（2026-10-22）----------
+    # 站点改版只做两类动作：改方向前缀（涨停/跌停）、改单位/说明括号（(股)/(%)/无）。
+    # 2026-09-14 事故：`涨停封成比(%)`→`封成比(%)` 靠手工 col_map 维护，漏了就静默
+    # 变 NaN（历史 3.5 万行跌停数据一度被抹掉）。改为**归一化后查字典**：
+    #   '涨停封成比(%)' / '跌停封成比(%)' / '封成比(%)' → 归一 '封成比' → seal_pct
+    # 未来再改前缀/单位无需动表；改**语义词**（如 封成比→封成率）才会 miss，
+    # 而 miss 现在会**显式报错**（见下方校验），不再静默。
+    _canon = lambda name: _strip_dir_units(name)
+    rename, unknown = {}, []
+    for c in df.columns:
+        fld = _canon_field(_canon(c))
+        if fld:
+            rename[c] = fld
+        elif _canon(c) not in _CANON_IGNORE:
+            unknown.append(c)
+    df = df.rename(columns=rename)
+
+    # 必需列校验：涨停文件必须有代码 + 首次涨停时间；跌停文件历史上只有 5 列（无时间），
+    # 故对跌停只校验代码。缺列 = 站点又改版 ⇒ 立刻炸掉，不要产出静默 NaN。
+    if 'code' not in df.columns:
+        raise ValueError(f"[updown] {filepath} 找不到『股票代码』列，实际列={list(df.columns)}")
+    if is_limit_up == 1 and 'first_limit_time' not in df.columns:
+        raise ValueError(
+            f"[updown] {filepath} 涨停文件缺『首次涨停时间』（站点改版？）"
+            f"实际列={list(df.columns)} 未识别列={unknown}")
+
+    # 严格模式：**每一列都必须被归类**（映射 或 显式忽略），否则报错。
+    # 历史 3,249 个文件实测 0 个未识别列 ⇒ 只有"站点再改版"才会触发。
+    # 这是把"静默变 NaN"换成"构建期就炸"的那道闸门（2026-09-14 曾因静默丢 22 天数据）。
+    if unknown:
+        raise ValueError(
+            f"[updown] {filepath} 出现无法识别的列 {unknown}（站点改版？）\n"
+            f"  · 有用 → 在 extra_features._CANON_FIELD 加映射（键=归一化后的语义词）\n"
+            f"  · 无关 → 加入 _CANON_IGNORE\n"
+            f"  · 归一化会自动剥掉『涨停/跌停』前缀与『(单位)』括号")
 
     # HH:MM:SS → 开盘后分钟(不含午休 11:30~13:00)
     def _t2min(t):
