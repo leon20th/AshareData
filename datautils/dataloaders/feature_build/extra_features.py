@@ -115,6 +115,9 @@ def _read_single_updown_file(filepath: str, is_limit_up: int) -> pd.DataFrame:
     # 严格模式：**每一列都必须被归类**（映射 或 显式忽略），否则报错。
     # 历史 3,249 个文件实测 0 个未识别列 ⇒ 只有"站点再改版"才会触发。
     # 这是把"静默变 NaN"换成"构建期就炸"的那道闸门（2026-09-14 曾因静默丢 22 天数据）。
+    # ★ 已确认取舍（2026-10-22，用户决策）：**连"新增无关列"也允许阻断日构建**。
+    #   宁可当天构建失败、人工看一眼加进 _CANON_IGNORE，也不要静默降级。
+    #   不要改成 warnings.warn 后继续跑。
     if unknown:
         raise ValueError(
             f"[updown] {filepath} 出现无法识别的列 {unknown}（站点改版？）\n"
