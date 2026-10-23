@@ -118,21 +118,33 @@ def build_pca16(refit: bool = False) -> pd.DataFrame:
 
 
 def merge_event_feat(force: bool = False) -> int:
-    """kpe_* 并入 event 键表（outer merge，ev_*/kp_* 原样保留）。返回行数。"""
+    """kpe_* 并入 event 键表（outer merge，**其余列原样保留**）。返回行数。
+
+    ★ 2026-10-24 修复：原 `keep` 只留 ev_/kp_/kpe_ 前缀列，会把同一张表里
+      `ks_days` / `st_*`（9）/ `th_*`（5）共 15 列静默丢掉（由
+      `kpl_strength_features` 维护）。因为 `update()` 用 `force=n>0` 调用，
+      只要有新事件就会日频触发 ⇒ 表会被逐步削弱。改为「除 kpe_ 外全保留」。
+    """
     feat = read_key_table_df('event')
     if feat is None or not os.path.exists(EMB16):
         return 0
     if all(c in feat.columns for c in KPE_COLUMNS) and not force:
         return 0
     b16 = pd.read_parquet(EMB16, columns=['trade_date_idx', 'code_idx'] + KPE_COLUMNS)
-    base = feat.drop(columns=[c for c in KPE_COLUMNS if c in feat.columns]).copy()
+    keep0 = [c for c in feat.columns
+             if c not in ('trade_date_idx', 'code_idx')
+             and not c.startswith('kpe_')]
+    base = feat[['trade_date_idx', 'code_idx'] + keep0].copy()
     out = base.merge(b16, on=['trade_date_idx', 'code_idx'], how='outer')
-    for c in [c for c in out.columns if c.startswith(('ev_', 'kp_', 'kpe_'))]:
+    val_cols = [c for c in out.columns
+                if c not in ('trade_date_idx', 'code_idx')]
+    for c in val_cols:
         out[c] = pd.to_numeric(out[c], errors='coerce').fillna(0).astype(np.float32)
-    keep = ([c for c in out.columns if c in ('trade_date_idx', 'code_idx') or c.startswith(('ev_', 'kp_', 'kpe_'))])
+    keep = ['trade_date_idx', 'code_idx'] + val_cols
     out = out[keep].sort_values(['trade_date_idx', 'code_idx']).reset_index(drop=True)
     save_key_table('event', out, keep, 0.0, source='build_kpl_reason_emb')
-    print(f'[kpl-emb] event 键表 {feat.shape} → {out.shape}（+{len(KPE_COLUMNS)} 列 kpe_*）')
+    print(f'[kpl-emb] event 键表 {feat.shape} → {out.shape}'
+          f'（+{len(KPE_COLUMNS)} 列 kpe_*，其余 {len(keep0)} 列原样保留）')
     return len(out)
 
 
