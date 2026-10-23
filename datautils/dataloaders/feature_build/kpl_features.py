@@ -23,13 +23,24 @@ KPL_RAW_DIR = f'{SCRAP_DATA_DIR}/kaipanla'
 KPL_EVENTS_PARQUET = f'{BUILT_DATA_DIR}/misc/kpl_events.parquet'
 KPL_EDGES_PARQUET = f'{BUILT_DATA_DIR}/misc/kpl_edges.parquet'
 
-EVENT_COLUMNS = ['date', 'code', 'zscode', 'zs_name', 'segment', 'industry', 'board_txt', 'boards', 'reason_txt']
+EVENT_COLUMNS = ['date', 'code', 'zscode', 'zs_name', 'segment', 'industry', 'board_txt', 'boards', 'reason_txt',
+                 'net_main', 'amount_kpl', 'vol_kpl', 'turn_kpl', 'mktcap']
 KP_COLUMNS = ['kp_sz', 'kp_rk', 'kp_fb', 'kp_age', 'kp_new', 'kp_gap', 'kp_rev', 'kp_nf']
 
 
 def _parse_json(fp: str) -> list:
-    """单个 kpl JSON → 事件行。StockList 定长字段: [0]code [9]板数文本 [10]板数 [11]行业标签 [16]细分题材 [17]原因长文"""
+    """单个 kpl JSON → 事件行。
+    StockList 定长字段: [0]code [8]成交量(股) [9]板数文本 [10]板数 [11]行业标签
+                      [12]主力净额(元) [13]成交额(元) [14]换手%(流通口径) [15]流通市值(元)
+                      [16]细分题材 [17]原因长文"""
     d8 = os.path.basename(fp)[:10].replace('-', '')
+
+    def _f(s, i):
+        try:
+            return float(s[i])
+        except (ValueError, IndexError, TypeError):
+            return np.nan
+
     rows = []
     for g in json.load(open(fp, encoding='utf-8')).get('list') or []:
         zs = (g.get('ZSName') or '').strip()
@@ -48,6 +59,7 @@ def _parse_json(fp: str) -> list:
                 str(s[9]).strip() if len(s) > 9 else '',
                 boards,
                 str(s[17]).strip()[:400] if len(s) > 17 else '',
+                _f(s, 12), _f(s, 13), _f(s, 8), _f(s, 14), _f(s, 15),
             ))
     return rows
 
