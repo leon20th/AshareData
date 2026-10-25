@@ -31,6 +31,9 @@ from AshareData.datautils.dataloaders.feature_build.kpl_entities import (
 from AshareData.datautils.dataloaders.feature_build.stock_traits import (
     build as build_stock_traits
 )
+from AshareData.datautils.dataloaders.feature_build.index_daily import (
+    build_index_daily
+)
 
 FeatDIR = BASE_FEATURE_DIR
 os.makedirs(FeatDIR, exist_ok=True)
@@ -155,6 +158,8 @@ if __name__ == '__main__':
     build_updown_limit_feature(update=True)
     publish_updown_npy()                # 涨跌停 → loader_npy/updown 键表（parquet 仍是 UI/决策源）
     build_market_features(update=True)
+    build_index_daily()                 # 三大指数日线 → loader_npy/index_daily
+    # （富瑶近5年 + baostock 回填；无新交易日秒退）
     build_pct_cross_rank(update=True)  # 依赖 base_feature，须在其后
     build_longhu_feature(update=True)
     build_stock_traits()                # 股性 traits 14 列（全量重建 ~10s；依赖 base_feature/updown/market）
