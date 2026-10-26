@@ -282,11 +282,19 @@ class _KlineDataStorage:
 
         _updown_cols = [c for c in UPDOWN_SUB_COLUMNS if c not in ('trade_date_idx', 'code_idx')]
         _market_cols = [c for c in MARKET_SUB_COLUMNS if c != 'trade_date_idx']
+        # market 表可携带附加特征列（2026-10-26：夜盘 / 大盘指数）。
+        #   环境变量 MARKET_EXTRA_COLS="a,b,..." ⇒ 追加到契约列之后；不设则逐位不变。
+        # 配合下方 vals 的 :len(_market_cols) 截取：表加宽后旧 ckpt 仍读到原来的 7 列。
+        _mext = os.environ.get("MARKET_EXTRA_COLS", "").strip()
+        if _mext:
+            _market_cols = _market_cols + [c.strip() for c in _mext.split(",") if c.strip()]
         _lh_cols = [c for c in LONGHU_SUB_COLUMNS if c not in ('trade_date_idx', 'code_idx')]
         _ev_cols = [c for c in EVENT_SUB_COLUMNS if c not in ('trade_date_idx', 'code_idx')]
         _tr_cols = [c for c in TRAIT_SUB_COLUMNS if c not in ('trade_date_idx', 'code_idx')]
         # event 键表可能携带 kpe_* 附加列（kpl 原因嵌入，供其他实验），截取契约前段
         self._event_values = event_vals[:, :len(_ev_cols)]
+        # market 同理：只取契约（+MARKET_EXTRA_COLS）宽度的前段，多出的列不参与旧模型
+        self._market_values = self._market_values[:, :len(_market_cols)]
 
         self._updown_sub_cols = _updown_cols
         self._market_sub_cols = _market_cols
