@@ -489,6 +489,10 @@ class _KlineDataset(Dataset):
         self._is_st_idx = self._columns.index("isST") if "isST" in self._columns else None
         self._is_new_idx = self._columns.index("isNew") if "isNew" in self._columns else None
         self._m15_idx = self._columns.index("m15_complete") if "m15_complete" in self._columns else None
+        # 2026-10-27 修复：npy 产物没有 m15_complete 列，旧质量门实际失效。
+        # 退化为「任一 m15_* 列为 NaN/inf 即整窗不合格」，与 m15_complete 同义。
+        self._m15_cols = [i for i, n in enumerate(self._columns)
+                          if str(n).startswith("m15_")]
 
         # YYYYMMDD 日期范围 → trade_dates 下标范围
         lo = storage._date_to_idx_or_bisect(int(target_begin)) if target_begin else 0
@@ -517,15 +521,22 @@ class _KlineDataset(Dataset):
             if valid.shape[0] == 0:
                 continue
 
-            # 窗口质量过滤：isST / isNew / m15_complete（向量化 cumsum）
+            # 窗口质量过滤：isST / isNew / m15（向量化 cumsum）
             window_starts = valid - self.total_len + 1
             bad = np.zeros(n, dtype=np.int64)
             if self._is_st_idx is not None:
                 bad |= (stacked[:, self._is_st_idx] != 0).astype(np.int64)
             if self._is_new_idx is not None:
                 bad |= (stacked[:, self._is_new_idx] != 0).astype(np.int64)
-            if need_m15 and self._m15_idx is not None:
-                bad |= (stacked[:, self._m15_idx] <= 0).astype(np.int64)
+            if need_m15:
+                if self._m15_idx is not None:
+                    bad |= (stacked[:, self._m15_idx] <= 0).astype(np.int64)
+                elif self._m15_cols:
+                    # 2026-10-27：npy 产物无 m15_complete；用任一 m15_* 非有限值
+                    # 作为“不全”的等价位，避免 NaN 经 nan_to_num 变 0 混入训练。
+                    # storage 数组代理只支持单列索引，逐列 OR。
+                    for _j in self._m15_cols:
+                        bad |= (~np.isfinite(stacked[:, _j])).astype(np.int64)
             cumbad = np.concatenate(([0], np.cumsum(bad)))
             ok = (cumbad[valid + 1] - cumbad[window_starts]) == 0
             valid = valid[ok]
