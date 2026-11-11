@@ -490,9 +490,14 @@ class _KlineDataset(Dataset):
         self._is_new_idx = self._columns.index("isNew") if "isNew" in self._columns else None
         self._m15_idx = self._columns.index("m15_complete") if "m15_complete" in self._columns else None
         # 2026-10-27 修复：npy 产物没有 m15_complete 列，旧质量门实际失效。
-        # 退化为「任一 m15_* 列为 NaN/inf 即整窗不合格」，与 m15_complete 同义。
+        # 2026-11-05 修正判据：m15 完整性的物理含义 = **日K正常交易而 m15 缺 bar**；
+        # 停牌日（volume=0/turn=NaN）m15 本就没有 bar，NaN 是正常语义，不得判坏，
+        # 否则一次停牌会把它整票从此后 61 个交易日的样本里抹掉（605577 实例）。
+        # 旧 m15_complete 口径同义（RegimeFramework feature_pipeline：停牌日填日K价
+        # 并置 m15_complete=1）。
         self._m15_cols = [i for i, n in enumerate(self._columns)
                           if str(n).startswith("m15_")]
+        self._vol_idx = self._columns.index("volume") if "volume" in self._columns else None
 
         # YYYYMMDD 日期范围 → trade_dates 下标范围
         lo = storage._date_to_idx_or_bisect(int(target_begin)) if target_begin else 0
@@ -532,11 +537,17 @@ class _KlineDataset(Dataset):
                 if self._m15_idx is not None:
                     bad |= (stacked[:, self._m15_idx] <= 0).astype(np.int64)
                 elif self._m15_cols:
-                    # 2026-10-27：npy 产物无 m15_complete；用任一 m15_* 非有限值
-                    # 作为“不全”的等价位，避免 NaN 经 nan_to_num 变 0 混入训练。
-                    # storage 数组代理只支持单列索引，逐列 OR。
+                    # npy 产物无 m15_complete；用任一 m15_* 非有限值作为“不全”的等价
+                    # 位，避免 NaN 经 nan_to_num 变 0 混入训练。storage 数组代理只支持
+                    # 单列索引，逐列 OR。**只在当日日K正常交易(volume>0)时才算不全**：
+                    # 停牌日 m15 缺 bar 是正常语义（volume=0 或 NaN ⇒ 判 False）。
+                    if self._vol_idx is not None:
+                        traded = np.asarray(stacked[:, self._vol_idx]) > 0
+                    else:
+                        traded = np.ones(n, dtype=bool)
                     for _j in self._m15_cols:
-                        bad |= (~np.isfinite(stacked[:, _j])).astype(np.int64)
+                        bad |= (traded & ~np.isfinite(
+                            np.asarray(stacked[:, _j]))).astype(np.int64)
             cumbad = np.concatenate(([0], np.cumsum(bad)))
             ok = (cumbad[valid + 1] - cumbad[window_starts]) == 0
             valid = valid[ok]
@@ -827,6 +838,7 @@ def build_train_and_val_dataloaders(
     split_train_and_val_date: str = "20250901",
     need_m15: bool = True,
     num_workers: int = 4,
+    pin_memory: bool = True,
     val_batch_size: Optional[int] = None,
     val_num_workers: Optional[int] = None,
     special_codes: Optional[List[str]] = [],
@@ -856,6 +868,8 @@ def build_train_and_val_dataloaders(
     val_batch_size / val_num_workers: 验证集独立批次大小与 worker 数（None=沿用
     train 值）。val 是完整遍历、无梯度，瓶颈在 GPU forward，batch 调大只减 kernel
     次数不改任何指标（日期分组采样保证 daily-AUC 分组不受 batch 影响）。
+    pin_memory: DataLoader 锁页拷贝（默认 True=旧逐位）。锁页池在 WSL 映射为
+    /dev/zero 常驻 ~5G/进程且不回收；纯同步消费方（.to(dev) 非异步）关掉零损失。
 
     以下 7 参用于 train/val 异构采样，默认值 = 原逐位行为：
     train_target_horizon: train 侧独立 horizon（None=沿用 target_horizon）。可传
@@ -937,8 +951,8 @@ def build_train_and_val_dataloaders(
         )
     else:
         val_sampler = _OrderBatchSampler(val_ds, vbs)
-    train_loader = DataLoader(train_ds, batch_sampler=train_sampler, num_workers=num_workers, pin_memory=True, persistent_workers=num_workers > 0, collate_fn=cf_tr)
-    val_loader = DataLoader(val_ds, batch_sampler=val_sampler, num_workers=vnw, pin_memory=True, persistent_workers=vnw > 0, collate_fn=cf_v)
+    train_loader = DataLoader(train_ds, batch_sampler=train_sampler, num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0, collate_fn=cf_tr)
+    val_loader = DataLoader(val_ds, batch_sampler=val_sampler, num_workers=vnw, pin_memory=pin_memory, persistent_workers=vnw > 0, collate_fn=cf_v)
 
     return train_loader, val_loader
 
